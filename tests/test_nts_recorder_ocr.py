@@ -536,3 +536,82 @@ def test_nul_is_pdf_whitespace_between_matrix_operands_in_both_shapes(tmp_path):
     assert lf.ok, lf.reason
     chelan = ocr_pdf(recorder_pdf(1, draw=b"q 612\x000 0 835 0 0 cm /Im0 Do Q"), tesseract=tool)
     assert chelan.ok, chelan.reason
+
+
+# ── Laserfiche pages scanned in grey (live 2026-11-16, NTS 3799007: 18 pages, each an
+# 8-bit /DeviceGray /DCTDecode image in the same "q q <m> cm /img Do Q Q" drawing).
+
+def _jpeg(width: int, height: int, mode: str = "L") -> bytes:
+    b = io.BytesIO()
+    Image.new(mode, (width, height), 255).save(b, "JPEG", quality=80)
+    return b.getvalue()
+
+
+def _progressive_jpeg(width: int, height: int) -> bytes:
+    b = io.BytesIO()
+    Image.new("L", (width, height), 255).save(b, "JPEG", progressive=True)
+    return b.getvalue()
+
+
+def _with_fill_byte(jpeg: bytes) -> bytes:
+    """SOI, then an extra 0xFF before the first marker (legal fill for libjpeg)."""
+    return jpeg[:2] + b"\xff" + jpeg[2:]
+
+
+def laserfiche_jpeg_pdf(width: int = 850, height: int = 1100, *, data: bytes | None = None,
+                        colorspace: str = "/DeviceGray", bits: int = 8, parms: dict | None = None) -> bytes:
+    raw = data if data is not None else _jpeg(width, height)
+    w = PdfWriter()
+    page = w.add_blank_page(612, 792)
+    x = StreamObject()
+    x._data = raw
+    x.update({
+        NameObject("/Type"): NameObject("/XObject"), NameObject("/Subtype"): NameObject("/Image"),
+        NameObject("/Width"): NumberObject(width), NameObject("/Height"): NumberObject(height),
+        NameObject("/BitsPerComponent"): NumberObject(bits), NameObject("/ColorSpace"): NameObject(colorspace),
+        NameObject("/Filter"): NameObject("/DCTDecode"),
+    })
+    if parms is not None:
+        x[NameObject("/DecodeParms")] = DictionaryObject({NameObject(k): NumberObject(v) for k, v in parms.items()})
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/ProcSet"): ArrayObject([NameObject("/PDF"), NameObject("/ImageB")]),
+        NameObject("/XObject"): DictionaryObject({NameObject("/img0"): w._add_object(x)}),
+    })
+    content = StreamObject()
+    content._data = LASERFICHE_DRAW
+    page[NameObject("/Contents")] = w._add_object(content)
+    b = io.BytesIO()
+    w.write(b)
+    return b.getvalue()
+
+
+def test_a_grey_jpeg_laserfiche_page_reaches_ocr_as_a_jpeg(tmp_path):
+    res = ocr_pdf(laserfiche_jpeg_pdf(), tesseract=_tool(tmp_path, "tess_ok", _OK))
+    assert res.ok, res.reason
+    assert [w[2].split(":")[0] for w in res.words] == ["Trustee", "850x1100"]
+
+
+@pytest.mark.parametrize("pdf,reason", [
+    # The frame header claims a bigger image than the PDF declares: a decompression bomb.
+    (laserfiche_jpeg_pdf(850, 1100, data=_jpeg(3000, 3000)), "unsupported pdf: JPEG frame size differs"),
+    (laserfiche_jpeg_pdf(data=b"not a jpeg at all"), "unsupported pdf: JPEG frame size differs"),
+    (laserfiche_jpeg_pdf(colorspace="/DeviceRGB", data=_jpeg(850, 1100, "RGB")),
+     "unsupported pdf: image is not a plain 8-bit grey JPEG"),
+    (laserfiche_jpeg_pdf(parms={"/ColorTransform": 0}), "unsupported pdf: image is not a plain 8-bit grey JPEG"),
+    (laserfiche_jpeg_pdf(bits=1), "unsupported pdf: image is not a plain 8-bit grey JPEG"),
+    # Labelled grey, but the JPEG itself is colour: the decoder would read 3 or 4 components.
+    (laserfiche_jpeg_pdf(data=_jpeg(850, 1100, "RGB")), "unsupported pdf: JPEG frame size differs"),
+    (laserfiche_jpeg_pdf(data=_jpeg(850, 1100, "CMYK")), "unsupported pdf: JPEG frame size differs"),
+    (laserfiche_jpeg_pdf(data=_progressive_jpeg(850, 1100)), "unsupported pdf: JPEG frame size differs"),
+    # Fill byte before a marker: libjpeg skips it, a naive walker misreads the length and
+    # finds a fake small frame planted later (Codex High). Refused outright.
+    (laserfiche_jpeg_pdf(data=_with_fill_byte(_jpeg(850, 1100))), "unsupported pdf: JPEG frame size differs"),
+    (laserfiche_jpeg_pdf(data=_jpeg(850, 1100)[:30]), "unsupported pdf: JPEG frame size differs"),  # truncated
+], ids=["frame-bomb", "not-jpeg", "rgb", "decode-parms", "1-bit",
+        "rgb-labelled-grey", "cmyk-labelled-grey", "progressive", "fill-byte", "truncated"])
+def test_grey_jpeg_pages_outside_the_shape_are_rejected_before_ocr(tmp_path, pdf, reason):
+    ran = tmp_path / "ran"
+    tool = _tool(tmp_path, "tess_mark", f"open({str(ran)!r}, 'w').write('x')\n")
+    res = ocr_pdf(pdf, tesseract=tool)
+    assert res.ok is False and res.reason.startswith(reason), res.reason
+    assert not ran.exists()

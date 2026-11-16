@@ -22,7 +22,9 @@ read 2026-11-15):
   the image, then an EMPTY text object (no show operator; the page has no font, so it
   can draw nothing);
 - the image: 1-bit /CCITTFaxDecode Group 4 (DecodeParms exactly /K -1, /Columns = its
-  width, /Rows = its height), /DeviceGray, no masks or decode arrays.
+  width, /Rows = its height), /DeviceGray, no masks or decode arrays; or a page scanned in
+  grey: 8-bit /DCTDecode, /DeviceGray, no parameters, its JPEG frame header giving the
+  same size (passed to tesseract as the JPEG file, never decoded here).
 The CCITT data is never decoded here: its bytes are wrapped unchanged in a one-strip
 Group 4 TIFF that tesseract reads. Anything else is "unsupported pdf".
 
@@ -182,6 +184,8 @@ def _page_image(page):
     filt = list(filt) if isinstance(filt, list) else [filt]
     if filt == ["/CCITTFaxDecode"]:
         return _ccitt_image(img)
+    if filt == ["/DCTDecode"]:
+        return _dct_image(img)
     if (img.get("/Subtype") != "/Image" or filt != ["/FlateDecode"]
             or int(img.get("/BitsPerComponent", 0)) != 1
             or any(k in img for k in ("/SMask", "/Mask", "/Decode", "/DecodeParms", "/ImageMask"))):
@@ -217,6 +221,56 @@ def _ccitt_image(img):
     if not raw or len(raw) > MAX_STREAM_BYTES:
         raise UnsupportedPdfError("image stream too large")
     return "ccitt", w, h, raw, False
+
+
+# Segments a plain baseline JPEG may carry before its frame header: APP0-APP15, DQT,
+# DHT, DRI, COM. Anything else there (scan data, end of image, fill bytes, another
+# frame type) is refused, so this walk and the decoder cannot disagree (Codex High).
+_JPEG_PRE_FRAME = frozenset({*range(0xE0, 0xF0), 0xDB, 0xC4, 0xDD, 0xFE})
+
+
+def _jpeg_size(raw: bytes) -> tuple[int, int] | None:
+    """(width, height) of a baseline 8-bit single-component JPEG, read from its SOF0
+    header without decoding, or None for anything else. The live county scans are
+    exactly APP0, DQT, SOF0(8-bit, 1 component) (NTS 3799007, 18 pages)."""
+    if raw[:2] != b"\xff\xd8":
+        return None
+    i = 2
+    while True:
+        if i + 4 > len(raw) or raw[i] != 0xFF:
+            return None
+        marker = raw[i + 1]
+        length = int.from_bytes(raw[i + 2:i + 4], "big")
+        if length < 2 or i + 2 + length > len(raw):
+            return None                                   # truncated or nonsense length
+        if marker == 0xC0:                                # baseline sequential, Huffman
+            seg = raw[i + 4:i + 2 + length]
+            if length != 11 or seg[0] != 8 or seg[5] != 1:
+                return None                               # not 8-bit, one component
+            return int.from_bytes(seg[3:5], "big"), int.from_bytes(seg[1:3], "big")
+        if marker not in _JPEG_PRE_FRAME:
+            return None                                   # fill byte, SOS, EOI, other SOFn
+        i += 2 + length
+
+
+def _dct_image(img):
+    """A Laserfiche page scanned in grey (live 2026-11-16, NTS 3799007: 18 pages):
+    8-bit /DCTDecode, /DeviceGray, nothing optional. The JPEG is never decoded here:
+    tesseract reads it as a file. Its own frame header must give the PDF's size, so a
+    file claiming a larger image than the page declares (a decompression bomb) is refused."""
+    if (img.get("/Subtype") != "/Image" or int(img.get("/BitsPerComponent", 0)) != 8
+            or img.get("/ColorSpace") != "/DeviceGray"
+            or any(k in img for k in ("/SMask", "/Mask", "/Decode", "/ImageMask", "/DecodeParms"))):
+        raise UnsupportedPdfError("image is not a plain 8-bit grey JPEG")
+    w, h = int(img.get("/Width", 0)), int(img.get("/Height", 0))
+    if w <= 0 or h <= 0 or w * h > MAX_IMAGE_PIXELS:
+        raise UnsupportedPdfError("image size out of bounds")
+    raw = img._data
+    if not raw or len(raw) > MAX_STREAM_BYTES:
+        raise UnsupportedPdfError("image stream too large")
+    if _jpeg_size(raw) != (w, h):
+        raise UnsupportedPdfError("JPEG frame size differs from the image's")
+    return "dct", w, h, raw, False
 
 
 def _g4_tiff(w: int, h: int, raw: bytes) -> bytes:
@@ -297,6 +351,10 @@ def main() -> None:
             png = os.path.join(workdir, f"p{pno}.tif")  # tesseract decodes G4 itself
             with open(png, "wb") as fh:
                 fh.write(_g4_tiff(w, h, raw))
+        elif kind == "dct":
+            png = os.path.join(workdir, f"p{pno}.jpg")  # the JPEG bytes, unchanged
+            with open(png, "wb") as fh:
+                fh.write(raw)
         else:
             try:
                 pixels = _bounded_inflate(raw, ((w + 7) // 8) * h, exact=((w + 7) // 8) * h)
@@ -314,7 +372,7 @@ def main() -> None:
             proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
                 # Laserfiche notices are two-column forms: default segmentation cut the
                 # sale-date line ("will on 1/8/2"); one uniform block reads it whole.
-                [tesseract, png, outbase, "-l", "eng", *(["--psm", "6"] if kind == "ccitt" else []), "tsv"],
+                [tesseract, png, outbase, "-l", "eng", *(["--psm", "6"] if kind in ("ccitt", "dct") else []), "tsv"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=env, cwd=workdir, start_new_session=os.name == "posix",
             )

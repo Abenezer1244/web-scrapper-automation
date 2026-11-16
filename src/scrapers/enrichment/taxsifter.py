@@ -540,6 +540,7 @@ def _parcel_pass(county: str, parcel_ids: list[str], time_budget_s: float,
         check_source_or_raise,
         record_source_blocked,
     )
+    from src.utils.celery_limits import reraise_time_limit
 
     county = (county or "").lower()
     out = {pid: make(SOURCE_UNAVAILABLE) for pid in parcel_ids}
@@ -581,6 +582,7 @@ def _parcel_pass(county: str, parcel_ids: list[str], time_budget_s: float,
             _logger.info("%s: %s; %d parcel(s) deferred", source_key, exc, len(by_key))
             return out
         except Exception as exc:  # noqa: BLE001 -- a source problem defers, never raises
+            reraise_time_limit(exc)
             _logger.warning("%s unavailable: %s", source_key, type(exc).__name__)
             return out
 
@@ -589,6 +591,7 @@ def _parcel_pass(county: str, parcel_ids: list[str], time_budget_s: float,
             try:
                 resp = client._get(path, **params)
             except Exception as exc:  # noqa: BLE001
+                reraise_time_limit(exc)
                 _logger.warning("%s request %s", source_key, type(exc).__name__)
                 return None, False
             if resp.status_code in _BLOCK_STATUSES:

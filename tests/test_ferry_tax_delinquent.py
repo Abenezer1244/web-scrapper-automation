@@ -78,7 +78,8 @@ def test_the_beat_task_hands_ferry_to_the_taxsifter_resolver(monkeypatch):
     monkeypatch.setattr(crawler, "crawl_county",
                         lambda county, db, *, fetch, resolve: used.setdefault(county, resolve)
                         and {"county": county})
-    crawler.crawl_pacs_tax()
+    for county in crawler.COUNTIES:
+        crawler.crawl_pacs_tax_county(county)
     assert used["ferry"] is taxsifter.resolve_tax
     assert used["asotin"] is pacs_parcel.resolve_tax
     assert used["columbia"] is pacs_parcel.resolve_tax
@@ -180,3 +181,29 @@ def test_the_ferry_scraper_module_is_allowlisted():
     from src.scrapers.registry import _ALLOWED_SCRAPER_MODULES
 
     assert "src.scrapers.ferry_wa_tax_delinquent" in _ALLOWED_SCRAPER_MODULES
+
+
+def test_the_beat_task_gives_each_county_its_own_time_limited_task(monkeypatch):
+    sent = []
+    monkeypatch.setattr(crawler.crawl_pacs_tax_county, "delay", sent.append)
+    assert crawler.crawl_pacs_tax() == {"dispatched": ["asotin", "columbia", "ferry"]}
+    assert sent == ["asotin", "columbia", "ferry"]
+    task = crawler.crawl_pacs_tax_county
+    # 20-minute pass + inventory/DB/alerts fits; three passes in one task did not (55 min).
+    assert crawler._BUDGET_S < task.soft_time_limit < task.time_limit <= 30 * 60
+
+
+def test_a_county_task_rejects_a_county_with_no_crawl():
+    with pytest.raises(ValueError):
+        crawler.crawl_pacs_tax_county("king")
+
+
+def test_a_time_limit_is_never_swallowed_by_the_county_task(monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    def boom(*a, **k):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(crawler, "crawl_county", boom)
+    with pytest.raises(SoftTimeLimitExceeded):
+        crawler.crawl_pacs_tax_county("ferry")

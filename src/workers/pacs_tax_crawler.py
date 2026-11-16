@@ -238,9 +238,23 @@ _SETTLED = frozenset({"found", "parcel_not_found"})
 
 @app.task(name="src.workers.pacs_tax_crawler.crawl_pacs_tax")
 def crawl_pacs_tax() -> dict:
-    """Beat entry: one bounded run per county; never raises for a source problem."""
+    """Beat entry: one task per county, so each pass has its own time limit.
+
+    Three counties at a 20-minute budget each no longer fit one task's 55-minute soft
+    limit (Codex): the last county's pass would be cut off before it wrote anything."""
+    for county in COUNTIES:
+        crawl_pacs_tax_county.delay(county)
+    return {"dispatched": list(COUNTIES)}
+
+
+# Budget 20 min + inventory/DB/alerts: well inside 25 min soft, 30 min hard.
+@app.task(name="src.workers.pacs_tax_crawler.crawl_pacs_tax_county",
+          soft_time_limit=25 * 60, time_limit=30 * 60)
+def crawl_pacs_tax_county(county: str) -> dict:
+    """One bounded run for one county; never raises for a source problem."""
     from src.db.session import system_sync_session
     from src.scrapers.enrichment import pacs_parcel, taxsifter
+    from src.utils.celery_limits import reraise_time_limit
     from src.utils.safe_http import safe_get
 
     def fetch(url: str) -> dict:
@@ -248,38 +262,39 @@ def crawl_pacs_tax() -> dict:
         resp.raise_for_status()
         return resp.json()
 
+    if county not in COUNTIES:
+        raise ValueError(f"no tax crawl for {county}")
     resolvers = {"pacs": pacs_parcel.resolve_tax, "taxsifter": taxsifter.resolve_tax}
-    results = []
-    for county in COUNTIES:
-        try:
-            with system_sync_session() as db:
-                summary = crawl_county(county, db, fetch=fetch,
-                                       resolve=resolvers[_TAX_SOURCE[county]])
-        except Exception as exc:  # noqa: BLE001 — one county must not stop the others
-            _logger.error("PACS tax crawl %s failed: %s", county, str(exc)[:200])
-            summary = {"county": county, "error": type(exc).__name__}
-        from src.workers.ops_alerts import send_ops_alert
+    try:
+        with system_sync_session() as db:
+            summary = crawl_county(county, db, fetch=fetch,
+                                   resolve=resolvers[_TAX_SOURCE[county]])
+    except Exception as exc:  # noqa: BLE001 — a source problem is logged, not raised
+        reraise_time_limit(exc)
+        _logger.error("PACS tax crawl %s failed: %s", county, str(exc)[:200])
+        summary = {"county": county, "error": type(exc).__name__}
+    from src.workers.ops_alerts import send_ops_alert
 
-        if summary.get("asked") and not summary.get("settled"):
-            send_ops_alert(
-                kind="pacs_tax_unsettled", key=f"pacs_tax_unsettled:{county}",
-                subject=f"PACS tax crawl settled nothing ({county})",
-                body=f"{summary['asked']} parcels asked, 0 answered. The PACS layout or "
-                     "the tax table may have changed.",
-            )
-        try:
-            with system_sync_session() as db:
-                quiet = silent_since(county, db, datetime.now(UTC))
-        except Exception as exc:  # noqa: BLE001 — the heartbeat must not stop the crawl
-            _logger.error("PACS tax heartbeat %s unreadable: %s", county, type(exc).__name__)
-            quiet = None
-        if quiet is not None:
-            send_ops_alert(
-                kind="pacs_tax_silent", key=f"pacs_tax_silent:{county}",
-                subject=f"PACS tax crawl has settled nothing for {_SILENT_AFTER} ({county})",
-                body=f"No parcel answered since {quiet.isoformat()}. Check the county "
-                     "portal (year selector, layout, a block) and the PACS lease.",
-            )
-        _logger.info("PACS tax crawl: %s", summary)  # counts only, no parcels or names
-        results.append(summary)
-    return {"counties": results}
+    if summary.get("asked") and not summary.get("settled"):
+        send_ops_alert(
+            kind="pacs_tax_unsettled", key=f"pacs_tax_unsettled:{county}",
+            subject=f"PACS tax crawl settled nothing ({county})",
+            body=f"{summary['asked']} parcels asked, 0 answered. The PACS layout or "
+                 "the tax table may have changed.",
+        )
+    try:
+        with system_sync_session() as db:
+            quiet = silent_since(county, db, datetime.now(UTC))
+    except Exception as exc:  # noqa: BLE001 — the heartbeat must not stop the crawl
+        reraise_time_limit(exc)
+        _logger.error("PACS tax heartbeat %s unreadable: %s", county, type(exc).__name__)
+        quiet = None
+    if quiet is not None:
+        send_ops_alert(
+            kind="pacs_tax_silent", key=f"pacs_tax_silent:{county}",
+            subject=f"PACS tax crawl has settled nothing for {_SILENT_AFTER} ({county})",
+            body=f"No parcel answered since {quiet.isoformat()}. Check the county "
+                 "portal (year selector, layout, a block) and the PACS lease.",
+        )
+    _logger.info("PACS tax crawl: %s", summary)  # counts only, no parcels or names
+    return summary

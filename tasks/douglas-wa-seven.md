@@ -109,10 +109,50 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
     deploy, parcel echo, tests) -> fixed/answered -> **GO**.
   - **Deploy precondition (Codex):** zero PENDING/QUEUED/running Douglas jobs, and Douglas dispatch held (connector
     inactive or schedules paused) until every old worker has stopped; then re-enable.
-- [ ] **Phase 3: death_certificate** connector type for Douglas (seeded inactive), tests.
-- [ ] **Phase 4: trustee_sale** via the Chelan OCR pipeline (`nts_recorder_documents`, recorder crawler, operator review)
+- [x] **Phase 3: death_certificate** (commit 3bb24e41; Codex NO-GO -> fixed -> GO). Migration 164 appends the type to the
+  (active) Douglas connector, so DEPLOYING = OFFERING it. Douglas DC rows: decedent is the person party on 20/21; one
+  is "STATE OF WASHINGTON" -> "<NAME> ESTATE OF" (Douglas-only `strip_inverted_estate_caption`; the shared helper is
+  unchanged because changing it would re-key other counties' delivered name+date leads). 6/21 carry an 11-digit parcel.
+  Found and fixed while verifying live:
+  - [x] unpaged grid lists one recording twice (identical but GUID; 10/19/2026) -> every run over that day failed. Collapsed.
+  - [x] one-day window ran ZERO searches when `#RecordDate` was not yet on the page -> false zero "done". Always searched once.
+  - [x] kendo single-picker fill stepped 7 days per one-date search (Codex). Steps a day.
+  - Live: 10/19-11/04 read all 17 days, 0 DCs = matches the recorder's own doc-type search (0). A positive live read
+    (05/25-06/05, 3 DCs) did NOT complete: the portal stalled (TransientScrapeError, retried by the worker). Open.
+  - Open (pre-existing, not fixed): a first page that never shows a date field raises a PERMANENT
+    ScraperExecutionError ("could not locate date inputs") on a slow portal; arguably transient.
+- [ ] **Phase 4: trustee_sale — BLOCKED on coordination.** A parallel Cowlitz session is generalising the same OCR
+  pipeline (commits "feat(nts-ocr): read Laserfiche (Cowlitz)", "stage recorded trustee-sale notices for operator review",
+  not on main). Build Douglas on top of that once merged, not in parallel.
+  (original plan) via the Chelan OCR pipeline (`nts_recorder_documents`, recorder crawler, operator review)
   generalised to Douglas NTS (33/yr). Check image access is free first. Owner decision (same as Chelan's).
-- [ ] **Phase 5: tax_delinquent** — owner decision between (a) OCR of the annual Notice and Summons (foreclosure-stage only),
+- [ ] **Phase 5: tax_delinquent — needs owner decision (freshness).** Verified 2026-11-15:
+  - Treasurer "2026 Notice and Summons" (Superior Court 26-2-00337-09, filed 9/17/2026; scanned, 11 pages). Exhibit A
+    rows carry: 11-digit parcel, legal, street address, vested owner + mailing, taxpayer + mailing, certificate tax years,
+    "Taxes and Interest Due As Of August 1, 2026". ~3 parcels per page, pages 6-11. Needs OCR (tesseract is in the prod
+    image, not on this laptop).
+  - TaxSifter Treasurer.aspx per parcel: per-statement balances due, receipts, page echoes the parcel. BUT the site footer
+    says "Data current as of: 6/3/2026" (5 months stale), so it cannot prove a listed parcel is still unpaid TODAY.
+    (Also: Douglas TaxSifter owner/mailing used by enrichment is June data.)
+  - No current-status source found yet; Bid4Assets (the 2026 auction) would show remaining parcels but its terms are unread.
+  Options: (1) deliver foreclosure-stage leads labelled "as of 8/1/2026 per the court summons", accepting that some may
+  have redeemed; (2) find/approve a current source (Treasurer by phone/PRR, Bid4Assets terms); (3) hold.
+  **Owner chose (1) 2026-11-15. Build attempted, then STOPPED as unsafe:**
+  - The county keeps the summons PDF current: redeemed rows get a grey "REDEEMED" stamp and a diagonal strike line
+    (page 8: 3 of 4 rows redeemed; PDF modified 2026-10-27). So the document DOES carry redemption status.
+  - Tesseract (repo OCR child, run in a python:3.12-slim + tesseract 5.5 container) does not read the stamp, and the
+    strike line destroys exactly the redeemed rows' parcel numbers. 16 parcel rows read; parser's one-years/one-amount
+    guard fails closed on page 8 (a lost parcel pushes its values into the row above).
+  - Unsafe case: a redeemed row whose parcel number survives OCR would ship as delinquent. Not wired, not enabled.
+  - Saved, unmerged: branch `wip/douglas-tax-ocr-unsafe` (a stash commit; restore with
+    `git stash apply wip/douglas-tax-ocr-unsafe`): OCR child accepts no-op CropBox/Rotate and 8-bit grey/RGB JPEG
+    (header-checked, never decoded in the child); `taxsifter.lookup_parcel_owner` (parcel search + echo, owner/situs/
+    mailing/"data current as of"); `douglas_wa_tax_delinquent.py` (summons discovery, Exhibit A parser, owner surname
+    check, as-of labelling). No tests yet; no Codex review yet.
+  - Safe ways forward: (a) per-version operator review of the summons rows (~16/yr; the county re-stamps as parcels
+    redeem), Chelan-style; (b) export word boxes from the OCR child and detect the stamp/strike per row band (image
+    analysis; harder to prove); (c) hold.
+  Original options: between (a) OCR of the annual Notice and Summons (foreclosure-stage only),
   (b) a Public Records Request for the Treasurer's year-round delinquent file, (c) per-parcel TaxSifter balances.
 - Blocked (no code): **code_violation** (no case-level source), **divorce** (no recorder type in use; court index is
   case-only/paid). **death_certificate** certificates themselves are restricted; recorder DC is the feed.
@@ -129,5 +169,10 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
 | divorce | Odyssey index / JIS-Link | case index / paid | 0 recorded | Blocked by source access |
 | death_certificate | Recorder DC | public | 21 | Not implemented (Phase 3) |
 
-## Review
-(to be written at the end)
+## Review (2026-11-16, interim)
+- Full suite on 3bb24e41, fresh test DB (bl-douglas-pg recreated, alembic 164): 8,970 passed, 53 skipped, 1 failed +
+  2 errors; all three (test_db_canary slow-answer timing, test_address_lookup_progress GIS sweep) pass in isolation
+  (21/21). `tests/test_migrate_lock.py` deselected from full runs (it hangs inside a full run) and passes alone (6 + 1 skip).
+- A run on a DB left dirty by two stopped runs gave 317 FK-violation failures: environment, not code. Recreate the DB
+  after any aborted full run.
+- Released: nothing (no push, no deploy). Phase 2 + 3 committed locally; tax WIP on `wip/douglas-tax-ocr-unsafe`.

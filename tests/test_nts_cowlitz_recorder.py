@@ -319,3 +319,16 @@ def test_the_cowlitz_crawl_withholds_freshness_over_a_gap_and_rechecks_before_st
     src = inspect.getsource(nts_crawler.crawl_nts_cowlitz_recorder)
     assert "chelan_cache_is_fresh(summary) and gap is None" in src
     assert src.index("_COWLITZ_STAGE_RESERVE_S") < src.index("asyncio.to_thread(_stage_one")
+
+
+def test_the_pdf_url_is_taken_from_the_request_not_a_download_event():
+    """Production runs Chromium headed (Xvfb): a PDF opens in the viewer and no download
+    event fires (first crawl 2026-11-16: 11 of 11 timed out). fetch_pdf must intercept
+    the /PDF10/ request itself, abort the browser's own load, and refetch it capped."""
+    import inspect
+
+    src = inspect.getsource(LaserficheWebLinkScraper.fetch_pdf)
+    assert "expect_download" not in src
+    assert 'context.route("**/PDF10/**"' in src and "await route.abort()" in src
+    assert 'context.unroute("**/PDF10/**"' in src
+    assert "read_recorder_pdf" in src     # the capped, same-origin refetch is unchanged

@@ -19,6 +19,71 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Benton death-certificate parcels from the recording cover sheet (#642, FE #327, #647)
+
+**Built / Shipped:** Run `f1277c60` (Benton death_certificate, 10/15–11/14) had 6 of 11 records with no
+address. The probate run returned the same 11 Cert Of Death documents.
+- **Cause.** Benton's EagleWeb index truncates (`Parcel: 1079810...`) or omits the parcel, but the recorded
+  PDF's page-1 cover sheet prints it on the line after its label.
+- **#642 (`8022556b`).** `recording_cover_sheet.read_cover_sheet_parcel` returns found, none, unreadable or
+  ambiguous. Outcomes go in `recording_apn_lookup`, so only `none` may use the owner-name fallback.
+  - Benton probate and death_certificate read the cover sheet.
+  - `probate` strips "STATE OF WA, DEPTH OF HEALTH" (a county typo) and "STATE OF WA, DSHS".
+  - PACS probate and death leads record `assessor_current_owner` and `title_status`, display-only as on
+    King's path.
+- **FE #327 (`45e34fe9`).** No-address reasons: "No parcel in the record", "Parcel unreadable", "Parcel needs
+  review".
+- **#647 (`e3292a08`).** The mailing-recovery sweep writes the same owner keys.
+- **Recovery run `c5c0e51e`** (rolling 90 days, 34 records): Lamborn, Hay, Pearson and Macias are new leads.
+  Murray is "none" (blank in the source); Campbell is "unreadable" (handwriting).
+- **Data fix.** Four one-row owner writes on that run, because their mailing addresses were filled before
+  #647 deployed. Only Lamborn is flagged `current_owner_name_differs`: a title company recorded the
+  certificate for a sale, and an unrelated buyer owns the parcel now.
+
+**Tried / Decided:**
+- **Owner-differs leads are flagged, not held.** Owner decision: flag (display-only) rather than hold, because
+  heirs with another surname are valid sellers and the assessor lags.
+- **No production rows were rewritten for the parcels.** The recovery is a fresh run; old rows stay as
+  history.
+- **Probate's overlap with death certificates is left as is.** Billing dedup is per property.
+- **Kept out of the integration test:** real death-certificate PDFs carry sensitive details, so the tests
+  use verbatim cover-sheet field excerpts only.
+
+**Failed / Blocked:**
+- **Recovery run killed by a deploy.** Another session's merge redeployed the worker at 22:02. The watchdog
+  re-queued the run after a 15-minute stale heartbeat.
+  - **Fix proposed, not applied:** `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=3900` on the worker. Railway's
+    default is 0 s between SIGTERM and SIGKILL, and Celery is exec'd, so its warm shutdown would finish
+    running scrapes. The classifier blocked the variable change, so the owner must set it.
+- **Unexpected stash pop.** A `git stash pop` tried to pop another worktree's stash (the stash list is
+  shared). It refused, and nothing was lost. Don't use stash in shared worktrees.
+
+**Caught & fixed:** Codex on #642:
+- **Consult.** P1 name-lookup leak (fixed by reusing the `recording_apn_lookup` gate); P1 a cover-sheet
+  parcel does not prove ownership (led to the owner flag).
+- **Round 1, GATE FAIL.** P1 prefix bypass, P1 multi-parcel accepted as one, P2 glued tokens, P2 permanent
+  document failures poisoning runs, P2 page-1-only read.
+- **Round 2.** P1 field truncation after 3 lines.
+- **Round 3.** GATE PASS.
+- **Frontend.** The ambiguous wording claimed more than the outcome means; broadened.
+- **Live run.** Found the #647 gap: the recovery sweep wrote no owner.
+
+**Pending / Handoff:**
+- Set the worker drain window (above).
+- Kitsap probate: 41 of 80 rows have parcels, but none was enriched (all from one Oct 12 run, no lookup
+  markers). Needs one fresh Kitsap probate run to see whether current code enriches them.
+- Grant, Okanogan and Island probate: their indexes carry no parcel or legal description.
+- The 20:14 Chelan failure was a stale doc-type selection, already fixed by #644.
+
+**Facts learned:**
+- Benton recording cover sheets put the parcel on the line after its label. Handwritten values come through
+  the text layer as noise.
+- `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` defaults to 0.
+- Most PACS mailing addresses arrive via the recovery sweep, not inline, so per-row extras must be written
+  in both places.
+
+---
+
 ## 2026-11-15 — Probate representatives in deletion, and a guarded Current Owner (branch `fix/probate-rep-erasure-owner`)
 
 **Built / Shipped:**

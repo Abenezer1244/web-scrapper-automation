@@ -292,3 +292,16 @@ def test_anything_but_a_plain_name_is_refused(surname):
 def test_a_truncated_answer_is_a_failed_lookup_not_a_short_list():
     with pytest.raises(ap.LayerError):
         ap.parse_layer_response({"features": [], "exceededTransferLimit": True})
+
+
+def test_a_surname_the_layer_cannot_be_asked_about_holds_the_notice():
+    # match_notice asks through surname_where; a refused surname is held, never failed
+    # (a failed notice is re-checked forever) and never a crash.
+    from src.workers.probate_ingest import match_notice
+
+    def lookup(surname):
+        ap.surname_where(surname + "\n")          # refused, as an unsafe surname is
+        return []
+
+    assert match_notice("MARGARET J. HOLLOWAY", [], None, lookup) == (
+        "held", ["surname_not_queryable"], [])

@@ -697,11 +697,14 @@ class LaserficheWebLinkScraper(BridgeScraper):
 
     async def fetch_pdf(self, doc: dict, max_bytes: int) -> bytes:
         """The recorded document as the viewer's free "Print (as PDF)" serves it (no
-        watermark). The viewer generates it and starts a browser download of a
-        session-bound URL (/PDF10/<id>/<doc>); that download is cancelled at once and
-        the URL re-read through safe_download_to_file, so the byte cap and time limit
-        hold WHILE it streams (Codex 3b P2). Raises on any failure: never an empty
-        document."""
+        watermark). The viewer generates it at a session-bound URL (/PDF10/<id>/<doc>)
+        and then loads it: a headless browser downloads it, a headed one (production
+        runs Chromium under Xvfb) opens it in its PDF viewer and fires no download
+        (first production crawl, 2026-11-16: 11 of 11 timed out). So the URL is taken
+        from the request itself, either way; any download is cancelled and any viewer
+        tab closed, and the URL is re-read through safe_download_to_file, so the byte
+        cap and time limit hold WHILE it streams (Codex 3b P2). Raises on any failure:
+        never an empty document."""
         import asyncio
 
         from src.utils.safe_http import safe_download_to_file, same_origin
@@ -709,15 +712,38 @@ class LaserficheWebLinkScraper(BridgeScraper):
         afn = doc["instrument"]
         await self.navigate(urljoin(self.app_root + "/", doc["href"]))
         await self._entry_fields(afn)
+        context = self.page.context
+        found: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def _take_pdf_url(route) -> None:
+            # The browser never fetches the document itself (no uncapped download, no
+            # viewer): its URL is all we need, and the capped refetch below reads it.
+            # Aborted first, published after (Codex): cleanup cannot race the abort.
+            url = route.request.url
+            try:
+                await route.abort()
+            except Exception as exc:
+                if not found.done():
+                    found.set_exception(exc)
+                return
+            if not found.done():
+                found.set_result(url)
+
+        await context.route("**/PDF10/**", _take_pdf_url)
         try:
-            async with self.page.expect_download(timeout=120_000) as dl:
+            try:
                 await self.page.locator("#STR_DOWNLOAD_PDF").click()
                 await self.page.get_by_role("button", name="Download & Print").click()
-            download = await dl.value
-            url = download.url
-            await download.cancel()
-        except Exception as exc:
-            raise self._fail(f"AFN {afn}: PDF not served ({type(exc).__name__})") from exc
+                url = await asyncio.wait_for(found, timeout=120)
+            except Exception as exc:
+                raise self._fail(f"AFN {afn}: PDF not served ({type(exc).__name__})") from exc
+            finally:
+                # Viewer tabs close while interception still stands, so no load they
+                # retry can reach the document uncapped (Codex).
+                for other in [p for p in context.pages if p is not self.page]:
+                    await other.close()
+        finally:
+            await context.unroute("**/PDF10/**", _take_pdf_url)
         if not same_origin(url, self.app_root):  # checked before any cookie is read
             raise self._fail(f"AFN {afn}: PDF served from another host")
         cookies = "; ".join(f"{c['name']}={c['value']}" for c in await self.page.context.cookies(url))

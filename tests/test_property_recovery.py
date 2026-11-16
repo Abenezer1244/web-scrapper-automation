@@ -311,3 +311,18 @@ async def test_a_result_for_a_pin_that_was_not_requested_writes_nothing(db, busi
     assert stats["unreached"] == 1
     r = await _get(db, rid)
     assert r.property_address is None and "property_recovery_attempts" not in r.enrichment_data
+
+
+async def test_a_row_held_for_having_had_no_address_is_still_looked_up(db, business_user, monkeypatch):
+    """The no_address hold freezes delivery, not enrichment: this sweep exists for exactly
+    these rows, and before the hold they were eligible (owner, 2026-11-15)."""
+    done = await _job(db, business_user)
+    await _lead(db, business_user, done, "3000000001", mailing=None,
+                extra={"delivery_excluded_reason": "no_address"})
+    await _lead(db, business_user, done, "3000000002", mailing=None,
+                extra={"delivery_excluded_reason": "over_quota"})
+    _gis(monkeypatch, {})
+    asked = _page(monkeypatch, lambda p: None)
+
+    await asyncio.to_thread(_tick)
+    assert asked == [(["3000000001"], False)]

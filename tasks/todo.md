@@ -394,3 +394,31 @@ Redis handler, real-sender tests sync + running loop -> Codex GO. 55 passed loca
 (test_canary_check, test_ops_alerts); enrichment canary 11 passed. Pre-existing local-only
 failure: test_db_canary::test_the_next_tick_samples_again_once_the_gate_expires fails on
 unchanged main too (key gone before pttl; slow local Redis connect), unrelated.
+
+## Clallam cross-scraper integrity + no-address promotion leak (2026-11-15)
+
+Investigation (read-only prod) — runs 7dfa7d6c probate / 8f70234c pre / cd7ae48b death, one account:
+- Pre (3 LP + 12 NTS) vs Death (23 recorded "Death"): 0 shared instruments; equal "15 already
+  delivered" is coincidence. Death's 15 = 14 delivered by the probate run 11 min earlier + 1 older probate run.
+- EagleWeb probate includes DEATH + TOD by design; death_certificate (whole-label DEATH) is a subset.
+  Owner: keep, disclose the overlap. Dedup once per property (parcel|address): owner confirmed.
+- 51/77 delivered probate leads mailing "Pending" = deferred lookup; policy is property OR mailing.
+- DEFECT (systemic): mailing recovery fills rows of done jobs that had NO address at delivery; they
+  become live "new" leads never billed/claimed-as-delivered/e-mailed (Clark 62404bd0 643 billed vs 655
+  live; Jefferson 013bbdd6 39 vs 46; King/Cowlitz too). CV rows are already safe (held by
+  mark_not_qualified_rows). Owner chose: promote AND bill.
+
+Plan (Codex consult before code; approval between phases):
+- [ ] Phase 1 hold: at delivery, hold every non-CV record type's no-address rows (+ same-run siblings)
+      with delivery_excluded_reason = 'no_address'; add to EXCLUSION_REASONS; No-address list keeps
+      listing held rows until late-delivered; idempotent on watchdog re-run. Stops the leak.
+      Codex design consult adds: deliverable_before_cap_sql must exclude NO_ADDRESS (not just
+      NOT_QUALIFIED); owner_recovery/property_recovery may still enrich NO_ADDRESS-held rows;
+      hold every same-run sibling of a held survivor; run_breakdown live partition counts a held
+      row as no_address; keep weak-claim release; hold failure is fatal before delivery.
+      Files: lead_actionability.py, plan_cap.py, tasks.py, results_category.py, run_breakdown.py
+      (1a) + owner_recovery.py, property_recovery.py (1b), tests per sub-phase.
+- [ ] Phase 2 late delivery: widen cv_late_delivery to deliver + bill a held no_address row once it
+      has an address (any record type), same locks/grant_records/late_delivery proof/notice; flag-gated.
+- [ ] Phase 3 historical: dry-run report of rows already promoted unbilled; owner decides.
+- [ ] Copy (frontend repo): No-address tab wording ("may still be pending"); probate/death overlap note.

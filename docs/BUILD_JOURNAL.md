@@ -19,6 +19,32 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Ferry County: tax_delinquent + court-index probate/divorce (all connectors inactive)
+
+**Built / Shipped:** branch `feat/ferry-wa-seven-record-types` (local, not pushed). `taxsifter.resolve_tax`
+reads each parcel's TaxSifter Treasurer page (5-year statements, Balance Due) through the Whitman parcel pass,
+now shared as `_parcel_pass`; `FerryWATaxDelinquentScraper` reads `pacs_tax_status` with Asotin's contract plus
+a 14-day source-date gate and fail-on-held. `sources/wa_digital_archives.py` reads the WA State Archives Superior
+Court docket index (17 counties; Ferry title 3007) and `ferry_wa_court_index.py` classifies probate (open "ESTATE
+OF") and divorce (petition for dissolution). Migration 163 seeds three Ferry connectors, fixed ids, inactive.
+**Tried / Decided:** Auditor has no online recorder index and its request form pledges no commercial use of lists,
+so pre_foreclosure/trustee_sale/death_certificate have no route; code_violation has no case data. wapublicnotices
+bans scraping; Ferry County View has no online legal notices. Court index: GR 31(g)(4) bars commercial
+solicitation from bulk court records -> built at owner request but nothing is ever delivered (every run raises,
+held count or "not a verified zero"). Ferry is wired into `pacs_tax_crawler` but NOT scheduled until the owner
+approves the first broad crawl.
+**Failed / Blocked:** Archives ResultsTable answers HTTP 500 outside the browser flow (Playwright required, ~20 s
+per search). A live divorce run raised drift on one unrecognised results page. Prod read-only connector check and
+the Gmail outreach drafts were not possible in-session (permission classifier; connector re-auth).
+**Caught & fixed:** fixture `__VIEWSTATE` decoded to the real owner/address (amended before any push); malformed
+statement rows and personal-property rows could become false zeros; case-history lookups could become false
+zeros; "MOTION ... CLOSING ESTATE" read as closed; a stray backspace byte in a regex; migration downgrade scope;
+Review C: crawl would start on deploy, freshness by fetch time only, rural parcels silently dropped, court zeros
+called verified, inventory not count-reconciled (now checked against the layer's count, Asotin 13,612 live).
+**Pending / Handoff:** owner: first broad Ferry tax crawl, rural no-situs delivery rule, Reservation tenure rule,
+counsel on GR 31, send the two outreach emails (texts in `tasks/ferry-wa-seven.md`), push/PR.
+**Facts learned:** Ferry parcels are 14-digit; statewide layer FIPS 019 = 9,195 parcels; ~58% sampled lack a situs.
+Archives: pages are 1-based and clamp; one-page answers carry no pager; newest Ferry case opening Nov 2025.
 ## 2026-11-16 — Chelan notices take the parcel's current address (#650); follow-up tests
 
 **Built / Shipped:**

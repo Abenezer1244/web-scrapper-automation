@@ -171,6 +171,7 @@ _TRUSTED_TAX_SOURCES = frozenset({
     "clallam_county_tax_foreclosure_certificate",
     "asotin_pacs_tax",                     # Asotin — per-parcel PACS tax tables (pacs_tax)
     "columbia_pacs_tax",                   # Columbia — the same reader and tables
+    "ferry_taxsifter_tax",                 # Ferry — per-parcel TaxSifter Treasurer pages
 })
 
 

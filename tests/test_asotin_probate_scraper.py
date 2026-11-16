@@ -53,7 +53,7 @@ def _ingest(db, name: str) -> str | None:
         db, (_FIX / f"{name}.txt").read_text(encoding="utf-8"), advert_id="2267",
         pdf_url="https://x/2267.pdf", now=_NOW,
         lookup=lambda surname: [r for r in _ROWS if surname in r["NAME"]],
-        gate=lambda _parcels, _county: None)
+        gate=lambda _parcels, _county, _reps: None)
     db.commit()
     return outcome
 

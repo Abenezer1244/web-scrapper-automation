@@ -12,8 +12,9 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from src.db.session import system_sync_session
+from src.db.session import sync_engine, system_sync_session
 from src.privacy import keys
 from src.scrapers.enrichment.asotin_parcels import LayerError
 from src.workers import probate_ingest as pi
@@ -39,7 +40,7 @@ def _down(_surname):
     raise LayerError("layer HTTP 503")
 
 
-def _open(_parcels, _county):
+def _open(_parcels, _county, _reps):
     return None
 
 
@@ -117,7 +118,7 @@ def test_a_privacy_rule_on_a_tied_parcel_tombstones_the_notice_for_good(s):
                                      subject=("person", "holloway|margaret"))
     gate = pi.privacy_gate(s)
     assert gate([{"parcel_id": parcel, "party_name": "HOLLOWAY, MARGARET J",
-                  "owner_name": "HOLLOWAY, MARGARET J"}], "asotin") == rule_row
+                  "owner_name": "HOLLOWAY, MARGARET J"}], "asotin", []) == rule_row
     assert _ingest(s, "asotin_probate_notice_a", gate=gate) == "withheld"
     row = _row(s, "26-4-00122-02")
     assert (row["decedent"], row["personal_reps"], row["claims_address"], row["parcels"]) == (
@@ -126,6 +127,83 @@ def test_a_privacy_rule_on_a_tied_parcel_tombstones_the_notice_for_good(s):
     # A later crawl, even one whose gate no longer sees the rule, never writes it back.
     assert _ingest(s, "asotin_probate_notice_a") == "withheld"
     assert _row(s, "26-4-00122-02")["decedent"] is None
+
+
+def _rep_rule(s, person="dunn|rachel", parcel="10412300600050000") -> str:
+    # A personal representative (natural order on the notice) with her own rule, by
+    # default on the estate's tied parcel.
+    anchor = keys.property_anchor_value(parcel, "asotin", "WA")
+    return _active_rule(s, "opt_out", anchor=("property", anchor),
+                        subject=("person", person))[1]
+
+
+def _tombstoned(s, rule_row: str) -> None:
+    row = _row(s, "26-4-00122-02")
+    assert row["match_outcome"] == "withheld"
+    assert (row["decedent"], row["personal_reps"], row["claims_address"], row["parcels"]) == (
+        None, None, None, None)
+    assert str(row["privacy_suppression_id"]) == rule_row
+
+
+def test_a_personal_representatives_rule_on_a_tied_parcel_tombstones_at_ingest(s):
+    rule_row = _rep_rule(s)
+    gate = pi.privacy_gate(s)
+    assert _ingest(s, "asotin_probate_notice_a", gate=gate) == "withheld"
+    _tombstoned(s, rule_row)
+
+
+def test_a_personal_representatives_rule_tombstones_at_the_recheck():
+    # rematch_due commits per notice and a rule can never be deleted, so the whole test
+    # runs in one outer transaction (each commit is a savepoint) that is rolled back.
+    with sync_engine.connect() as conn:
+        outer = conn.begin()
+        try:
+            s = Session(bind=conn, join_transaction_mode="create_savepoint")
+            _ingest(s, "asotin_probate_notice_a", lookup=_down)  # failed, reps stored
+            s.commit()
+            rule_row = _rep_rule(s)
+            later = _NOW + pi.REMATCH_EVERY + timedelta(minutes=1)
+            assert pi.rematch_due(s, today=later.date(), now=later, lookup=_layer(_ROWS),
+                                  gate=pi.privacy_gate(s)) == 1
+            _tombstoned(s, rule_row)
+            s.close()
+        finally:
+            outer.rollback()
+
+
+def test_every_personal_representative_is_checked(s):
+    rule_row = _rep_rule(s, person="holloway|amanda")              # the second one
+    assert _ingest(s, "asotin_probate_notice_a", gate=pi.privacy_gate(s)) == "withheld"
+    _tombstoned(s, rule_row)
+
+
+def test_a_representatives_rule_elsewhere_still_withholds_like_the_decedents(s):
+    # Her name without the rule's parcel is a review, and the gate keeps nobody under
+    # review (as for the decedent): the notice is stored as a tombstone.
+    rule_row = _rep_rule(s, parcel="10412300600099999")
+    assert _ingest(s, "asotin_probate_notice_a", gate=pi.privacy_gate(s)) == "withheld"
+    _tombstoned(s, rule_row)
+
+
+@pytest.mark.parametrize("stored", [None, "RACHEL M. DUNN", {"name": "RACHEL M. DUNN"}])
+def test_a_recheck_hands_the_gate_a_list_whatever_was_stored(s, stored):
+    # Notice B's estate is tied by its estate-marked owner, not by a representative.
+    _ingest(s, "asotin_probate_notice_b", lookup=_down)
+    s.execute(text("UPDATE probate_notices SET personal_reps = CAST(:r AS json) "
+                   "WHERE cause_no = '26-4-00117-02'"), {"r": json.dumps(stored)})
+    s.commit()
+    estate = dict(next(r for r in _ROWS if r["NAME"].startswith("HOLLOWAY")),
+                  NAME="PRATT, DOROTHY L (ESTATE)", PARCEL_ID="10412300600070000")
+    seen = []
+
+    def spy(_parcels, _county, reps):
+        seen.append(reps)
+        return None
+
+    later = _NOW + pi.REMATCH_EVERY + timedelta(minutes=1)
+    assert pi.rematch_due(s, today=later.date(), now=later, lookup=_layer([estate]),
+                          gate=spy) == 1
+    assert seen == [[]]
 
 
 def test_retention_deletes_old_notices_but_keeps_tombstones(s):

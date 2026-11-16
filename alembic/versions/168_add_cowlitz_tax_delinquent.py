@@ -9,15 +9,15 @@ that this amount is the foreclosure minimum bid (delinquent_amount_basis), not u
 alone (Codex final review). The run fails once the tentative sale date (December 7, 2026
 for the 2026 cycle) has passed. Data INSERT only, idempotent.
 
-Revision ID: 167
-Revises: 166
+Revision ID: 168
+Revises: 167
 Create Date: 2026-11-15
 """
 
 from alembic import op
 
-revision = "167"
-down_revision = "166"
+revision = "168"
+down_revision = "167"
 branch_labels = None
 depends_on = None
 

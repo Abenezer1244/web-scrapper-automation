@@ -10,15 +10,15 @@ The connector row is active, so this type is offered as soon as this runs: it ru
 only with an owner-approved deploy. Idempotent: the WHERE guard skips a row that
 already offers it (same shape as 157).
 
-Revision ID: 165
-Revises: 164
+Revision ID: 166
+Revises: 165
 Create Date: 2026-11-15
 """
 
 from alembic import op
 
-revision = "165"
-down_revision = "164"
+revision = "166"
+down_revision = "165"
 branch_labels = None
 depends_on = None
 

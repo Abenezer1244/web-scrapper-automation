@@ -174,6 +174,7 @@ _TRUSTED_TAX_SOURCES = frozenset({
     # Cowlitz — the Treasurer's current tax-foreclosure listing, re-issued as parcels
     # redeem; amount = the minimum bid (redemption total), no per-parcel year.
     "cowlitz_county_tax_foreclosure",
+    "ferry_taxsifter_tax",                 # Ferry — per-parcel TaxSifter Treasurer pages
 })
 
 # Trusted sources that publish the amount owed but not the oldest unpaid year for each

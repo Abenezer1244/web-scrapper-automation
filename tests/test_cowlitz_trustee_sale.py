@@ -1,4 +1,4 @@
-"""Cowlitz auction leads (3c): migration 166 seeds an INACTIVE connector at the Cowlitz
+"""Cowlitz auction leads (3c): migration 167 seeds an INACTIVE connector at the Cowlitz
 reader; approved notices reach the matcher; the daily crawl is scheduled; and a notice
 still awaiting review holds delivery as a source gap (as Chelan)."""
 import importlib
@@ -12,11 +12,11 @@ from src.workers.nts_matcher_task import NTS_MATCH_COUNTIES
 from tests.test_nts_cowlitz_recorder import _stage, db  # noqa: F401 -- rolled-back DB fixture
 from tests.test_privacy_authorize import _keyring  # noqa: F401 -- autouse keyring
 
-_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "166_add_cowlitz_trustee_sale_connector.py"
+_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "167_add_cowlitz_trustee_sale_connector.py"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_mig166", _MIG)
+    spec = importlib.util.spec_from_file_location("_mig167", _MIG)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -24,7 +24,7 @@ def _load():
 
 def test_chain_and_county():
     mig = _load()
-    assert (mig.revision, mig.down_revision, mig._COUNTY) == ("166", "165", "cowlitz")
+    assert (mig.revision, mig.down_revision, mig._COUNTY) == ("167", "166", "cowlitz")
 
 
 def test_connector_points_at_the_cowlitz_reader_and_is_inactive():

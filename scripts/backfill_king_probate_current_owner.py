@@ -46,7 +46,7 @@ from src.scrapers.enrichment.king_county_assessor import (
     batch_extract_king_owners,
 )
 from src.scrapers.enrichment.source_health import SourceUnavailableError
-from src.utils.lead_formatting import classify_probate_title_status
+from src.utils.lead_formatting import current_owner_fields
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
@@ -141,10 +141,12 @@ def run(batch: int, limit: int | None, dry_run: bool, delay: float) -> None:
             triples: list[tuple[str, str, str]] = []
             for row in rows:
                 owner = owner_cache.get(row.parcel_id.strip())
-                if not owner:
+                # No owner, or one naming a care-of or a representative (never shown).
+                fields = current_owner_fields(row.party_name, owner)
+                if not fields:
                     skipped_no_owner += 1
                     continue
-                status = classify_probate_title_status(row.party_name, owner)
+                status = fields["title_status"]
                 flagged[status] = flagged.get(status, 0) + 1
                 triples.append((str(row.id), owner, status))
 

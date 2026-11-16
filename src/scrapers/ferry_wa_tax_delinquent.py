@@ -12,8 +12,9 @@ an owner, property address or mailing address held, not delivered. The amount is
 TaxSifter's Balance Due (taxes + assessments + fees), which excludes accrued interest.
 
 Differences from Asotin (Codex Review C):
-* TaxSifter stamps its data date ("Data current as of"), which can lag the fetch; a row
-  counts as fresh only when that date is within MAX_SOURCE_AGE too.
+* TaxSifter stamps its data date ("Data current as of"), which can lag the fetch; the
+  crawler settles an answer only when that date is within 14 days
+  (pacs_tax_crawler._AS_OF_SLACK_BY_COUNTY), so a frozen source goes stale, never fresh.
 * FAIL_ON_HELD: most Ferry parcels are rural with no situs address (7 of 12 sampled).
   Until the owner decides how such land is delivered, a run that would hold any
   qualifying parcel fails with the count instead of returning a shorter list.
@@ -21,8 +22,6 @@ Differences from Asotin (Codex Review C):
   Treasurer grid's Taxpayer column; it is not independently verified as title holder.
 """
 from __future__ import annotations
-
-from datetime import timedelta
 
 from src.scrapers.asotin_wa_tax_delinquent import AsotinWATaxDelinquentScraper
 
@@ -35,5 +34,4 @@ class FerryWATaxDelinquentScraper(AsotinWATaxDelinquentScraper):
 
     COUNTY = "ferry"
     SOURCE = SOURCE
-    MAX_SOURCE_AGE = timedelta(days=14)
     FAIL_ON_HELD = True

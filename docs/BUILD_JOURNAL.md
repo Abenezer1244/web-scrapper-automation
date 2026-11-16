@@ -45,6 +45,175 @@ called verified, inventory not count-reconciled (now checked against the layer's
 counsel on GR 31, send the two outreach emails (texts in `tasks/ferry-wa-seven.md`), push/PR.
 **Facts learned:** Ferry parcels are 14-digit; statewide layer FIPS 019 = 9,195 parcels; ~58% sampled lack a situs.
 Archives: pages are 1-based and clamp; one-page answers carry no pager; newest Ferry case opening Nov 2025.
+## 2026-11-15 — Benton death-certificate parcels from the recording cover sheet (#642, FE #327, #647)
+
+**Built / Shipped:** Run `f1277c60` (Benton death_certificate, 10/15–11/14) had 6 of 11 records with no
+address. The probate run returned the same 11 Cert Of Death documents.
+- **Cause.** Benton's EagleWeb index truncates (`Parcel: 1079810...`) or omits the parcel, but the recorded
+  PDF's page-1 cover sheet prints it on the line after its label.
+- **#642 (`8022556b`).** `recording_cover_sheet.read_cover_sheet_parcel` returns found, none, unreadable or
+  ambiguous. Outcomes go in `recording_apn_lookup`, so only `none` may use the owner-name fallback.
+  - Benton probate and death_certificate read the cover sheet.
+  - `probate` strips "STATE OF WA, DEPTH OF HEALTH" (a county typo) and "STATE OF WA, DSHS".
+  - PACS probate and death leads record `assessor_current_owner` and `title_status`, display-only as on
+    King's path.
+- **FE #327 (`45e34fe9`).** No-address reasons: "No parcel in the record", "Parcel unreadable", "Parcel needs
+  review".
+- **#647 (`e3292a08`).** The mailing-recovery sweep writes the same owner keys.
+- **Recovery run `c5c0e51e`** (rolling 90 days, 34 records): Lamborn, Hay, Pearson and Macias are new leads.
+  Murray is "none" (blank in the source); Campbell is "unreadable" (handwriting).
+- **Data fix.** Four one-row owner writes on that run, because their mailing addresses were filled before
+  #647 deployed. Only Lamborn is flagged `current_owner_name_differs`: a title company recorded the
+  certificate for a sale, and an unrelated buyer owns the parcel now.
+
+**Tried / Decided:**
+- **Owner-differs leads are flagged, not held.** Owner decision: flag (display-only) rather than hold, because
+  heirs with another surname are valid sellers and the assessor lags.
+- **No production rows were rewritten for the parcels.** The recovery is a fresh run; old rows stay as
+  history.
+- **Probate's overlap with death certificates is left as is.** Billing dedup is per property.
+- **Kept out of the integration test:** real death-certificate PDFs carry sensitive details, so the tests
+  use verbatim cover-sheet field excerpts only.
+
+**Failed / Blocked:**
+- **Recovery run killed by a deploy.** Another session's merge redeployed the worker at 22:02. The watchdog
+  re-queued the run after a 15-minute stale heartbeat.
+  - **Fix proposed, not applied:** `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=3900` on the worker. Railway's
+    default is 0 s between SIGTERM and SIGKILL, and Celery is exec'd, so its warm shutdown would finish
+    running scrapes. The classifier blocked the variable change, so the owner must set it.
+- **Unexpected stash pop.** A `git stash pop` tried to pop another worktree's stash (the stash list is
+  shared). It refused, and nothing was lost. Don't use stash in shared worktrees.
+
+**Caught & fixed:** Codex on #642:
+- **Consult.** P1 name-lookup leak (fixed by reusing the `recording_apn_lookup` gate); P1 a cover-sheet
+  parcel does not prove ownership (led to the owner flag).
+- **Round 1, GATE FAIL.** P1 prefix bypass, P1 multi-parcel accepted as one, P2 glued tokens, P2 permanent
+  document failures poisoning runs, P2 page-1-only read.
+- **Round 2.** P1 field truncation after 3 lines.
+- **Round 3.** GATE PASS.
+- **Frontend.** The ambiguous wording claimed more than the outcome means; broadened.
+- **Live run.** Found the #647 gap: the recovery sweep wrote no owner.
+
+**Pending / Handoff:**
+- Set the worker drain window (above).
+- Kitsap probate: 41 of 80 rows have parcels, but none was enriched (all from one Oct 12 run, no lookup
+  markers). Needs one fresh Kitsap probate run to see whether current code enriches them.
+- Grant, Okanogan and Island probate: their indexes carry no parcel or legal description.
+- The 20:14 Chelan failure was a stale doc-type selection, already fixed by #644.
+
+**Facts learned:**
+- Benton recording cover sheets put the parcel on the line after its label. Handwritten values come through
+  the text layer as noise.
+- `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` defaults to 0.
+- Most PACS mailing addresses arrive via the recovery sweep, not inline, so per-row extras must be written
+  in both places.
+
+---
+
+## 2026-11-15 — Probate representatives in deletion, and a guarded Current Owner (branch `fix/probate-rep-erasure-owner`)
+
+**Built / Shipped:**
+- `src/privacy/authorize.py`: `authorize()` takes `extra_subjects`, people tied to a row who are not in
+  its columns. `natural_order_subjects()` reads them one name at a time, in natural order, with role
+  `contact`.
+- `src/privacy/erase.py` `_scan_probate`: also judges each notice's `personal_reps`. A representative's
+  own deletion rule on any tied parcel now erases (tombstones) the whole notice.
+- `src/workers/probate_ingest.py`: the ingest and re-check gate passes the representatives too, so such a
+  notice is stored as a `withheld` tombstone. `Gate` is now `(parcels, county, reps)`.
+- `src/utils/lead_formatting.py` `current_owner_fields()`, used by both writers in
+  `tasks_helpers/enrich.py` (King, and the PACS path #642 added for every PACS county, Asotin included)
+  and by `scripts/backfill_king_probate_current_owner.py`: an owner string with
+  care-of or representative wording (C/O, C\O, CARE OF, ATTN, PR, PERS/PER/PERSONAL REP, executor,
+  administrator) leaves Current Owner and Title Status blank. Re-enrichment removes a stored pair.
+
+**Tried / Decided:**
+- The owner first approved removing Current Owner for probate. That rested on my wrong claim that the
+  field was filled for every county; it is filled only for King. A read-only production count found
+  2,000 stored King values (1,947 probate, 53 death certificate), none with care-of or representative
+  wording. The owner then chose "guard, keep": nothing customers see today changes.
+- Codex reviewed every phase. Phase C was NO-GO on four Mediums, all handled:
+  - A bare `CO` hid companies, so it was dropped.
+  - The backfill script bypassed the guard, so it now goes through the helper.
+  - `CARE-OF` is covered, and `REP` matches only as a whole word.
+  - Stored pairs that re-enrichment never selects: no sweep. Production has 0 matching values with the
+    final regex, and both writers are guarded. Codex accepted this.
+- Representatives are read in natural order, because notices print them that way. Probate's recorder
+  order would read "GLENN WEBER" with GLENN as the surname. A test pins this.
+- The gate still keeps nobody under review. A representative named without the rule's parcel (REVIEW)
+  withholds the notice, exactly as a decedent already did. A test pins this.
+
+**Failed / Blocked:**
+- My first re-check test committed a privacy rule: `rematch_due` commits per notice, and rules can never be
+  deleted. It now runs in a rolled-back outer transaction, with each commit a savepoint.
+- While clearing those leaked rows from the local test database, I disabled and re-enabled the table's
+  triggers. Re-enabling reset `privacy_suppressions_no_update` from ALWAYS to ORIGIN, which
+  `test_privacy_schema` caught. Restored with `ENABLE ALWAYS TRIGGER`. Local test database only.
+- Writing the regex through nested shell and Python quoting turned `\b` into backspace characters and lost
+  one of the two backslashes the regex needs for a literal `C\O`. Fixed by editing the lines by line number.
+
+**Caught & fixed:** see Codex's Phase C findings above. Negative controls: the new erasure and ingest
+tests fail on the old code.
+
+**Pending / Handoff:**
+- Still open from the post-deploy review: the ArcGIS `where` clause built from text (Medium, low practical
+  risk).
+- The first probate crawl with this code is the 2026-11-16 10:00 UTC run, if this deploys first.
+
+**Facts learned:**
+- Current Owner (`assessor_current_owner`) was King-only until #642 (merged during this work) added a
+  PACS writer. That writer would have shown Asotin's 'ESTATE C/O <rep> PR' owners once Asotin probate
+  is switched on, so it goes through the same guard. Grep for every writer of a field before claiming
+  where it comes from.
+- `ALTER TABLE ... ENABLE TRIGGER USER` re-enables triggers as ORIGIN, not ALWAYS. Never toggle triggers
+  on a privacy table, even in a test database.
+## 2026-11-15 — Chelan's first live crawl and connector activation; stale document-type selections (#644, FE #328)
+
+**Built / Shipped:**
+- **Chelan trustee sales, first live run.** The 09:50 UTC crawl read 1,163 recordings (Oct 16 to Nov 15, weekdays only) and staged 1 NTS: recording 2628915, an *amended* notice superseding one recorded 2026-03-20, outside the window. On the owner's instruction Claude reviewed it against the scanned image and approved it (`REC-2628915`, sale 2027-01-15, $92,674.75 principal). A read-only run of `ChelanWATrusteeSaleScraper` returned that one lead, and the owner then had the Chelan trustee_sale connector switched on.
+- **Both lead paths seen live.** A Chelan pre_foreclosure run (job `7dff04ab`, owner's account, skip trace off) picked up 2628915, and the matcher stamped the approved sale on it (confidence 0.96).
+- **#644** (`ddad1d52`, deployed; prod alembic 162):
+  - `canonical_tokens_or_raise` raises `StaleDocTypeSelectionError` (a `ValueError`) naming every type a county no longer offers, with customer copy. The worker fails such a job before the transient-retry branch, never retries it, and still reports it.
+  - Migration 162 drops Chelan's retired types from saved selections. It never adds a type, leaves a selection with nothing valid untouched, bumps `updated_at`, and writes one `audit_events` row per repair. Frozen: it does not import the live registry.
+  - `GET /scrapers/{id}` returns `doc_type_options` and `doc_type_confidence`, straight from the registry.
+  - An invariant test: every type a customer can save is one the scraper can run.
+- **Frontend #328** (`8a15d98e`, live on bridgeleads.io):
+  - A shared `DocTypePicker`, used on the Edit page too.
+  - The Edit page offers the county's current list, names retired saved types and drops them on save. It forces a choice when nothing valid is left: the page would otherwise send NULL (every type, a wider search), and an explicit empty list is invalid.
+  - Saves are computed against the copy loaded into the form, so a background refetch can no longer pair a fresh `updated_at` with stale values.
+  - Checked on production: saving one type, then two, wrote exactly that to `scraper_configs`.
+
+**Tried / Decided:**
+- Codex chose a frozen, Chelan-only migration over importing the live registry: replaying it later must do what it did today.
+- An empty remainder stays untouched rather than becoming the county default or NULL. Both would add types the customer never chose.
+- The typed error lives in the shared strict check, not in a worker pre-flight, so all 10 callers fail the same way.
+- **Stale notice address:** the notice says "170 Hill Street, Manson"; the WA statewide parcel layer and the Chelan assessor both give 62 Village Vista Ln for parcel 282135608610, and the legal descriptions match. Codex recommends resolving the assessor address at approval time and freezing it, keeping the notice's wording as `address_on_notice`. A scrape-time lookup would let a GIS outage flip `dedup_hash` between runs and bill twice. Not built yet.
+
+**Failed / Blocked:**
+- **#625 regression, found live.** A Chelan pre_foreclosure config saved 2026-09-13 failed every run after #625 narrowed Chelan's types ("document type 'notice_of_default' is not mappable"), and its Edit page could not fix it. Every other saved selection in production was checked and was valid. The row was repaired by hand at 20:49 UTC, before migration 162 deployed, so 162 found nothing to do.
+- **First #644 CI run failed:** `schema/openapi.json` must be regenerated (`python scripts/export_openapi.py`) whenever a response gains fields.
+- **Permissions:** a direct production `UPDATE` of a customer config and a `git push` of the frontend dependency branch were both refused by the permission classifier.
+- **Local test gaps:** the stale-selection worker branch is checked by source, not by a run, because that path needs Redis. `test_email_unsubscribe::test_a_forged_or_empty_token_is_refused` fails locally on unmodified main with the local test key.
+
+**Caught & fixed:**
+- **Codex, Phase 2 frontend (NO-GO, then GO):**
+  - A background refetch could widen a document-type selection without a 409.
+  - The picker depended on the connectors list, which hides down, unknown and inactive connectors.
+
+**Pending / Handoff:**
+- **Stale notice address (approval-time situs):** owner go-ahead needed, then a Codex-reviewed build, then re-resolve REC-2628915 before the first Chelan trustee_sale delivery.
+- **Frontend dependency fix,** local branch `fix/dependabot-2026-11` (`48c3e34`):
+  - npm audit shows 0 findings in shipped dependencies and no high or critical anywhere; 12 dev-only moderate/low remain.
+  - Codex GO. Not pushed.
+  - Not verified: a Remotion render after its bundler moved to Rspack 2.
+- **Chelan review queue:** newly staged recordings need operator approval or rejection. One still pending or failed more than 3 days after first staging makes Chelan's trustee-sale data report as incomplete.
+
+**Facts learned:**
+- A trustee's "more commonly known as" address can be years stale; the parcel and legal description are the reliable identity.
+- Chelan pre_foreclosure addresses come from the statewide parcel layer (situs) and PACS (mailing). Enrichment never overwrites an address a lead already carries.
+- Narrowing a county's types in `src/scrapers/doc_types.py` needs a repair migration for saved selections.
+- The frontend repo does not allow auto-merge. Its CI checks `lib/api-types.generated.ts` against the backend's schema on main, so backend schema changes merge first.
+
+---
 
 ## 2026-11-15 — Canary names where a probe broke (#635); per-type down state + RECOVERED alert
 

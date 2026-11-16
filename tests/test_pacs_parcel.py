@@ -417,3 +417,67 @@ class TestSearchRedirect:
         s = _RedirectSession(location)
         resp = pp._http_post(s, _SITE.search_url, {})
         assert resp.status_code == 400 and s.fetched == []
+
+
+# ─── Columbia: both requests name the current roll ───────────────────────────
+_COL_SITE = pp.PACS_SITES["columbia"]
+_COL_GEO, _COL_PROP = "1180050890000", "264873"
+
+
+def _serve_columbia(monkeypatch, form: str | None = None):
+    log: list = []
+
+    def _get(session, url):
+        if url == _COL_SITE.search_url:
+            log.append(("form", url))
+            return _Resp(200, _fixture("columbia_pacs_search_form.html") if form is None else form)
+        log.append(("detail", url))
+        # The county answers HTTP 500 to a detail URL without a year.
+        if url.endswith(f"prop_id={_COL_PROP}&year=2026"):
+            return _Resp(200, _fixture(f"columbia_pacs_detail_{_COL_GEO}.html"))
+        return _Resp(500, "Runtime Error")
+
+    def _post(session, url, data):
+        log.append(("search", data))
+        return _Resp(200, _results([(_COL_GEO, _COL_PROP)]))
+
+    monkeypatch.setattr(pp, "_http_get", _get)
+    monkeypatch.setattr(pp, "_http_post", _post)
+    return log
+
+
+class TestColumbia:
+    def test_mailing_reads_the_current_roll(self, monkeypatch):
+        log = _serve_columbia(monkeypatch)
+        out = pp.resolve_mailing("columbia", [_COL_GEO])
+        assert out[_COL_GEO].is_found
+        assert out[_COL_GEO].mailing_address == "500 S 5TH ST, DAYTON, WA 99328"
+        search = next(e[1] for e in log if e[0] == "search")
+        assert search["propertySearchOptions$taxyear"] == "2026"
+
+    def test_tax_reads_the_same_roll(self, monkeypatch):
+        _serve_columbia(monkeypatch)
+        answer = pp.resolve_tax("columbia", [_COL_GEO])[_COL_GEO]
+        assert answer.outcome == "found" and answer.as_of is not None
+
+    def test_a_form_without_a_year_defers_every_parcel_unasked(self, monkeypatch):
+        no_year = _fixture("columbia_pacs_search_form.html").replace(
+            'name="propertySearchOptions$taxyear"', 'name="gone"')
+        log = _serve_columbia(monkeypatch, form=no_year)
+        out = pp.resolve_mailing("columbia", [_COL_GEO])
+        assert out[_COL_GEO].outcome == SOURCE_UNAVAILABLE
+        assert [e[0] for e in log] == ["form"]
+
+    def test_a_new_roll_reaches_both_requests(self, monkeypatch):
+        # The county opens 2027 while 2026 stays selected: both requests follow 2027.
+        newer = _fixture("columbia_pacs_search_form.html").replace(
+            '<option selected="selected" value="2026">',
+            '<option value="2027">2027 - 2028</option><option selected="selected" value="2026">')
+        log = _serve_columbia(monkeypatch, form=newer)
+        pp.resolve_mailing("columbia", [_COL_GEO])
+        assert next(e[1] for e in log if e[0] == "search")["propertySearchOptions$taxyear"] == "2027"
+        assert next(e[1] for e in log if e[0] == "detail").endswith("&year=2027")
+    def test_benton_requests_are_unchanged(self, monkeypatch):
+        log = _serve(monkeypatch, {_PARCEL: _GOOD_SEARCH}, {"58808": _GOOD_DETAIL})
+        assert pp.resolve_mailing("benton", [_PARCEL])[_PARCEL].is_found
+        assert ("detail", "58808") in log  # the detail URL still ends at prop_id

@@ -62,6 +62,7 @@ from src.scrapers.enrichment.pacs import (
     _HEADERS,
     compose_pacs_mailing,
     normalize_pacs_parcel,
+    ownership_year,
     pacs_detail_url,
     pacs_owner_names,
     parse_pacs_detail_html,
@@ -131,6 +132,10 @@ PACS_SITES: dict[str, PacsSite] = {
     "chelan": PacsSite("chelan", "https://pacs.co.chelan.wa.us/PropertyAccess/PropertySearch.aspx?cid=91", True),
     # Vendor-hosted (cid=10); Geo IDs are 17 digits. No RCW 42.56.070 clause on the page (2026-11-12).
     "asotin": PacsSite("asotin", "https://propertysearch.trueautomation.com/PropertyAccess/PropertySearch.aspx?cid=10", False),
+    # Harris PACS 9.0; Geo IDs are 13 digits (= statewide ORIG_PARCEL_ID). Its detail page
+    # needs a year (pacs.ownership_year). Disclaimer cites RCW 42.56 authorization only,
+    # no 42.56.070 commercial clause (read 2026-11-14).
+    "columbia": PacsSite("columbia", "https://propertysearch.co.columbia.wa.us/PropertyAccess/PropertySearch.aspx?cid=0", False),
 }
 
 _PACE_S = 3.0
@@ -341,15 +346,17 @@ def query_digits(value: object) -> str:
 
 def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
                  query: str | None = None, mode: dict | None = None, land_id: str | None = None,
-                 parse=None, make=MailingAnswer) -> tuple:
+                 parse=None, make=MailingAnswer, year: str | None = None) -> tuple:
     """Search POST, then detail GET, for one parcel. (answer, block_reason).
     `mode` is the form's search-mode field (pacs.search_type_field); `land_id` is
     PacsSite.land_id for this parcel's callers, or None. `parse(html, key)` reads the
     detail page (default: the mailing answer); `make(outcome)` builds every other
-    answer, so the tax pass shares this exact identity chain."""
+    answer, so the tax pass shares this exact identity chain. `year` (pacs.ownership_year)
+    is named on both requests, so search and detail read the same roll."""
     parse = parse or parse_detail
     data = {**tokens, **(mode or {}), "propertySearchOptions$geoid": query or parcel_key,
-            "propertySearchOptions$search": "Search"}
+            "propertySearchOptions$search": "Search",
+            **({"propertySearchOptions$taxyear": year} if year else {})}
     resp, blocked = _request(lambda: _http_post(session, site.search_url, data), still_held)
     if blocked or resp is None:
         return make(REQUEST_FAILED), blocked
@@ -359,7 +366,7 @@ def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_h
     time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
     if not still_held():
         return make(SOURCE_UNAVAILABLE), None
-    url = pacs_detail_url(site.search_url, prop_id)
+    url = pacs_detail_url(site.search_url, prop_id, year)
     resp, blocked = _request(lambda: _http_get(session, url), still_held)
     if blocked or resp is None:
         return make(REQUEST_FAILED), blocked
@@ -460,6 +467,13 @@ def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, m
             _logger.warning("%s: search form offers no account-number search; %d parcel(s) "
                             "deferred", site.source_key, len(by_key))
             return out
+        try:
+            year = ownership_year(site.search_url, resp.text)
+        except ValueError:
+            # Which roll is current is unknown: an answer could name a past owner.
+            _logger.warning("%s: search form offers no tax year; %d parcel(s) deferred",
+                            site.source_key, len(by_key))
+            return out
         streak = 0
         reserve = _reserve_s()
         for i, (key, callers) in enumerate(by_key.items()):
@@ -470,7 +484,7 @@ def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, m
                 break
             answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
                                            query=queries[key], mode=mode, land_id=land_ids[key],
-                                           parse=parse, make=make)
+                                           parse=parse, make=make, year=year)
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

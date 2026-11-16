@@ -1,4 +1,4 @@
-"""Migration 163 (Ferry connectors) — the seed data must be valid and stay switched off.
+"""Migration 164 (Ferry connectors) — the seed data must be valid and stay switched off.
 
 No DB: loads the migration and checks every row points at a real, allowlisted scraper
 class, the tax source is trusted (and, like Asotin's, not cap-exempt), the court rows'
@@ -17,19 +17,19 @@ from src.scrapers.sources import wa_digital_archives as da
 from src.workers.tasks_helpers.dedup import _TRUSTED_TAX_SOURCES
 
 _MIG_PATH = (Path(__file__).resolve().parents[1] / "alembic" / "versions"
-             / "163_add_ferry_connectors.py")
+             / "164_add_ferry_connectors.py")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_mig163", _MIG_PATH)
+    spec = importlib.util.spec_from_file_location("_mig164", _MIG_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-def test_chains_onto_162():
+def test_chains_onto_163():
     mig = _load()
-    assert (mig.revision, mig.down_revision) == ("163", "162")
+    assert (mig.revision, mig.down_revision) == ("164", "163")
 
 
 def test_every_row_is_a_real_allowlisted_scraper_for_its_record_type():

@@ -1,0 +1,373 @@
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<HTML>
+  <HEAD>
+    <title>Columbia County Assessor & Treasurer - Property Search</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+    <meta name="GENERATOR" Content="Microsoft Visual Studio .NET 7.1" />
+    <meta name="CODE_LANGUAGE" Content="C#" />
+    <meta name=vs_defaultClientScript content="JavaScript" />
+    <meta name=vs_targetSchema content="http://schemas.microsoft.com/intellisense/ie5" />
+    <script type="text/javascript">
+			var countyID = 0
+		</script>
+		<script src="js/jquery-1.3.2.js" type="text/javascript"></script>
+		
+    
+		<script src="js/default.js" type="text/javascript"></script>
+		
+		<link href="styles/global.css" rel="stylesheet" type="text/css" />
+		<link href="styles/handheld.css" rel="stylesheet" type="text/css" media="handheld" />
+  </HEAD>
+  <body">
+  <form name="Form1" method="post" action="./PropertySearch.aspx?cid=0" id="Form1">
+<div>
+<input type="hidden" name="__EVENTTARGET" id="__EVENTTARGET" value="" />
+<input type="hidden" name="__EVENTARGUMENT" id="__EVENTARGUMENT" value="" />
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="/wEPDwUKMTU4Njg0NDc3Mg8WAh4DY2lkBQEwFgJmD2QWBgIBDw8WAh8ABQEwZGQCAw8PFgIfAAUBMGQWCAIBD2QWAgIBDw8WAh4EVGV4dAWlAVNlbGVjdCBhIHNlYXJjaCB0eXBlLCB0aGVuIGVudGVyIG9uZSBvciBtb3JlIHNlYXJjaCB0ZXJtcy4gIENsaWNrICJBZHZhbmNlZCIgZm9yIG1vcmUgc2VhcmNoIG9wdGlvbnMuPGJyIC8+VG8gc2VhcmNoIGZvciBzYWxlcyBwbGVhc2UgY2xpY2sgdGhlICJTYWxlcyBTZWFyY2giIGFib3ZlLmRkAgMPEA8WBB4IQ3NzQ2xhc3MFEHNlYXJjaFR5cGVTZWxlY3QeBF8hU0ICAhYCHghvbmNoYW5nZQURc2hvd09wdGlvbnModGhpcykQFQQKT3duZXIgTmFtZRBQcm9wZXJ0eSBBZGRyZXNzDkFjY291bnQgTnVtYmVyF0RvaW5nIEJ1c2luZXNzIEFzIChEQkEpFQQFb3duZXIHYWRkcmVzcw5hY2NvdW50LW51bWJlcgNkYmEUKwMEZ2dnZ2RkAgcPFgIeBXN0eWxlBQ1kaXNwbGF5Om5vbmU7ZAIJD2QWAgICD2QWCmYPD2QWAh8FBQ5kaXNwbGF5OmJsb2NrO2QCAQ8PZBYCHwUFDWRpc3BsYXk6bm9uZTtkAgIPD2QWAh8FBQ1kaXNwbGF5Om5vbmU7ZAIDDw9kFgIfBQUNZGlzcGxheTpub25lO2QCBA8PZBYCHwUFDWRpc3BsYXk6bm9uZTtkAgUPDxYCHwAFATBkZGS6hd2nF7EEFzHh0AV1TuHsoCmlLxhbH7yqWNxJln1U0Q==" />
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+var theForm = document.forms['Form1'];
+if (!theForm) {
+    theForm = document.Form1;
+}
+function __doPostBack(eventTarget, eventArgument) {
+    if (!theForm.onsubmit || (theForm.onsubmit() != false)) {
+        theForm.__EVENTTARGET.value = eventTarget;
+        theForm.__EVENTARGUMENT.value = eventArgument;
+        theForm.submit();
+    }
+}
+//]]>
+</script>
+
+
+<div>
+
+	<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="8B754D87" />
+	<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="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" />
+</div>
+<!-- As of: 11/14/2026 12:30:48 PM --><div id="header"><h1>Columbia County Assessor & Treasurer</h1><ul><li><a id="header_PropertySearch" class="active" onmouseover="window.status=&#39;Property Search&#39;;return true;" onmouseout="window.status=&#39;&#39;;return true;" href="PropertySearch.aspx?cid=0">Property Search</a></li><li><a id="header_SaleSearch" onmouseover="window.status=&#39;Sales Search&#39;;return true;" onmouseout="window.status=&#39;&#39;;return true;" href="SaleSearch.aspx?cid=0">Sales Search</a></li></ul></div>
+
+<!-- HEADER --> 
+<!-- END HEADER -->
+
+
+<!-- PAGE TITLE -->
+<div id="propertySearchOptions_titleSection">
+	<div id="pageTitle">
+		<h2>
+			Property Search Options</h2>
+		<p class="instructions">
+			<span id="propertySearchOptions_instructions">Select a search type, then enter one or more search terms.  Click "Advanced" for more search options.<br />To search for sales please click the "Sales Search" above.</span></p>
+	</div>
+</div>
+<!-- END PAGE TITLE -->
+<!-- CONTENT -->
+<div id="content">
+	<fieldset class="search-fields" id="searchTypes">
+		<legend>Search Type:
+			<select name="propertySearchOptions$searchType" id="propertySearchOptions_searchType" class="searchTypeSelect" onchange="showOptions(this)">
+	<option selected="selected" value="owner">Owner Name</option>
+	<option value="address">Property Address</option>
+	<option value="account-number">Account Number</option>
+	<option value="dba">Doing Business As (DBA)</option>
+
+</select>
+		</legend>
+		<div id="propertySearchOptions_searchTables">
+		<table border="0" style="display:none;">
+	<tr>
+		<td class="formLabel">Owner Name:</td><td><input name="propertySearchOptions$ownerName" type="text" maxlength="30" id="propertySearchOptions_ownerName" size="30" /><span class="hint">&nbsp;e.g., Smith</span></td>
+	</tr><tr id="propertySearchOptions_webHelpID_ownerName">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Owner Name to search on.</div></td>
+	</tr>
+</table><table border="0" style="display:none;">
+	<tr>
+		<td class="formLabel">Street Number:</td><td><input name="propertySearchOptions$streetNumber" type="text" maxlength="15" id="propertySearchOptions_streetNumber" size="30" /><span class="hint">&nbsp;1234</span></td>
+	</tr><tr id="propertySearchOptions_webHelpID_streetNumber">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Street Number to search on.</div></td>
+	</tr><tr>
+		<td class="formLabel">Street Name:</td><td><input name="propertySearchOptions$streetName" type="text" maxlength="65" id="propertySearchOptions_streetName" size="30" /><span class="hint">&nbsp;Main</span></td>
+	</tr><tr id="propertySearchOptions_webHelpID_streetName">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter a street name or a partial street name in this field to obtain a list of parcels containing the words you entered in their street name.</div></td>
+	</tr>
+</table><table border="0" style="display:none;">
+	<tr>
+		<td class="formLabel">Property ID:</td><td><input name="propertySearchOptions$propertyid" type="text" maxlength="15" id="propertySearchOptions_propertyid" size="30" /><span class="hint">&nbsp;XXXXXX</span></td>
+	</tr><tr id="propertySearchOptions_webHelpID_propertyid">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter a parcel number in this field and press the parcel search button if you are searching for a particular parcel. You will receive a list of parcels starting at the parcel number you entered. If the number you are entering has all zeros on the end of it, you only need to key the number in up to the last non-zero digit. A limited number of parcels are listed in parcel number order. You may page through all parcels selected. The parcel number is a 16 digit number in 6-6-4 format. The first 6 digits describe the township/range/section for the parcel using 2 digits for each. The next 6 digits are x-y map coordinates with 3 digits each. The last 4 characters are only used if the parcel needs further description. Enter a number in this field and press the legal search button to retrieve a list of parcels in a particular Township/Range/Section. You may further refine your search by using the Qtr/QtrQtr drop down boxes in conunction with the Twn/Rng/Sec box to divide the section into smaller pieces. Township/Range/Section is simply the first 6 digits of a parcel number using 2 digits for each. You could put the same six digits in the parcel number field and click the parcel search button to get the same results. These drop down boxes are used in conjunction with the Twn/Rng/Sec box to further divide the section into smaller pieces. The Qtr selection box divides the section into quarters and the QtrQtr selection box gives you a quarter of the quarter section specified in the Qtr box or, in other words, one-sixteenth of the entire section. You must make a Qtr selection in order to use the QtrQtr box.</div></td>
+	</tr><tr>
+		<td class="formLabel">Geographic ID:</td><td><input name="propertySearchOptions$geoid" type="text" maxlength="30" id="propertySearchOptions_geoid" size="30" /><span class="hint">&nbsp;Geo Parcel Number</span></td>
+	</tr><tr id="propertySearchOptions_webHelpID_geoid">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Geo ID to search on.</div></td>
+	</tr>
+</table><table border="0" style="display:none;">
+	<tr>
+		<td class="formLabel">Doing Business As:</td><td><input name="propertySearchOptions$dba" type="text" maxlength="50" id="propertySearchOptions_dba" size="30" /><span class="hint">&nbsp;Pizza Planet</span></td>
+	</tr><tr id="propertySearchOptions_webHelpID_dba">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the DBA name to search on.</div></td>
+	</tr>
+</table></div>
+	</fieldset>
+	<fieldset id="propertySearchOptions_additionalCriteria" class="search-fields" style="display:none;">
+	<legend>Additional Criteria</legend><table border="0">
+	<tr>
+		<td class="formLabel">Abstract:&nbsp;</td><td><select name="propertySearchOptions$abstract" id="propertySearchOptions_abstract">
+			<option value=""></option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_webHelpID_abstract">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Abstract name to search on.</div></td>
+	</tr><tr>
+		<td class="formLabel">Subdivision:&nbsp;</td><td><select name="propertySearchOptions$subdivision" id="propertySearchOptions_subdivision">
+			<option value=""></option>
+			<option value="0739">0739 (0739)</option>
+			<option value="0839">0839 (0839)</option>
+			<option value="0840">0840 (0840)</option>
+			<option value="0841">0841 (0841)</option>
+			<option value="0938">0938 (0938)</option>
+			<option value="0939">0939 (0939)</option>
+			<option value="0940">0940 (0940)</option>
+			<option value="0941">0941 (0941)</option>
+			<option value="1000">1000 (1000)</option>
+			<option value="1037">1037 (1037)</option>
+			<option value="1038">1038 (1038)</option>
+			<option value="1039">1039 (1039)</option>
+			<option value="1040">1040 (1040)</option>
+			<option value="1041">1041 (1041)</option>
+			<option value="1137">1137 (1137)</option>
+			<option value="1138">1138 (1138)</option>
+			<option value="1139">1139 (1139)</option>
+			<option value="1140">1140 (1140)</option>
+			<option value="1141">1141 (1141)</option>
+			<option value="1234">1234 (1234)</option>
+			<option value="1237">1237 (1237)</option>
+			<option value="1238">1238 (1238)</option>
+			<option value="1239">1239 (1239)</option>
+			<option value="1337">1337 (1337)</option>
+			<option value="1338">1338 (1338)</option>
+			<option value="1339">1339 (1339)</option>
+			<option value="2017">2017 (2017)</option>
+			<option value="2020">2020 (2020)</option>
+			<option value="2040">2040 (2040)</option>
+			<option value="2050">2050 (2050)</option>
+			<option value="2060">2060 (2060)</option>
+			<option value="2070">2070 (2070)</option>
+			<option value="2080">2080 (2080)</option>
+			<option value="2090">2090 (2090)</option>
+			<option value="2110">2110 (2110)</option>
+			<option value="2400">2400 (2400)</option>
+			<option value="4000">4000 (4000)</option>
+			<option value="4010">4010 (4010)</option>
+			<option value="5001">5001 (5001)</option>
+			<option value="5002">5002 (5002)</option>
+			<option value="5003">5003 (5003)</option>
+			<option value="5004">5004 (5004)</option>
+			<option value="6000">6000 (6000)</option>
+			<option value="9000">9000 (9000)</option>
+			<option value="BKMN">BKMN (BKMN)</option>
+			<option value="BKYN">BKYN (BKYN)</option>
+			<option value="CAMR">CAMR (CAMR)</option>
+			<option value="CPEI">CPEI (CPEI)</option>
+			<option value="D&amp;M">D&amp;M (D&amp;M)</option>
+			<option value="DATN">DATN (DATN)</option>
+			<option value="DAYS">DAYS (DAYS)</option>
+			<option value="DXTR">DXTR (DXTR)</option>
+			<option value="EKLR">EKLR (EKLR)</option>
+			<option value="FIRE">FIRE (FIRE)</option>
+			<option value="G&amp;S">G&amp;S (G&amp;S)</option>
+			<option value="GNSY">GNSY (GNSY)</option>
+			<option value="HATF">HATF (HATF)</option>
+			<option value="HERN">HERN (HERN)</option>
+			<option value="HNTS">HNTS (HNTS)</option>
+			<option value="HRLM">HRLM (HRLM)</option>
+			<option value="HUME">HUME (HUME)</option>
+			<option value="JEFR">JEFR (JEFR)</option>
+			<option value="KNOB">KNOB (KNOB)</option>
+			<option value="LUBL">LUBL (LUBL)</option>
+			<option value="MCAL">MCAL (MCAL)</option>
+			<option value="MTHM">MTHM (MTHM)</option>
+			<option value="MUST">MUST (MUST)</option>
+			<option value="MYMC">MYMC (MYMC)</option>
+			<option value="NX-1">NX-1 (NX-1)</option>
+			<option value="NX-2">NX-2 (NX-2)</option>
+			<option value="PBDY">PBDY (PBDY)</option>
+			<option value="R&amp;M">R&amp;M (R&amp;M)</option>
+			<option value="RAIL">RAIL (RAIL)</option>
+			<option value="STBK">STBK (STBK)</option>
+			<option value="SYND">SYND (SYND)</option>
+			<option value="THMC">THMC (THMC)</option>
+			<option value="TRNR">TRNR (TRNR)</option>
+			<option value="TV">TV (TV)</option>
+			<option value="WE">WE (WE)</option>
+			<option value="WEED">WEED (WEED)</option>
+			<option value="WOOD">WOOD (WOOD)</option>
+			<option value="YNGS">YNGS (YNGS)</option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_webHelpID_subdivision">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Sub Division to search on.</div></td>
+	</tr><tr>
+		<td class="formLabel">Mobile Home Park:&nbsp;</td><td><select name="propertySearchOptions$mobileHome" id="propertySearchOptions_mobileHome">
+			<option value=""></option>
+			<option value="EATON4TH">EATON4TH (Bill Eaton South 4th St Court)</option>
+			<option value="CMRNCT">CMRNCT (CAMERON COURT)</option>
+			<option value="CROWE2ND">CROWE2ND (CARL ROWE 2ND ST)</option>
+			<option value="CROWE4TH">CROWE4TH (CARL ROWE 4TH ST)</option>
+			<option value="CROWERMD">CROWERMD (CARL ROWE RICHMOND)</option>
+			<option value="CTRYVIL">CTRYVIL (COUNTRY VILLAGE)</option>
+			<option value="LSD LAND">LSD LAND (MOBILE HOME ON LEASED LAND NO PARK)</option>
+			<option value="PLLMWILL">PLLMWILL (PULLIAM WILLOW ST)</option>
+			<option value="RVPK">RVPK (RV PARK)</option>
+			<option value="TRLSWST">TRLSWST (TRAILS WEST MOBILE HOME PARK)</option>
+			<option value="VLVW">VLVW (VALLEY VIEW)</option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_webHelpID_mobileHome">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Mobile Home Park to search on.</div></td>
+	</tr><tr>
+		<td class="formLabel">Condo:&nbsp;</td><td><select name="propertySearchOptions$condo" id="propertySearchOptions_condo">
+			<option value=""></option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_webHelpID_condo">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Condo type to search on.</div></td>
+	</tr><tr>
+		<td class="formLabel">Township:&nbsp;</td><td><select name="propertySearchOptions$township" id="propertySearchOptions_township">
+			<option value=""></option>
+			<option value="10">10 (Twnshp 10)</option>
+			<option value="11">11 (Twnshp 11)</option>
+			<option value="12">12 (Twnshp 12)</option>
+			<option value="13">13 (Twnshp 13)</option>
+			<option value="6">6 (Twnshp 6)</option>
+			<option value="7">7 (Twnshp 7)</option>
+			<option value="8">8 (Twnshp 8)</option>
+			<option value="9">9 (Twnshp 9)</option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_webHelpID_township">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Township to search on.</div></td>
+	</tr><tr>
+		<td class="formLabel">Range:&nbsp;</td><td><select name="propertySearchOptions$range" id="propertySearchOptions_range">
+			<option value=""></option>
+			<option value="37">37 (Rnge 37)</option>
+			<option value="38">38 (Rnge 38)</option>
+			<option value="39">39 (Rnge 39)</option>
+			<option value="40">40 (Rnge 40)</option>
+			<option value="41">41 (Rnge 41)</option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_webHelpID_range">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Range to search on.</div></td>
+	</tr><tr>
+		<td class="formLabel">Township Section:&nbsp;</td><td><input name="propertySearchOptions$townshipSection" type="text" maxlength="200" id="propertySearchOptions_townshipSection" /></td>
+	</tr><tr id="propertySearchOptions_webHelpID_townshipSection">
+		<td colspan="2"><div class="webHelp" style="display: none;">Enter the Township Section to search on.</div></td>
+	</tr>
+</table></fieldset>
+	<fieldset id="propertySearchOptions_resultsDisplay" class="search-fields">
+	<legend>Results Display</legend><table id="propertySearchOptions_tableResultsDisplay" border="0">
+	<tr id="propertySearchOptions_rowTaxYear" style="display:block;">
+		<td class="formLabel">Appraisal Year for Tax Year:&nbsp;</td><td><select name="propertySearchOptions$taxyear" id="propertySearchOptions_taxyear">
+			<option selected="selected" value="2026">2026 - 2027</option>
+			<option value="2025">2025 - 2026</option>
+			<option value="2024">2024 - 2025</option>
+			<option value="2023">2023 - 2024</option>
+			<option value="2022">2022 - 2023</option>
+			<option value="2021">2021 - 2022</option>
+			<option value="2020">2020 - 2021</option>
+			<option value="2019">2019 - 2020</option>
+			<option value="2018">2018 - 2019</option>
+			<option value="2017">2017 - 2018</option>
+			<option value="2016">2016 - 2017</option>
+			<option value="2015">2015 - 2016</option>
+			<option value="2014">2014 - 2015</option>
+			<option value="2013">2013 - 2014</option>
+			<option value="2012">2012 - 2013</option>
+			<option value="2011">2011 - 2012</option>
+			<option value="2010">2010 - 2011</option>
+			<option value="2009">2009 - 2010</option>
+			<option value="2008">2008 - 2009</option>
+			<option value="2007">2007 - 2008</option>
+			<option value="2006">2006 - 2007</option>
+			<option value="2005">2005 - 2006</option>
+			<option value="2004">2004 - 2005</option>
+			<option value="2003">2003 - 2004</option>
+			<option value="2002">2002 - 2003</option>
+			<option value="2001">2001 - 2002</option>
+			<option value="2000">2000 - 2001</option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_webHelpID_taxyear" style="display:none;">
+		<td colspan="2"><div class="webHelp" style="display: none;">Select additional options for displaying the results, for eg: Tax Year.</div></td>
+	</tr><tr id="propertySearchOptions_rowPropertyType" style="display:none;">
+		<td class="formLabel">Property Type:&nbsp;</td><td><select name="propertySearchOptions$propertyType" id="propertySearchOptions_propertyType">
+			<option selected="selected" value="All">All</option>
+			<option value="A">Auto</option>
+			<option value="MN">Mineral</option>
+			<option value="MH">Mobile Home</option>
+			<option value="P">Personal</option>
+			<option value="R">Real</option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_rowOrderResultsBy" style="display:none;">
+		<td class="formLabel">Order Results by:&nbsp;</td><td><select name="propertySearchOptions$orderResultsBy" id="propertySearchOptions_orderResultsBy">
+			<option value="Owner Name">Owner Name</option>
+			<option value="Address">Address</option>
+			<option value="Geographic ID">Geographic ID</option>
+			<option value="DBA Name">DBA Name</option>
+			<option value="Sale Date">Sale Date</option>
+
+		</select></td>
+	</tr><tr id="propertySearchOptions_rowResultsPerPage" style="display:none;">
+		<td class="formLabel">Results Per Page:&nbsp;</td><td><select name="propertySearchOptions$recordsPerPage" id="propertySearchOptions_recordsPerPage">
+			<option value="25">25</option>
+			<option value="50">50</option>
+			<option value="75">75</option>
+			<option value="100">100</option>
+			<option value="250">250</option>
+
+		</select></td>
+	</tr>
+</table></fieldset>
+	<!-- BOTTOM OPTIONS -->
+	<div id="propertySearchOptions_buttons" align="center">
+	<span id="propertySearchOptions_error" class="error"></span><div id="bottomOptions"><input type="submit" name="propertySearchOptions$search" value="Search" id="propertySearchOptions_search" class="button" />&nbsp;<input type="submit" name="propertySearchOptions$advanced" value="Advanced >>" id="propertySearchOptions_advanced" class="button" />&nbsp;<input type="button" name="propertySearchOptions$help" value="Help" onclick="return false;__doPostBack(&#39;propertySearchOptions$help&#39;,&#39;&#39;)" id="propertySearchOptions_help" class="button help" /></div></div>
+	<!-- END BOTTOM OPTIONS -->
+</div>
+
+<div id="propertySearchOptions_disclaimer" class="disclaimer">
+<h3>Disclaimer</h3>
+<p>Open public records is authorized by the state of Washington RCW 42.56. <br>2026 values for 2027 property taxes are not available at this time. To see most current ownership, please change results to display to 2026-2027</p>
+</div>
+
+<script type="text/javascript">
+$(document).ready(function() {
+	showOptions($('.searchTypeSelect', '#searchTypes').get(0));
+});
+</script>
+
+
+<script type="text/javascript">
+var gaJsHost = (("https:" == document.location.protocol) ? "https://ssl." : "http://www.");
+document.write(unescape("%3Cscript src='" + gaJsHost + "google-analytics.com/ga.js' type='text/javascript'%3E%3C/script%3E"));
+</script>
+<script type="text/javascript">
+var pageTracker = _gat._getTracker("UA-6057032-4");
+pageTracker._trackPageview();
+</script>
+<div id="footer"><table border="0" style="width:100%;">
+	<tr>
+
+	</tr><tr>
+		<td align="left">Website version: 9.0.50.1004</td><td align="center">Database last updated on: 11/14/2026 1:05 AM</td><td align="right">&copy; N. Harris Computer Corporation</td>
+	</tr>
+</table></div>
+  
+  </form>
+	
+  </body>
+</HTML>

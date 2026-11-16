@@ -113,7 +113,7 @@ Verified by Claude against primary text where marked.
   `ferry_taxsifter_tax`. Codex: NO-GO (ViewState in fixtures decoded to owner/address; malformed rows -> false
   zero; personal property) -> fixed by amend -> GO.
 - `5dbf636d` merge origin/main (migration head 162).
-- `ef85ea27` probate/divorce: `sources/wa_digital_archives` + `ferry_wa_court_index` + migration 163 (three
+- `ef85ea27` probate/divorce: `sources/wa_digital_archives` + `ferry_wa_court_index` + migration 164, was 163 before Columbia took it (three
   inactive connectors, fixed ids). Codex: NO-GO (case-history false zero; motion-to-close read as closed; untested
   pager-less branch; downgrade scope) -> fixed -> GO.
 
@@ -170,7 +170,7 @@ the paper licenses a weekly digital copy or feed of trustee-sale and probate not
   state 'WA', record_types probate+pre_foreclosure, scraper_class empty, health 'down', **active=false**, base_url
   `ferrycountyauditor.com/DisplayPage?paname=publicrecords`. That domain was the county's elections site and now
   serves a parked ad page. Harmless while inactive: only ACTIVE rows seed the scrape allowlist
-  (`security.py` ~L391) and registry matching is case-insensitive, so it neither collides with migration 163 nor
+  (`security.py` ~L391) and registry matching is case-insensitive, so it neither collides with migration 164 nor
   allowlists the parked domain. **Owner decision:** delete/retire it (a prod data change, not done).
 - Playwright QA (Chromium, not Claude in Chrome): https://bridgeleads.io/coverage at 320/375/390/430/768/1024/1440/
   1920 px, light and dark: Ferry is NOT listed at any width; no horizontal scroll; control: Chelan, Clallam, Benton

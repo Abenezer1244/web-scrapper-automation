@@ -150,18 +150,46 @@ def compose_pacs_mailing(lines: list[str]) -> str | None:
     return ", ".join(parts)[:512]  # results.mailing_address is String(512)
 
 
-def pacs_detail_url(pacs_url: str, prop_id: str) -> str:
-    """The Property.aspx detail URL on the same portal (same origin, same cid)."""
+# Portals whose Property.aspx answers HTTP 500 without &year= (Columbia, 2026-11-14).
+# Their search and detail requests name the newest year the search form offers: the
+# county says that roll shows current ownership ("2026 - 2027" in November 2026). Read
+# from the form on every pass, never fixed, so the roll-over follows the county.
+_YEAR_HOSTS = frozenset({"propertysearch.co.columbia.wa.us"})
+_TAXYEAR_FIELD = "propertySearchOptions$taxyear"
+
+
+def ownership_year(pacs_url: str, form_html: str) -> str | None:
+    """The year this portal's requests must name, or None for a portal that needs none.
+
+    Raises ValueError when the portal needs a year and its form offers none: a lookup
+    in an unknown roll could read a past owner.
+    """
+    if (urlparse(pacs_url).hostname or "").lower() not in _YEAR_HOSTS:
+        return None
+    select = BeautifulSoup(form_html or "", "html.parser").find("select", attrs={"name": _TAXYEAR_FIELD})
+    years = [o.get("value", "") for o in select.find_all("option")] if select else []
+    years = [y for y in years if re.fullmatch(r"\d{4}", y)]
+    if not years:
+        raise ValueError("PACS search form offers no tax year")
+    return max(years)
+
+
+def pacs_detail_url(pacs_url: str, prop_id: str, year: str | None = None) -> str:
+    """The Property.aspx detail URL on the same portal (same origin, same cid), naming
+    ``year`` when the portal needs one (see ``ownership_year``)."""
     parsed = urlparse(pacs_url)
     if parsed.scheme != "https" or not parsed.netloc:
         raise ValueError("PACS portal URL must be https")  # same origin, same scheme as the search
     cid = (parse_qs(parsed.query).get("cid") or ["0"])[0]
     if not cid.isdigit():
         raise ValueError("PACS cid must be numeric")
+    if year is not None and not re.fullmatch(r"\d{4}", year):
+        raise ValueError("PACS year must be four digits")
     base = pacs_url.split("?", 1)[0]
     if not base.endswith("/"):
         base = base.rsplit("/", 1)[0] + "/"
-    return urljoin(base, f"Property.aspx?cid={cid}&prop_id={prop_id}")
+    query = f"cid={cid}&prop_id={prop_id}" + (f"&year={year}" if year else "")
+    return urljoin(base, f"Property.aspx?{query}")
 
 
 def _norm_name(text: str) -> str:
@@ -259,7 +287,7 @@ def parse_pacs_result_html(html_text: str, owner_name: str | None = None) -> dic
 
 
 def mailing_from_detail(session: requests.Session, pacs_url: str, prop_id: str,
-                        timeout: int = 20) -> str | None:
+                        timeout: int = 20, year: str | None = None) -> str | None:
     """The labelled owner mailing address from one Property.aspx page, or None.
 
     None covers every non-answer (HTTP failure, no label, an empty cell, co-owner
@@ -268,7 +296,8 @@ def mailing_from_detail(session: requests.Session, pacs_url: str, prop_id: str,
     reasons. The parcel-keyed path (pacs_parcel.py) does, and uses the parser directly.
     """
     try:
-        r = session.get(pacs_detail_url(pacs_url, prop_id), timeout=timeout, allow_redirects=False)
+        r = session.get(pacs_detail_url(pacs_url, prop_id, year), timeout=timeout,
+                        allow_redirects=False)
     except requests.RequestException as exc:
         _logger.warning("PACS detail fetch failed: %s", type(exc).__name__)
         return None
@@ -393,31 +422,33 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> tuple[str, dict | Non
         sess.headers.update(_HEADERS)
         r0 = sess.get(pacs_url, timeout=_GET_TIMEOUT, allow_redirects=False)
         if r0.status_code != 200:
-            return None, None
+            return None, None, None
         vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
         ev = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', r0.text)
         vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
         if not vs:
-            return None, None
+            return None, None, None
         mode = search_type_field(r0.text, "owner")
         if mode is None:
-            return None, None   # the form cannot run a name search: not an answer
+            return None, None, None   # the form cannot run a name search: not an answer
+        year = ownership_year(pacs_url, r0.text)  # raises -> LOOKUP_FAILED below
         data = {
             "__VIEWSTATE": vs.group(1),
             "__EVENTVALIDATION": ev.group(1) if ev else "",
             "__VIEWSTATEGENERATOR": vsg.group(1) if vsg else "",
             **mode,
+            **({_TAXYEAR_FIELD: year} if year else {}),
             "propertySearchOptions$ownerName": owner_name,
             "propertySearchOptions$search": "Search",
         }
-        return sess, post_search(sess, pacs_url, data, _POST_TIMEOUT)
+        return sess, post_search(sess, pacs_url, data, _POST_TIMEOUT), year
 
     try:
         validate_scraping_target(pacs_url, require_allowlisted=False, resolve=True)
-        sess, r = None, None
+        sess, r, year = None, None, None
         for attempt in range(2):  # one retry on read timeout
             try:
-                sess, r = _do_request()
+                sess, r, year = _do_request()
                 break
             except requests.exceptions.ReadTimeout:
                 if attempt == 1:
@@ -438,7 +469,7 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> tuple[str, dict | Non
         if prop_id:
             # The grid never carries the owner's mailing address; the detail page
             # does, under its own label. One more same-origin GET per unique hit.
-            mailing = mailing_from_detail(sess, pacs_url, prop_id, timeout=_GET_TIMEOUT)
+            mailing = mailing_from_detail(sess, pacs_url, prop_id, timeout=_GET_TIMEOUT, year=year)
             if mailing:
                 result["mailing"] = mailing
         return LOOKUP_FOUND, result

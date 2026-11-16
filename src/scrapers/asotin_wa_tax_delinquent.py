@@ -16,10 +16,16 @@ answers from the last 10 days, or the job fails loudly instead of returning a sh
 or empty list.
 
 STRICT QUALITY: a qualifying parcel missing its owner, property address or mailing
-address is HELD (stays in the cache, counted in the log), never delivered.
+address is HELD (stays in the cache, counted in the log), never delivered. A situs
+without a house number ("DAYTON, WA 99328" on a rural Columbia parcel, or a bare road
+name) is not a property address and is held too.
+
+Every PACS tax county uses this reader; a county is a subclass naming COUNTY and SOURCE
+(columbia_wa_tax_delinquent).
 """
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
@@ -34,9 +40,12 @@ _logger = setup_logger("scraper.asotin_wa_tax_delinquent")
 
 RECORD_TYPE = "tax_delinquent"
 SOURCE = "asotin_pacs_tax"  # dedup._TRUSTED_TAX_SOURCES
-_COUNTY, _STATE = "asotin", "WA"
+_STATE = "WA"
 _FRESH = timedelta(days=10)
 _MIN_COVERAGE = 0.95
+# A house number is a whole token (12, 12A, 12-B, 12 1/2) followed by street text:
+# "1ST ST" (an ordinal road name) and "99328" (a ZIP) are not one.
+_HOUSE_NUMBER = re.compile(r"^\s*\d+(?:-?[A-Z])?(?:\s+\d+/\d+)?\s+[A-Z0-9]", re.I)
 
 
 def coverage(total: int, fresh: int) -> float:
@@ -66,21 +75,16 @@ def record_from_row(row: PacsTaxStatus, source: str = SOURCE) -> ScrapedRecord:
 
 
 def deliverable(row: PacsTaxStatus) -> bool:
-    return bool(row.owner_name and row.property_address and row.mailing_address)
+    return bool(row.owner_name and row.mailing_address
+                and _HOUSE_NUMBER.match(row.property_address or ""))
 
 
 class AsotinWATaxDelinquentScraper(BridgeScraper):
-    """Read Asotin's qualifying delinquent parcels out of pacs_tax_status.
+    """Read Asotin's qualifying delinquent parcels out of pacs_tax_status."""
 
-    Any county the tax crawler fills reuses this class by overriding COUNTY/SOURCE
-    (Ferry: scrapers/ferry_wa_tax_delinquent)."""
-
-    COUNTY = _COUNTY
+    COUNTY = "asotin"
     SOURCE = SOURCE
-    # The county's own "as of" date must be this recent for a row to count as fresh
-    # (None: the fetch time alone decides, as Asotin's PACS stamps the view date).
-    MAX_SOURCE_AGE: timedelta | None = None
-    # Fail instead of returning a shorter list when a qualifying parcel is held.
+    # Fail instead of returning a shorter list when a qualifying parcel is held (Ferry).
     FAIL_ON_HELD = False
 
     @classmethod
@@ -102,20 +106,28 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
         # Tax status is a snapshot, not a filing: the date window does not apply.
         self.report_stage("searching")
         since = datetime.now(UTC) - _FRESH
-        scope = (PacsTaxStatus.county == self.COUNTY, PacsTaxStatus.state == _STATE)
-        fresh_rule = [PacsTaxStatus.checked_at >= since]
-        if self.MAX_SOURCE_AGE is not None:
-            today = datetime.now(UTC).date()
-            fresh_rule += [PacsTaxStatus.as_of >= today - self.MAX_SOURCE_AGE,
-                           PacsTaxStatus.as_of <= today + timedelta(days=1)]
+        county = self.COUNTY
+        scope = (PacsTaxStatus.county == county, PacsTaxStatus.state == _STATE)
+        from src.scrapers.enrichment.source_health import get_source_state
+        from src.workers.pacs_tax_crawler import INVENTORY_KEY, INVENTORY_MAX_AGE
+
         with system_sync_session() as db:
+            # Coverage is measured against the cached inventory, so that inventory must
+            # itself be current: a refresh failing for weeks would otherwise go unseen.
+            inv = (get_source_state(db, INVENTORY_KEY(county)) or {}).get("last_success_at")
+            if inv is None or datetime.now(UTC) - inv > INVENTORY_MAX_AGE:
+                raise ScraperExecutionError(
+                    county, "pacs_tax_inventory",
+                    f"the parcel inventory was last refreshed {inv or 'never'}; "
+                    f"refusing to measure coverage against it", record_type=RECORD_TYPE,
+                )
             total = db.execute(select(func.count()).select_from(PacsTaxStatus)
                                .where(*scope)).scalar_one()
             fresh = db.execute(select(func.count()).select_from(PacsTaxStatus)
-                               .where(*scope, *fresh_rule)).scalar_one()
+                               .where(*scope, PacsTaxStatus.checked_at >= since)).scalar_one()
             rows = db.execute(select(PacsTaxStatus).where(
                 *scope,
-                *fresh_rule,
+                PacsTaxStatus.checked_at >= since,
                 PacsTaxStatus.outcome == "found",
                 PacsTaxStatus.privacy_suppression_id.is_(None),
                 PacsTaxStatus.delinquent_amount > 0,
@@ -124,7 +136,7 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
         cov = coverage(total, fresh)
         if cov < _MIN_COVERAGE:
             raise ScraperExecutionError(
-                self.COUNTY, "pacs_tax_cache",
+                county, "pacs_tax_cache",
                 f"the tax cache covers {fresh} of {total} parcels from the last "
                 f"{_FRESH.days} days ({cov:.0%}); refusing to report a partial list",
                 record_type=RECORD_TYPE,
@@ -133,14 +145,14 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
         held = len(rows) - len(records)
         if held and self.FAIL_ON_HELD:
             raise ScraperExecutionError(
-                self.COUNTY, "lead_quality",
-                f"{held} of {len(rows)} qualifying parcel(s) lack an owner, property address or "
-                "mailing address and are held; refusing to return a shorter list",
-                record_type=RECORD_TYPE,
+                county, "lead_quality",
+                f"{held} of {len(rows)} qualifying parcel(s) lack an owner, a house-numbered "
+                "property address or a mailing address and are held; refusing to return a "
+                "shorter list", record_type=RECORD_TYPE,
             )
         _logger.info("%s tax_delinquent: %d qualifying parcel(s), %d delivered, %d held "
                      "(missing owner/address/mailing); coverage %.1f%%",
-                     self.COUNTY, len(rows), len(records), held, cov * 100)
+                     county, len(rows), len(records), held, cov * 100)
         if self.on_progress:
             self.on_progress(0, 0, len(records))
         return records

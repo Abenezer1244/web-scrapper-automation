@@ -29,17 +29,31 @@ from src.workers import app
 
 _logger = setup_logger("workers.pacs_tax_crawler")
 
-# Counties with no delinquent list -> their per-parcel tax source. Ferry (TaxSifter)
-# publishes its Treasurer pages, not a list (the 2026 sale list was never posted).
-# Ferry is wired (_TAX_SOURCE) but NOT scheduled: the owner approves its first broad
-# crawl separately (tasks/ferry-wa-seven.md). Adding it here starts that crawl on deploy.
-COUNTIES = ("asotin",)
-_TAX_SOURCE = {"asotin": "pacs", "ferry": "taxsifter"}
+# Counties with no delinquent list. Ferry reads TaxSifter Treasurer pages instead of PACS
+# (owner approved its first full crawl 2026-11-15).
+COUNTIES = ("asotin", "columbia", "ferry")
+_TAX_SOURCE = {"asotin": "pacs", "columbia": "pacs", "ferry": "taxsifter"}
 _STATE = "WA"
 _BATCH = 400                        # more than one budget can reach; the rest wait
 _BUDGET_S = 20 * 60                 # inside the hourly slot, leaving the lease free
 _INVENTORY_EVERY = timedelta(days=7)
 _INVENTORY_PAGE = 2000              # the layer's maxRecordCount
+_MAX_BLANK_SHARE = 0.01
+# A tax answer needs an inventory refreshed this recently (it runs weekly: one miss allowed).
+INVENTORY_MAX_AGE = timedelta(days=14)
+INVENTORY_KEY = "pacs_tax_inventory:{}".format  # external_source_health heartbeat
+# The page's "as of" is the county's own today; a date further off is a stale or broken
+# snapshot, never a fresh answer.
+_AS_OF_SLACK = timedelta(days=3)
+# TaxSifter stamps the date its data was last loaded ("Data current as of"), not today:
+# Ferry's read 3 days old on 2026-11-15. Two weeks covers a weekly load plus one miss.
+_AS_OF_SLACK_BY_COUNTY = {"ferry": timedelta(days=14)}
+# No settled answer for this long (lost year, layout, a block): alert even when the pass
+# could ask nothing at all, which "asked but not settled" alone misses.
+_SILENT_AFTER = timedelta(hours=6)
+_LAST_SETTLED = text(
+    "SELECT max(checked_at) FROM pacs_tax_status WHERE county = :county AND state = :state"
+)
 
 _INSERT = text(
     "INSERT INTO pacs_tax_status (id, county, state, parcel_id) "
@@ -68,7 +82,6 @@ _SETTLE = text(
     WHERE county = :county AND state = :state AND parcel_id = :parcel
     """
 )
-_INVENTORY_KEY = "pacs_tax_inventory:{}".format  # external_source_health heartbeat
 _TOUCH = text(
     "UPDATE pacs_tax_status SET attempted_at = :now "
     "WHERE county = :county AND state = :state AND parcel_id = :parcel"
@@ -85,13 +98,7 @@ def statewide_parcel_ids(county: str, fetch) -> list[str]:
     scope = _wa_fips_filter(county)
     if not scope:
         raise ValueError(f"no statewide scope for {county}")
-    counted = fetch(f"{_WA_STATEWIDE_ENDPOINT}?" + urlencode(
-        {"where": "1=1" + scope, "returnCountOnly": "true", "f": "json"}))
-    expected = counted.get("count") if isinstance(counted, dict) else None
-    if not isinstance(expected, int) or expected <= 0:
-        raise ValueError(f"statewide layer gave no feature count: {str(counted)[:120]}")
     ids: list[str] = []
-    features_read = 0
     offset = 0
     while True:
         query = urlencode({
@@ -103,15 +110,30 @@ def statewide_parcel_ids(county: str, fetch) -> list[str]:
         features = data.get("features") if isinstance(data, dict) else None
         if features is None:
             raise ValueError(f"statewide layer answered without features: {str(data)[:120]}")
-        features_read += len(features)
-        ids += [str(f["attributes"]["ORIG_PARCEL_ID"]).strip() for f in features
-                if (f.get("attributes") or {}).get("ORIG_PARCEL_ID")]
-        if not data.get("exceededTransferLimit"):
-            # A truncated read would let a partial inventory pass the coverage gate (Codex).
-            if features_read != expected:
-                raise ValueError(f"statewide layer read {features_read} of {expected} features")
-            return sorted(set(ids))
+        ids += [str((f.get("attributes") or {}).get("ORIG_PARCEL_ID") or "").strip()
+                for f in features]
         offset += len(features)
+        if not data.get("exceededTransferLimit"):
+            break
+    # The layer's own count for the same scope: a short read (a dropped page, a missing
+    # transfer-limit flag) would otherwise shrink coverage's denominator.
+    counted = fetch(f"{_WA_STATEWIDE_ENDPOINT}?" + urlencode(
+        {"where": "1=1" + scope, "returnCountOnly": "true", "f": "json"}))
+    total = counted.get("count") if isinstance(counted, dict) else None
+    if total != offset:
+        raise ValueError(f"statewide layer listed {offset} features for {county}, counted {total}")
+    # A feature without a parcel id cannot be crawled, so it is not a missing parcel: the
+    # live layer has a few (Columbia 7 of 5,477) and duplicate features for multi-part
+    # parcels (190), checked 2026-11-14. More than 1% blank is a renamed or emptied field.
+    blank = sum(1 for i in ids if not i)
+    if blank > offset * _MAX_BLANK_SHARE:
+        raise ValueError(f"statewide layer: {blank} of {offset} {county} features have no parcel id")
+    distinct = sorted({i for i in ids if i})
+    if not distinct:  # no county here has zero parcels: never renew the heartbeat on it
+        raise ValueError(f"statewide layer listed no parcels for {county}")
+    _logger.info("PACS tax inventory %s: %d features, %d distinct parcels, %d without an id",
+                 county, offset, len(distinct), blank)
+    return distinct
 
 
 def _settled_row(answer, gate) -> dict:
@@ -164,13 +186,13 @@ def crawl_county(county: str, db, *, fetch, resolve, now: datetime | None = None
     summary = {"county": county, "inventory_added": 0, "asked": 0, "settled": 0, "owing": 0}
     from src.scrapers.enrichment.source_health import get_source_state, mark_source_healthy
 
-    last = (get_source_state(db, _INVENTORY_KEY(county)) or {}).get("last_success_at")
+    last = (get_source_state(db, INVENTORY_KEY(county)) or {}).get("last_success_at")
     if last is None or now - last > _INVENTORY_EVERY:
         ids = statewide_parcel_ids(county, fetch)
         summary["inventory_added"] = db.execute(
             _INSERT, {"county": county, "state": _STATE, "ids": ids}).rowcount or 0
         db.commit()
-        mark_source_healthy(db, _INVENTORY_KEY(county))  # refreshed: next one in a week
+        mark_source_healthy(db, INVENTORY_KEY(county))  # refreshed: next one in a week
     batch = [r.parcel_id for r in db.execute(
         _NEXT, {"county": county, "state": _STATE, "n": _BATCH})]
     if not batch:
@@ -182,15 +204,31 @@ def crawl_county(county: str, db, *, fetch, resolve, now: datetime | None = None
             continue  # never asked: keeps its place at the front of the queue
         summary["asked"] += 1
         key = {"county": county, "state": _STATE, "parcel": parcel, "now": now}
-        if answer.outcome in _SETTLED:
+        stale = (answer.outcome == "found"
+                 and abs(answer.as_of - now.date())
+                 > _AS_OF_SLACK_BY_COUNTY.get(county, _AS_OF_SLACK))
+        if answer.outcome in _SETTLED and not stale:
             row = _settled_row(answer, lambda r, p=parcel: gate({**r, "parcel": p}))
             db.execute(_SETTLE, {**key, **row})
             summary["settled"] += 1
             summary["owing"] += bool(row["amount"] and row["amount"] > 0)
         else:
-            db.execute(_TOUCH, key)  # asked, no answer (ambiguous, unparsed, failed)
+            db.execute(_TOUCH, key)  # asked, no answer (ambiguous, unparsed, failed, stale)
     db.commit()
     return summary
+
+
+def silent_since(county: str, db, now: datetime) -> datetime | None:
+    """Since when ``county``'s crawl has learned nothing, if longer than _SILENT_AFTER.
+
+    Measured from the last settled parcel, or for a county that never settled one (a
+    portal broken from day one) from when its inventory was loaded; None before that."""
+    from src.scrapers.enrichment.source_health import get_source_state
+
+    last = db.execute(_LAST_SETTLED, {"county": county, "state": _STATE}).scalar()
+    if last is None:
+        last = (get_source_state(db, INVENTORY_KEY(county)) or {}).get("last_success_at")
+    return last if last is not None and now - last > _SILENT_AFTER else None
 
 
 # What a settled answer is HERE: a mismatch page proves nothing about the requested
@@ -205,13 +243,12 @@ def crawl_pacs_tax() -> dict:
     from src.scrapers.enrichment import pacs_parcel, taxsifter
     from src.utils.safe_http import safe_get
 
-    resolvers = {"pacs": pacs_parcel.resolve_tax, "taxsifter": taxsifter.resolve_tax}
-
     def fetch(url: str) -> dict:
         resp = safe_get(url, timeout=30)
         resp.raise_for_status()
         return resp.json()
 
+    resolvers = {"pacs": pacs_parcel.resolve_tax, "taxsifter": taxsifter.resolve_tax}
     results = []
     for county in COUNTIES:
         try:
@@ -221,14 +258,27 @@ def crawl_pacs_tax() -> dict:
         except Exception as exc:  # noqa: BLE001 — one county must not stop the others
             _logger.error("PACS tax crawl %s failed: %s", county, str(exc)[:200])
             summary = {"county": county, "error": type(exc).__name__}
-        if summary.get("asked") and not summary.get("settled"):
-            from src.workers.ops_alerts import send_ops_alert
+        from src.workers.ops_alerts import send_ops_alert
 
+        if summary.get("asked") and not summary.get("settled"):
             send_ops_alert(
                 kind="pacs_tax_unsettled", key=f"pacs_tax_unsettled:{county}",
                 subject=f"PACS tax crawl settled nothing ({county})",
                 body=f"{summary['asked']} parcels asked, 0 answered. The PACS layout or "
                      "the tax table may have changed.",
+            )
+        try:
+            with system_sync_session() as db:
+                quiet = silent_since(county, db, datetime.now(UTC))
+        except Exception as exc:  # noqa: BLE001 — the heartbeat must not stop the crawl
+            _logger.error("PACS tax heartbeat %s unreadable: %s", county, type(exc).__name__)
+            quiet = None
+        if quiet is not None:
+            send_ops_alert(
+                kind="pacs_tax_silent", key=f"pacs_tax_silent:{county}",
+                subject=f"PACS tax crawl has settled nothing for {_SILENT_AFTER} ({county})",
+                body=f"No parcel answered since {quiet.isoformat()}. Check the county "
+                     "portal (year selector, layout, a block) and the PACS lease.",
             )
         _logger.info("PACS tax crawl: %s", summary)  # counts only, no parcels or names
         results.append(summary)

@@ -108,6 +108,56 @@ _ARCHIVE_REFRESH_DAYS = 7     # re-read an issue whose newest row is older than 
 # statutory RCW 61.24.040 notices.
 _CLARK_MAX_ADS = 60  # hard cap on ad-detail fetches per run (the listing is ~32)
 
+# security._assert_resolved_ips_safe's two DNS failures: transient, so retried. Every
+# other ValueError from safe_get (SSRF refusal, origin, HTTPS, redirects, size) is final.
+_DNS_FAILURES = frozenset({"Target host could not be resolved", "Target host did not resolve"})
+
+
+def _get_with_retry(fetch, *, waits=None, sleep=time.sleep, deadline=None, clock=time.monotonic):
+    """``fetch()`` until it answers, retrying only what can pass: a connection error or
+    timeout (not SSL), a DNS failure, HTTP 5xx or 429. Anything else is returned or
+    raised at once; no retry starts past ``deadline`` (a ``clock()`` value). Returns
+    (response or None, attempts made, last error or None)."""
+    import requests
+
+    from src.utils.celery_limits import reraise_time_limit
+
+    waits = _NWM_SITEMAP_WAITS if waits is None else waits
+    last = None
+    attempts = 0
+    for wait in waits:
+        if attempts and deadline is not None and clock() + wait >= deadline:
+            break
+        if wait:
+            sleep(wait)
+            if deadline is not None and clock() >= deadline:
+                break                      # a late wake-up starts nothing past the deadline
+        attempts += 1
+        try:
+            resp = fetch()
+        except requests.exceptions.SSLError:
+            raise                          # a certificate problem never passes on a retry
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last = exc
+            continue
+        except ValueError as exc:
+            if str(exc) not in _DNS_FAILURES:
+                raise                      # a refused target never passes on a retry
+            last = exc
+            continue
+        except Exception as exc:  # noqa: BLE001 — anything else is not transient
+            reraise_time_limit(exc)
+            raise
+        if resp.status_code >= 500 or resp.status_code == 429:
+            last = RuntimeError(f"HTTP {resp.status_code}")
+            close = getattr(resp, "close", None)
+            if close is not None:
+                close()
+            continue
+        return resp, attempts, None
+    return None, attempts, last
+
+
 # ── Lewiston Tribune on nwmarket.com (Asotin County) ──
 # ~15 new adverts/day, two requests each at the 20 s robots.txt delay. The window heals
 # a missed run or a lagging sitemap; the Redis memo keeps each advert to one read.
@@ -115,6 +165,9 @@ _NWM_WINDOW_DAYS = 7
 _NWM_MAX_ADVERTS = 60          # per run; the rest wait for the next run, logged
 _NWM_DEADLINE_S = 45 * 60      # under the 55 min soft limit
 _NWM_SEEN_TTL_S = 14 * 86400   # outlives the window
+# The sitemap is the run's only door: one transient failure (prod 2026-11-16 10:00 UTC,
+# 'Target host could not be resolved') cost the whole day and froze the heartbeat.
+_NWM_SITEMAP_WAITS = (0, 15, 45)   # seconds before each attempt
 _NWM_MIN_TEXT_CHARS = 100      # below this a PDF is unreadable (scan); real notices are 800+
 # Probate re-checks run after the advert loop, inside this much of the soft limit's slack
 # (each is one county-layer query, 20 s timeout at worst; the loop's own last advert can
@@ -423,11 +476,21 @@ def crawl_nts_nwmarket_asotin() -> dict:
         db.rollback()
 
     try:
-        resp = safe_get(nwm.SITEMAP_URL, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers)
+        resp, attempts, last = _get_with_retry(lambda: safe_get(
+            nwm.SITEMAP_URL, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers),
+            deadline=deadline)
     except Exception as exc:  # noqa: BLE001 — a bad sitemap fetch must not crash the beat
-        _logger.warning("Asotin NTS sitemap fetch failed: %s", str(exc)[:140])
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
+        resp, attempts, last = None, 1, exc
+    if resp is None:
+        _logger.warning("Asotin NTS sitemap fetch failed after %d attempt(s): %s",
+                        attempts, str(last)[:140])
         _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
         return summary
+    if attempts > 1:
+        _logger.info("Asotin NTS sitemap answered on attempt %d", attempts)
     if resp.status_code != 200:
         _logger.warning("Asotin NTS sitemap HTTP %d", resp.status_code)
         _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)

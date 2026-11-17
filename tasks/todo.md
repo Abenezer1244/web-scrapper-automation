@@ -409,7 +409,7 @@ Investigation (read-only prod) — runs 7dfa7d6c probate / 8f70234c pre / cd7ae4
   mark_not_qualified_rows). Owner chose: promote AND bill.
 
 Plan (Codex consult before code; approval between phases):
-- [ ] Phase 1 hold: at delivery, hold every non-CV record type's no-address rows (+ same-run siblings)
+- [x] Phase 1 hold (`7831916c`, Codex GO, ~1,945 tests): at delivery, hold every non-CV record type's no-address rows (+ same-run siblings)
       with delivery_excluded_reason = 'no_address'; add to EXCLUSION_REASONS; No-address list keeps
       listing held rows until late-delivered; idempotent on watchdog re-run. Stops the leak.
       Codex design consult adds: deliverable_before_cap_sql must exclude NO_ADDRESS (not just
@@ -418,7 +418,38 @@ Plan (Codex consult before code; approval between phases):
       row as no_address; keep weak-claim release; hold failure is fatal before delivery.
       Files: lead_actionability.py, plan_cap.py, tasks.py, results_category.py, run_breakdown.py
       (1a) + owner_recovery.py, property_recovery.py (1b), tests per sub-phase.
-- [ ] Phase 2 late delivery: widen cv_late_delivery to deliver + bill a held no_address row once it
+- [x] Phase 2 late delivery (`bb4e9353`, Codex NO-GO tax cap -> GO): widen cv_late_delivery to deliver + bill a held no_address row once it
       has an address (any record type), same locks/grant_records/late_delivery proof/notice; flag-gated.
-- [ ] Phase 3 historical: dry-run report of rows already promoted unbilled; owner decides.
+- [x] Phase 3 historical: dry-run report (below); owner decides. Nothing written.
+
+### Phase 3 dry run (read-only prod, 2026-11-16)
+
+Rule: done, billed, non-CV runs; a row counts when it is a live lead now (address, not excluded,
+not duplicate, not privacy-suppressed, no late_delivery) but had NEITHER address when its run was
+billed (property empty or property_recovery_last_at > billing_applied_at, AND mailing empty or
+mailing_recovery found after billing). Gap = live leads - billed_count. Ids are prefixes; no PII.
+
+A. Exact match (candidates = gap), all account b6d2095d, all still hold their claim: 45 rows
+   - Clallam probate 7dfa7d6c (2026-11-15): 3
+   - Clark probate 62404bd0: 12, 371c1a44: 10, e6e09238: 11, 5176d851: 1
+   - Jefferson probate 013bbdd6: 7
+   - King tax e629d68a: 1
+B. Partly explained (candidates < gap): King tax b2f2ecd5 (acct ba64975a) 22 of 24; King tax
+   230a1d0f 6 of 8; King pre 7afdda0c 2 of 32; Cowlitz probate 4bc38e82 1 of 7. These runs predate
+   the breakdown snapshot (Sep 2026); the rest of each gap has other causes (not this bug).
+C. Unattributable: Cowlitz probate 4f1fbb37 (gap 13) and pre dfa811a0 (gap 8): every live row now
+   has both addresses but carries no recovery stamp, so which rows were unbilled cannot be told
+   from the data. Same class of leak, written by a path that leaves no timestamp.
+D. Separate anomaly (not this bug): King tax 68d83263, acct 01dc9396 (Starter, limit 50), manual
+   run 2026-09-04, record_count 10,344, billed 0, 16,549 live leads (5,865 match the rule).
+   Looks like a pre-cap run that was never capped or billed; needs its own look.
+E. Negative gaps (live < billed; Pierce, King tax, Okanogan): rows billed that are no longer leads
+   (lost actionability later). Opposite direction; not this bug.
+
+Phase 2 does NOT touch any of these: they carry no no_address marker, so they stay live and
+unbilled. Options for the owner (nothing done without approval):
+   1. Leave them (recommended): the customer already received them; charging months later, in the
+      current window, is a surprise bill for data already used.
+   2. Stamp them no_address so Phase 2 bills them now (billing change; current window).
+   3. Hide them (stamp held, no bill): takes away leads the customer may already be working.
 - [ ] Copy (frontend repo): No-address tab wording ("may still be pending"); probate/death overlap note.

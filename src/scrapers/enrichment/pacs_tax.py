@@ -79,6 +79,34 @@ class TaxAnswer:
         return min((s.year for s in self.past_due), default=None)
 
 
+def combine_accounts(answers: list[TaxAnswer]) -> TaxAnswer:
+    """One parcel's answer from each of its tax accounts (Columbia lists some parcels
+    under two property ids, each with its own tax page).
+
+    Unknown is never zero: an account that is not ``found`` decides the whole parcel.
+    The pages must agree on their "as of" date. The parcel owes what its accounts owe
+    together; owner, situs and mailing are kept only where every account agrees, so a
+    disagreement holds the lead instead of picking one.
+    """
+    for answer in answers:
+        if answer.outcome != FOUND:
+            return answer
+    if not answers or len({a.as_of for a in answers}) != 1:
+        return TaxAnswer(UNPARSED)
+
+    def same(values):
+        values = set(values)
+        return values.pop() if len(values) == 1 else None
+
+    return TaxAnswer(
+        FOUND, as_of=answers[0].as_of,
+        statements=[s for a in answers for s in a.statements],
+        owner_name=same(a.owner_name for a in answers),
+        property_address=same(a.property_address for a in answers),
+        mailing_address=same(a.mailing_address for a in answers),
+    )
+
+
 def _money(text: str) -> Decimal | None:
     m = _MONEY.match(text.strip())
     if not m:

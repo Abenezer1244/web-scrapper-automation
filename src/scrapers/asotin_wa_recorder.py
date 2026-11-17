@@ -69,6 +69,7 @@ _COUNTY, _STATE = "asotin", "WA"
 # a 50-card page), paced.
 _CHUNK_DAYS = 180
 _PAUSE_S = 5.0
+_BLOCK_BACKOFF_S = 60.0   # one wait, then one replay of the window
 _PAGE_SIZE = 50
 _MAX_PAGES = 40
 _MAX_UNLOCKS = 2
@@ -79,6 +80,7 @@ _CRITERIA_RE = re.compile(
     r"Search\s+Criteria:\s*Date:\s*(\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\s*(.*?)\s*View\s+By",
     re.I | re.S)
 _PARCEL_RE = re.compile(r"\d{9,20}")
+_DETAIL_URL_RE = re.compile(r"/DigitalResearchRoom/Document/Details\?year=(\d{4})&document=(\d+)$")
 
 Lookup = Callable[[str], list[dict]]
 
@@ -90,6 +92,10 @@ def _fail(reason: str, **context) -> ScraperExecutionError:
 
 class SessionExpiredError(Exception):
     """The portal answered with its disclaimer: the session has to be unlocked again."""
+
+
+class PortalBlockedError(Exception):
+    """The portal refused the request (rate limit / bot wall): wait, then replay once."""
 
 
 @dataclass(frozen=True)
@@ -187,6 +193,9 @@ def parse_page(html: str, url: str = "") -> Page:
     if ("/Disclaimer" in url or soup.select_one(".g-recaptcha") is not None
             or soup.select_one("form[action$='/Disclaimer']") is not None):
         return Page("disclaimer")
+    reason = detect_block(html)
+    if reason:
+        return Page("blocked", reason=reason)
     h1 = soup.find("h1")
     if h1 is not None and _text(h1) == "Document Details":
         return Page("detail", 1, 1, 1, (_detail_card(soup),))
@@ -209,8 +218,30 @@ def parse_page(html: str, url: str = "") -> Page:
         if start is not None and end is not None and sel is not None:
             criteria = (start.get("value") or "", end.get("value") or "", _text(sel))
         return Page("empty", criteria=criteria)
-    reason = detect_block(html)
-    return Page("blocked", reason=reason) if reason else Page("unknown")
+    return Page("unknown")
+
+
+def check_detail_binding(url: str, card: Card, *, via_search: bool) -> None:
+    """A details page counts as this search's single result only when the search's own
+    submission redirected to it and its URL names the instrument it shows."""
+    m = _DETAIL_URL_RE.search(url)
+    if not via_search or m is None or card.number != f"{m.group(1)}-{m.group(2)}":
+        raise _fail("asotin recorder: a details page that is not this search's result")
+
+
+async def with_backoff(run: Callable[[], Awaitable[list]], *,
+                       sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+                       wait: float = _BLOCK_BACKOFF_S) -> list:
+    """Run ``run``; if the portal refuses it, wait once and replay it from scratch."""
+    try:
+        return await run()
+    except PortalBlockedError:
+        _logger.info("asotin recorder: portal refused a search, waiting %.0fs", wait)
+    await sleep(wait)
+    try:
+        return await run()
+    except PortalBlockedError as exc:
+        raise _fail(f"asotin recorder: the portal refused the search ({exc})") from exc
 
 
 def _mdy(d: datetime) -> str:
@@ -230,7 +261,7 @@ def check_page(page: Page, *, expected_first: int, start: datetime, end: datetim
             raise _fail("asotin recorder: results vanished while paging")
         return
     if page.state == "blocked":
-        raise _fail(f"asotin recorder: the portal refused the search ({page.reason})")
+        raise PortalBlockedError(page.reason)
     if page.state not in ("results", "detail"):
         raise _fail("asotin recorder: unreadable results page (layout changed?)")
     # A single result opens its details page, which echoes no search: its type is checked
@@ -440,7 +471,9 @@ class AsotinWARecorderScraper(BridgeScraper):
         for i, (c_start, c_end) in enumerate(search_windows(start, end)):
             if i:
                 await asyncio.sleep(_PAUSE_S)      # the portal throttles bursts
-            for card in await self._search_with_unlock(c_start, c_end):
+            window = await with_backoff(
+                lambda a=c_start, b=c_end: self._search_with_unlock(a, b))
+            for card in window:
                 cards += 1
                 if self.record_type == "death_certificate":
                     try:
@@ -490,13 +523,20 @@ class AsotinWARecorderScraper(BridgeScraper):
 
     async def _search(self, start: datetime, end: datetime) -> list[Card]:
         await self.navigate(ADVANCED_URL)
-        if parse_page(await self.page.content(), self.page.url).state == "disclaimer":
+        form = parse_page(await self.page.content(), self.page.url)
+        if form.state == "disclaimer":
             raise SessionExpiredError()
+        if form.state == "blocked":
+            raise PortalBlockedError(form.reason)
         await self.page.locator("#Filter_DocumentSubtype").select_option(self._subtype)
         await self.page.locator("#Criteria_Filter_RecordingDateStart").fill(start.strftime("%Y-%m-%d"))
         await self.page.locator("#Criteria_Filter_RecordingDateEnd").fill(end.strftime("%Y-%m-%d"))
-        async with self.page.expect_navigation(timeout=60_000):
+        async with self.page.expect_navigation(timeout=60_000) as nav:
             await self.page.locator("button:has-text('Search')").first.click()
+        response = await nav.value
+        origin = response.request.redirected_from if response is not None else None
+        # The search posts to the portal root; one result is a redirect from that post.
+        via_search = origin is not None and origin.url.rstrip("/") == ROOT.rstrip("/")
         cards: list[Card] = []
         expected = 1
         total: int | None = None
@@ -506,6 +546,8 @@ class AsotinWARecorderScraper(BridgeScraper):
             check_page(page, expected_first=expected, start=start, end=end, subtype_label=self._label)
             if page.state == "empty":
                 return []
+            if page.state == "detail":
+                check_detail_binding(self.page.url, page.cards[0], via_search=via_search and expected == 1)
             total = check_progress(page, total=total, seen=seen, start=start, end=end)
             cards.extend(page.cards)
             if page.last == page.total:

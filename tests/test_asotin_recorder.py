@@ -429,8 +429,47 @@ def test_a_rate_limited_answer_is_named_not_counted_as_zero():
             "</body></html>")
     page = ar.parse_page(html, ar.ROOT)
     assert (page.state, page.reason) == ("blocked", "rate-limited")
-    with pytest.raises(ScraperExecutionError, match="refused the search"):
+    with pytest.raises(ar.PortalBlockedError):
         _check(page)
+
+
+def test_a_block_page_that_also_carries_the_empty_form_is_still_a_block():
+    page = ar.parse_page(_empty().replace("<main>", "<main><h1>Too Many Requests</h1>"))
+    assert page.state == "blocked"
+
+
+async def test_a_refused_search_waits_once_and_replays_then_fails_loud():
+    waits: list[float] = []
+    answers = iter([ar.PortalBlockedError("rate-limited"), ["card"]])
+
+    async def run():
+        a = next(answers)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    async def sleep(seconds):
+        waits.append(seconds)
+
+    assert await ar.with_backoff(run, sleep=sleep, wait=60) == ["card"]
+    assert waits == [60]
+
+    async def always_refused():
+        raise ar.PortalBlockedError("rate-limited")
+    with pytest.raises(ScraperExecutionError, match="refused the search"):
+        await ar.with_backoff(always_refused, sleep=sleep, wait=60)
+
+
+def test_a_details_page_counts_only_as_this_searchs_redirected_result():
+    card = ar.parse_page(_detail()).cards[0]                       # instrument 2026-388852
+    url = "https://pras.asotincountywa.gov/DigitalResearchRoom/Document/Details?year=2026&document=388852"
+    ar.check_detail_binding(url, card, via_search=True)
+    with pytest.raises(ScraperExecutionError, match="not this search"):
+        ar.check_detail_binding(url, card, via_search=False)       # not reached from the search
+    with pytest.raises(ScraperExecutionError, match="not this search"):
+        ar.check_detail_binding(url.replace("388852", "388853"), card, via_search=True)
+    with pytest.raises(ScraperExecutionError, match="not this search"):
+        ar.check_detail_binding(ar.ROOT, card, via_search=True)
 
 
 def test_a_year_is_three_paced_searches_and_rolling_90_is_one():

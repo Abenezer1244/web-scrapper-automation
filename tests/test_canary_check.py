@@ -609,3 +609,17 @@ def test_other_sources_empty_everywhere_are_still_zero_output(connector, monkeyp
     c = connector(record_types=("pre_foreclosure",))
     assert _probe(c, "pre_foreclosure") == (
         "degraded", [("canary_zero_output", f"{c.county}/WA/pre_foreclosure")])
+
+
+def test_a_down_source_that_proves_an_empty_week_recovers_once(connector, monkeypatch):
+    c = connector(record_types=("pre_foreclosure",))
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE county_connectors SET scraper_class = :k WHERE id = CAST(:i AS uuid)"),
+                  {"k": _PROVES_EMPTY, "i": c.id})
+        s.commit()
+    _portal(monkeypatch, now=RuntimeError("portal broke"), history=[])
+    assert _probe(c, "pre_foreclosure") == ("down", [("canary", f"{c.county}/WA/pre_foreclosure")])
+    _portal(monkeypatch, now=[], history=[])
+    assert _probe(c, "pre_foreclosure") == (
+        "healthy", [("canary_recovered", f"{c.county}/WA/pre_foreclosure")])
+    assert _probe(c, "pre_foreclosure") == ("healthy", [])     # once, not every tick

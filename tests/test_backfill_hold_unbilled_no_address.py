@@ -103,4 +103,9 @@ async def test_only_leads_with_no_address_at_billing_are_stamped_then_billed_onc
     used = (await db.execute(text("SELECT records_used FROM users WHERE id = :u"), {"u": u.id})).scalar()
     assert late.deliver_completed_held_rows()["delivered"] == 2
     assert (await db.execute(text("SELECT records_used FROM users WHERE id = :u"), {"u": u.id})).scalar() == used + 2
+    for rid in (target, situs_after):
+        ed = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": rid})).scalar()
+        assert ed[late.LATE_KEY]["policy"] == NO_ADDRESS and DELIVERY_EXCLUDED_KEY not in ed
+    assert late.deliver_completed_held_rows()["delivered"] == 0             # a second tick never charges
+    assert (await db.execute(text("SELECT records_used FROM users WHERE id = :u"), {"u": u.id})).scalar() == used + 2
     assert _go(u, [job, cv_job], 0, apply=True)["found"] == 0             # a re-run finds nothing

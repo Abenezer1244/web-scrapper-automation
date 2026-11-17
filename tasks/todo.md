@@ -452,4 +452,8 @@ unbilled. Options for the owner (nothing done without approval):
       current window, is a surprise bill for data already used.
    2. Stamp them no_address so Phase 2 bills them now (billing change; current window).
    3. Hide them (stamp held, no bill): takes away leads the customer may already be working.
+   OWNER (2026-11-16): option 2, bill them. scripts/backfill_hold_unbilled_no_address.py stamps
+   exactly the 45 (prod read-only check of its selection: 7/10/1/12/3/1/11 = 45; account is
+   agency/unlimited, the one King tax row is 2026 and cap-exempt). Run ONLY after the Phase 2
+   deploy, with owner approval: dry run, then --apply --expect 45. King 68d83263 anomaly: later.
 - [ ] Copy (frontend repo): No-address tab wording ("may still be pending"); probate/death overlap note.

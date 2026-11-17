@@ -64,7 +64,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 **Facts learned:**
 - Asotin Helion:
-  - sitekey `6LcAudwsAAAAAKt72O-7gSUlQb-fhs_d_HiRiLR1`;
+  - the sitekey (read from the page at run time);
   - one solve unlocks the session;
   - `type=date` inputs take ISO dates;
   - `Filter_DocumentSubtype` filters server-side (Lis Penden=39, DEATH CERTIFICATE=109,

@@ -55,7 +55,6 @@ HOST = "pras.asotincountywa.gov"
 ROOT = f"https://{HOST}/DigitalResearchRoom/"
 DISCLAIMER_URL = ROOT + "Disclaimer?returnUrl=%2FDigitalResearchRoom%2F"
 ADVANCED_URL = ROOT + "?mode=Advanced"
-SITEKEY = "6LcAudwsAAAAAKt72O-7gSUlQb-fhs_d_HiRiLR1"
 add_scrape_domain(HOST)
 
 # record type -> (portal subtype value, the portal's label for it, the delivered doc_type)
@@ -471,6 +470,7 @@ class AsotinWARecorderScraper(BridgeScraper):
         for i, (c_start, c_end) in enumerate(search_windows(start, end)):
             if i:
                 await asyncio.sleep(_PAUSE_S)      # the portal throttles bursts
+            self.report_stage("searching")   # unlocking reports 'connecting' itself
             window = await with_backoff(
                 lambda a=c_start, b=c_end: self._search_with_unlock(a, b))
             for card in window:
@@ -494,9 +494,14 @@ class AsotinWARecorderScraper(BridgeScraper):
         """Solve the disclaimer's reCAPTCHA with a fresh token and agree."""
         from src.scrapers.enrichment.captcha import forget_token, solve_recaptcha
 
+        self.report_stage("connecting")
         await self.navigate(DISCLAIMER_URL)
-        forget_token(DISCLAIMER_URL, SITEKEY)       # never reuse a submitted token
-        token = await solve_recaptcha(DISCLAIMER_URL, SITEKEY)
+        # The sitekey is read from the page (public, and it may change), never kept here.
+        sitekey = await self.page.get_attribute(".g-recaptcha[data-sitekey]", "data-sitekey")
+        if not sitekey:
+            raise _fail("asotin recorder: the disclaimer carries no reCAPTCHA sitekey")
+        forget_token(DISCLAIMER_URL, sitekey)       # never reuse a submitted token
+        token = await solve_recaptcha(DISCLAIMER_URL, sitekey)
         if not token:
             raise _fail("asotin recorder: the reCAPTCHA was not solved")
         try:
@@ -510,7 +515,7 @@ class AsotinWARecorderScraper(BridgeScraper):
             async with self.page.expect_navigation(timeout=30_000):
                 await self.page.locator("form[action$='/Disclaimer'] button[type=submit]").first.click()
         finally:
-            forget_token(DISCLAIMER_URL, SITEKEY)
+            forget_token(DISCLAIMER_URL, sitekey)
         if parse_page(await self.page.content(), self.page.url).state == "disclaimer":
             raise _fail("asotin recorder: the portal refused the solved reCAPTCHA")
         self._unlocked = True
@@ -528,6 +533,7 @@ class AsotinWARecorderScraper(BridgeScraper):
             raise SessionExpiredError()
         if form.state == "blocked":
             raise PortalBlockedError(form.reason)
+        self.report_stage("searching")       # again: an unlock in between said 'connecting'
         await self.page.locator("#Filter_DocumentSubtype").select_option(self._subtype)
         await self.page.locator("#Criteria_Filter_RecordingDateStart").fill(start.strftime("%Y-%m-%d"))
         await self.page.locator("#Criteria_Filter_RecordingDateEnd").fill(end.strftime("%Y-%m-%d"))
@@ -537,6 +543,7 @@ class AsotinWARecorderScraper(BridgeScraper):
         origin = response.request.redirected_from if response is not None else None
         # The search posts to the portal root; one result is a redirect from that post.
         via_search = origin is not None and origin.url.rstrip("/") == ROOT.rstrip("/")
+        self.report_stage("scraping")
         cards: list[Card] = []
         expected = 1
         total: int | None = None

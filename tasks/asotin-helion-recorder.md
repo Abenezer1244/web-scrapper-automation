@@ -1,7 +1,7 @@
 # Asotin recorder (Helion) — divorce, death_certificate, pre_foreclosure
 
 Owner decision 2026-11-16: the 2Captcha route. The recorder portal's disclaimer carries a
-reCAPTCHA v2 (sitekey 6LcAudwsAAAAAKt72O-7gSUlQb-fhs_d_HiRiLR1). The disclaimer text holds
+reCAPTCHA v2 (the sitekey (read from the page at run time)). The disclaimer text holds
 no automated-access prohibition. One owner-approved probe established the facts below.
 
 ## Facts (live probe, 2026-11-16)

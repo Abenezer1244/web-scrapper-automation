@@ -348,10 +348,10 @@ async def test_a_locked_session_is_unlocked_first_and_endless_expiry_fails():
 def test_a_submitted_token_is_forgotten():
     from src.scrapers.enrichment import captcha
 
-    key = (ar.SITEKEY, ar.DISCLAIMER_URL, False)
+    key = ("page-sitekey", ar.DISCLAIMER_URL, False)
     captcha._token_cache[key] = ("used-token", 9e18)
     try:
-        captcha.forget_token(ar.DISCLAIMER_URL, ar.SITEKEY)
+        captcha.forget_token(ar.DISCLAIMER_URL, "page-sitekey")
         assert key not in captcha._token_cache
     finally:
         captcha._token_cache.pop(key, None)

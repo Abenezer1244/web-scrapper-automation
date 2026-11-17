@@ -16,9 +16,11 @@ parcels owed only 2026 tax after both halves were due, so skipping the current y
 
 Unknown is never zero: a page without the statement table, without a readable "as
 of" date, with a table but no statement row, or naming another parcel is ``unparsed`` /
-``parcel_mismatch``. Every real parcel has statement rows, county-owned exempt land
-included (2 each on Columbia, checked live 2026-11-14), so an empty table is layout drift,
-never "nothing owed".
+``parcel_mismatch``. Every real parcel has rows, county-owned exempt land included (2
+each on Columbia, checked live 2026-11-14), so an empty table is layout drift, never
+"nothing owed". An account with no tax billed shows ONE row of its own (blank year and
+statement id, every amount $0.00; Columbia 2026-11-17): only that zero TOTALS row is an
+answer.
 """
 from __future__ import annotations
 
@@ -77,6 +79,32 @@ class TaxAnswer:
     @property
     def oldest_delinquent_year(self) -> int | None:
         return min((s.year for s in self.past_due), default=None)
+
+
+def _known_row(tr) -> bool:
+    """A statement-table row of a shape this parser understands (PACS, Asotin and
+    Columbia alike): header (th only), detail row (rowMiddle, one cell), or a
+    statement/totals row (rowEnd, eight cells)."""
+    classes = tr.get("class") or []
+    tds = len(tr.find_all("td", recursive=False))
+    ths = len(tr.find_all("th", recursive=False))
+    if ths and not tds:
+        return True
+    if "rowMiddle" in classes:
+        return tds == 1
+    if "rowEnd" in classes:
+        return tds == 8
+    return False
+
+
+def _is_no_statement_row(tr, cells: list[str]) -> bool:
+    """The page's TOTALS row standing alone: an account with no tax billed shows only
+    its totals row (id "...totalsRow"), with a blank year and statement id and every
+    amount exactly $0.00 (Columbia, live 2026-11-17). That is an answer, nothing owed;
+    a page with NO rows, or a totals row carrying any money, is not."""
+    return (str(tr.get("id", "")).endswith("totalsRow") and len(cells) == 8
+            and not cells[0] and not cells[1]
+            and all(_money(c) == Decimal("0") for c in cells[2:]))
 
 
 def combine_accounts(answers: list[TaxAnswer]) -> TaxAnswer:
@@ -139,17 +167,28 @@ def parse_tax(html: str, parcel_key: str) -> TaxAnswer:
         return TaxAnswer(UNPARSED)
     as_of = datetime.strptime(as_of_m.group(1), "%m/%d/%Y").date()
     statements: list[Statement] = []
-    for tr in table.find_all("tr", class_="rowEnd"):
-        if tr.find_parent("table") is not table:
-            continue  # a nested jurisdiction row, never a statement
+    no_statement_row = False
+    own_rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+    # Every row of the table must have a shape we know: the header, a one-cell detail
+    # row, or an eight-cell statement/totals row. Anything else is a changed layout,
+    # never skipped: a skipped owing row beside a zero marker would read as "nothing
+    # owed" (Codex P1, two rounds).
+    if not all(_known_row(tr) for tr in own_rows):
+        return TaxAnswer(UNPARSED)
+    for tr in own_rows:
+        if "rowEnd" not in (tr.get("class") or []):
+            continue  # headers, and the one-cell detail rows nesting per-district tables
         cells = [td.get_text(" ", strip=True) for td in tr.find_all("td", recursive=False)]
+        if _is_no_statement_row(tr, cells):
+            no_statement_row = True
+            continue
         if len(cells) != 8 or not cells[0].isdigit():
             return TaxAnswer(UNPARSED)
         due, penalty, interest = _money(cells[7]), _money(cells[4]), _money(cells[5])
         if due is None or penalty is None or interest is None:
             return TaxAnswer(UNPARSED)
         statements.append(Statement(int(cells[0]), cells[1], due, penalty, interest))
-    if not statements:
+    if not statements and not no_statement_row:
         return TaxAnswer(UNPARSED)  # a renamed row class must not read as "paid"
     return TaxAnswer(
         FOUND, as_of=as_of, statements=statements,

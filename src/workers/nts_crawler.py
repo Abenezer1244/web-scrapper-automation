@@ -130,6 +130,8 @@ def _get_with_retry(fetch, *, waits=None, sleep=time.sleep, deadline=None, clock
             break
         if wait:
             sleep(wait)
+            if deadline is not None and clock() >= deadline:
+                break                      # a late wake-up starts nothing past the deadline
         attempts += 1
         try:
             resp = fetch()

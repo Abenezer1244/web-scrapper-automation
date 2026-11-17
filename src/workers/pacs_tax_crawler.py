@@ -136,6 +136,17 @@ def statewide_parcel_ids(county: str, fetch) -> list[str]:
     return distinct
 
 
+def _owed_by_year(statements) -> dict[str, str]:
+    """Past-due amount per tax year. Summed, never last-wins: a parcel the county lists
+    under two accounts has one statement per account for the same year (Codex)."""
+    from decimal import Decimal
+
+    owed: dict[str, Decimal] = {}
+    for s in statements:
+        owed[str(s.year)] = owed.get(str(s.year), Decimal("0")) + s.amount_due
+    return {year: str(amount) for year, amount in owed.items()}
+
+
 def _settled_row(answer, gate) -> dict:
     """The column values one settled answer writes."""
     from src.scrapers.enrichment.pacs_tax import FOUND
@@ -146,7 +157,7 @@ def _settled_row(answer, gate) -> dict:
         return row
     row.update(as_of=answer.as_of, amount=answer.delinquent_amount,
                oldest=answer.oldest_delinquent_year,
-               years=json.dumps({str(s.year): str(s.amount_due) for s in answer.past_due}))
+               years=json.dumps(_owed_by_year(answer.past_due)))
     # Personal fields only with an owner: an ownerless row could neither be delivered
     # (the scraper holds it) nor be found by erasure, which keys on the owner.
     if answer.delinquent_amount > 0 and answer.owner_name:

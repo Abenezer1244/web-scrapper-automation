@@ -31,14 +31,14 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from bs4 import BeautifulSoup
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, chunk_windows
+from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.doc_scope import from_keyword_map
 from src.scrapers.doc_types import normalize_doc_type
 from src.scrapers.enrichment import asotin_parcels as ap
@@ -208,6 +208,38 @@ def check_page(page: Page, *, expected_first: int, start: datetime, end: datetim
                 f"asotin recorder: a {card.doc_type!r} card in a {subtype_label!r} search")
 
 
+def search_windows(start: datetime, end: datetime, days: int = _CHUNK_DAYS) -> list[tuple[datetime, datetime]]:
+    """Inclusive, non-overlapping windows covering start..end (a same-day request is one
+    window): the portal's date search includes both ends."""
+    out = []
+    cursor = start
+    while cursor <= end:
+        edge = min(cursor + timedelta(days=days - 1), end)
+        out.append((cursor, edge))
+        cursor = edge + timedelta(days=1)
+    return out
+
+
+def check_progress(page: Page, *, total: int | None, seen: set[str], start: datetime,
+                   end: datetime) -> int:
+    """Across the pages of one search: the total never changes, no instrument repeats,
+    and every card was recorded inside the window. Returns the total. Pure but for
+    ``seen``, which it fills."""
+    if total is not None and page.total != total:
+        raise _fail(f"asotin recorder: the result count moved from {total} to {page.total} while paging")
+    for card in page.cards:
+        if card.number in seen:
+            raise _fail(f"asotin recorder: instrument {card.number} came back twice")
+        seen.add(card.number)
+        try:
+            day = datetime.strptime(_recorded_mdy(card.recorded), "%m/%d/%Y")
+        except ValueError as exc:
+            raise _fail(f"asotin recorder: unreadable recording date {card.recorded!r}") from exc
+        if not start <= day <= end:
+            raise _fail(f"asotin recorder: instrument {card.number} recorded outside the window")
+    return page.total
+
+
 def _recorded_mdy(recorded: str) -> str:
     return recorded.split()[0]
 
@@ -257,11 +289,16 @@ def death_certificate_records(card: Card, lookup: Lookup) -> tuple[list[ScrapedR
 
 def lis_pendens_records(card: Card) -> tuple[list[ScrapedRecord], list[str]]:
     """One lead per parcel the card prints; none (or SEE ATTACHED) is held."""
-    oriented = orient_pre_foreclosure_party("; ".join(card.direct) or None,
-                                            "; ".join(card.indirect) or None)
-    if oriented is None:
+    # Each indexed party is judged on its own: the helper splits stacked names only on
+    # ' / ', so joining a bank and a person on one side would lose the person.
+    direct = [p for p in (_person(n) for n in card.direct) if p]
+    indirect = [p for p in (_person(n) for n in card.indirect) if p]
+    if direct:
+        party, other = " / ".join(direct), "; ".join(card.indirect) or None
+    elif indirect:
+        party, other = " / ".join(indirect), "; ".join(card.direct) or None
+    else:
         return [], ["no_person_party"]      # bank against trustee: no homeowner lead
-    party, other = oriented
     parcels = [p for p in card.parcels if _PARCEL_RE.fullmatch(p)]
     if not parcels:
         return [], ["no_parcel_on_record"]
@@ -272,6 +309,32 @@ def lis_pendens_records(card: Card) -> tuple[list[ScrapedRecord], list[str]]:
                          "all_parcels": list(card.parcels), "counterparty": other},
         raw_html_hash=_hash("pre_foreclosure", card.number, parcel)) for parcel in parcels]
     return records, []
+
+
+def _person(name: str) -> str | None:
+    """The person(s) in one indexed party, or None for a company, agency or trustee."""
+    oriented = orient_pre_foreclosure_party(name, None)
+    return oriented[0] if oriented else None
+
+
+async def with_unlock(unlock: Callable[[], Awaitable[None]],
+                      search: Callable[[], Awaitable[list]], *, unlocked: bool,
+                      max_unlocks: int = _MAX_UNLOCKS) -> list:
+    """Run ``search``, unlocking first when the session is locked and again (at most
+    ``max_unlocks`` times in all) whenever it answers with the disclaimer."""
+    unlocks = 0
+    while True:
+        if not unlocked:
+            if unlocks >= max_unlocks:
+                raise _fail("asotin recorder: the session kept expiring")
+            unlocks += 1
+            await unlock()
+            unlocked = True
+        try:
+            return await search()
+        except SessionExpiredError:
+            unlocked = False
+            _logger.info("asotin recorder: session expired, unlocking again")
 
 
 _SUFFIXES = {"JR", "SR", "II", "III", "IV"}
@@ -324,7 +387,7 @@ class AsotinWARecorderScraper(BridgeScraper):
         records: list[ScrapedRecord] = []
         held: dict[str, int] = {}
         cards = 0
-        for c_start, c_end in chunk_windows(start, end, _CHUNK_DAYS):
+        for c_start, c_end in search_windows(start, end):
             for card in await self._search_with_unlock(c_start, c_end):
                 cards += 1
                 if self.record_type == "death_certificate":
@@ -368,15 +431,10 @@ class AsotinWARecorderScraper(BridgeScraper):
         self._unlocked = True
 
     async def _search_with_unlock(self, start: datetime, end: datetime) -> list[Card]:
-        for attempt in range(_MAX_UNLOCKS + 1):
-            if not self._unlocked:
-                await self._unlock()
-            try:
-                return await self._search(start, end)
-            except SessionExpiredError:
-                self._unlocked = False
-                _logger.info("asotin recorder: session expired, unlocking again (%d)", attempt + 1)
-        raise _fail("asotin recorder: the session kept expiring")
+        cards = await with_unlock(self._unlock, lambda: self._search(start, end),
+                                  unlocked=self._unlocked)
+        self._unlocked = True
+        return cards
 
     async def _search(self, start: datetime, end: datetime) -> list[Card]:
         await self.navigate(ADVANCED_URL)
@@ -389,11 +447,14 @@ class AsotinWARecorderScraper(BridgeScraper):
             await self.page.locator("button:has-text('Search')").first.click()
         cards: list[Card] = []
         expected = 1
+        total: int | None = None
+        seen: set[str] = set()
         for _ in range(_MAX_PAGES):
             page = parse_page(await self.page.content(), self.page.url)
             check_page(page, expected_first=expected, start=start, end=end, subtype_label=self._label)
             if page.state == "empty":
                 return []
+            total = check_progress(page, total=total, seen=seen, start=start, end=end)
             cards.extend(page.cards)
             if page.last == page.total:
                 if len(cards) != page.total:

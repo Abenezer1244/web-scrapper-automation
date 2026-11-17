@@ -261,3 +261,97 @@ async def test_an_unusable_window_fails_before_any_request():
 def test_the_scope_shows_what_is_collected_and_the_module_is_allowlisted():
     assert "src.scrapers.asotin_wa_recorder" in _ALLOWED_SCRAPER_MODULES
     assert ar.AsotinWARecorderScraper.collection_scope("divorce") is None
+
+
+# --- windows, paging progress, parties, sessions (Codex review, Phase 1) ----------------
+
+def test_windows_are_inclusive_and_never_overlap():
+    d = datetime
+    assert ar.search_windows(d(2026, 11, 3), d(2026, 11, 3)) == [(d(2026, 11, 3), d(2026, 11, 3))]
+    wins = ar.search_windows(d(2026, 1, 1), d(2026, 3, 15), days=31)
+    assert wins == [(d(2026, 1, 1), d(2026, 1, 31)), (d(2026, 2, 1), d(2026, 3, 3)),
+                    (d(2026, 3, 4), d(2026, 3, 15))]
+    assert ar.search_windows(d(2026, 1, 2), d(2026, 1, 1)) == []
+
+
+def _page(numbers, total, first=1, recorded="11/04/2026 03:02 PM"):
+    return ar.parse_page(_results([_card(n, "DEATH CERTIFICATE", ["DOE, ADA M"], recorded=recorded)
+                                   for n in numbers], total=total, first=first))
+
+
+def test_paging_never_repeats_an_instrument_or_moves_the_total():
+    seen: set[str] = set()
+    total = ar.check_progress(_page(["2026-1", "2026-2"], 4), total=None, seen=seen, start=_START, end=_END)
+    assert total == 4
+    # The next page advances its header but repeats an instrument: refused.
+    with pytest.raises(ScraperExecutionError, match="came back twice"):
+        ar.check_progress(_page(["2026-2", "2026-3"], 4, first=3), total=total, seen=set(seen),
+                          start=_START, end=_END)
+    with pytest.raises(ScraperExecutionError, match="moved from 4 to 5"):
+        ar.check_progress(_page(["2026-3", "2026-4"], 5, first=3), total=total, seen=set(seen),
+                          start=_START, end=_END)
+
+
+def test_a_card_recorded_outside_the_window_or_undated_is_refused():
+    for recorded, match in (("07/14/2026 09:00 AM", "outside the window"),
+                            ("11/15/2026 09:00 AM", "outside the window"),
+                            ("soon", "unreadable recording date")):
+        with pytest.raises(ScraperExecutionError, match=match):
+            ar.check_progress(_page(["2026-9"], 1, recorded=recorded), total=None, seen=set(),
+                              start=_START, end=_END)
+
+
+def test_a_person_beside_a_company_on_one_side_is_kept():
+    records, held = ar.lis_pendens_records(
+        _lis(["10510000400000000"], direct=("BANK OF NOWHERE NA", "DOE, ADA M"),
+             indirect=("ACME TRUSTEE SERVICES LLC",)))
+    assert held == [] and records[0].party_name == "DOE, ADA M"
+    records, _ = ar.lis_pendens_records(
+        _lis(["10510000400000000"], direct=("BANK OF NOWHERE NA",),
+             indirect=("DOE, ADA M", "DOE, JOHN Q", "QUICK LOANS INC")))
+    assert records[0].party_name == "DOE, ADA M / DOE, JOHN Q"
+
+
+async def test_an_expired_session_is_unlocked_again_and_the_search_replayed():
+    calls: list[str] = []
+    answers = iter([ar.SessionExpiredError(), ["card"]])
+
+    async def unlock():
+        calls.append("unlock")
+
+    async def search():
+        calls.append("search")
+        a = next(answers)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    assert await ar.with_unlock(unlock, search, unlocked=True) == ["card"]
+    assert calls == ["search", "unlock", "search"]
+
+
+async def test_a_locked_session_is_unlocked_first_and_endless_expiry_fails():
+    calls: list[str] = []
+
+    async def unlock():
+        calls.append("unlock")
+
+    async def always_expired():
+        calls.append("search")
+        raise ar.SessionExpiredError()
+
+    with pytest.raises(ScraperExecutionError, match="kept expiring"):
+        await ar.with_unlock(unlock, always_expired, unlocked=False, max_unlocks=2)
+    assert calls == ["unlock", "search", "unlock", "search"]
+
+
+def test_a_submitted_token_is_forgotten():
+    from src.scrapers.enrichment import captcha
+
+    key = (ar.SITEKEY, ar.DISCLAIMER_URL, False)
+    captcha._token_cache[key] = ("used-token", 9e18)
+    try:
+        captcha.forget_token(ar.DISCLAIMER_URL, ar.SITEKEY)
+        assert key not in captcha._token_cache
+    finally:
+        captcha._token_cache.pop(key, None)

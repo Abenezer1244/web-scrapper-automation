@@ -15,7 +15,10 @@ parcels owed only 2026 tax after both halves were due, so skipping the current y
 (as the Snohomish bulk file does) would drop nearly every Asotin delinquency.
 
 Unknown is never zero: a page without the statement table, without a readable "as
-of" date, or naming another parcel is ``unparsed`` / ``parcel_mismatch``.
+of" date, with a table but no statement row, or naming another parcel is ``unparsed`` /
+``parcel_mismatch``. Every real parcel has statement rows, county-owned exempt land
+included (2 each on Columbia, checked live 2026-11-14), so an empty table is layout drift,
+never "nothing owed".
 """
 from __future__ import annotations
 
@@ -76,6 +79,34 @@ class TaxAnswer:
         return min((s.year for s in self.past_due), default=None)
 
 
+def combine_accounts(answers: list[TaxAnswer]) -> TaxAnswer:
+    """One parcel's answer from each of its tax accounts (Columbia lists some parcels
+    under two property ids, each with its own tax page).
+
+    Unknown is never zero: an account that is not ``found`` decides the whole parcel.
+    The pages must agree on their "as of" date. The parcel owes what its accounts owe
+    together; owner, situs and mailing are kept only where every account agrees, so a
+    disagreement holds the lead instead of picking one.
+    """
+    for answer in answers:
+        if answer.outcome != FOUND:
+            return answer
+    if not answers or len({a.as_of for a in answers}) != 1:
+        return TaxAnswer(UNPARSED)
+
+    def same(values):
+        values = set(values)
+        return values.pop() if len(values) == 1 else None
+
+    return TaxAnswer(
+        FOUND, as_of=answers[0].as_of,
+        statements=[s for a in answers for s in a.statements],
+        owner_name=same(a.owner_name for a in answers),
+        property_address=same(a.property_address for a in answers),
+        mailing_address=same(a.mailing_address for a in answers),
+    )
+
+
 def _money(text: str) -> Decimal | None:
     m = _MONEY.match(text.strip())
     if not m:
@@ -118,6 +149,8 @@ def parse_tax(html: str, parcel_key: str) -> TaxAnswer:
         if due is None or penalty is None or interest is None:
             return TaxAnswer(UNPARSED)
         statements.append(Statement(int(cells[0]), cells[1], due, penalty, interest))
+    if not statements:
+        return TaxAnswer(UNPARSED)  # a renamed row class must not read as "paid"
     return TaxAnswer(
         FOUND, as_of=as_of, statements=statements,
         owner_name=owner_name, property_address=situs,

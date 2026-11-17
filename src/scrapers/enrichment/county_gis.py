@@ -119,6 +119,10 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
             "/Assessor/Parcels/MapServer/0/query"
         ),
         "parcel_field": "PARCNO",
+        # Cowlitz parcel numbers can be 5 characters ("03110", "21044"); the default
+        # 6-char floor skipped all 27 such leads (2026-11-15). County query only: the
+        # statewide fallback keeps its 6-char floor.
+        "min_parcel_len": 5,
         "address_part_fields": [
             "SITUS_STREET_NUMBER", "SITUS_STREET_DIRECTION", "SITUS_STREET_NAME",
             "SITUS_STREET_SUFFIX", "SITUS_STREET_UNIT",
@@ -184,6 +188,13 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
 }
 
 _MAILING_KEYS = ("mailing_street_fields", "mailing_locality_fields", "mailing_fields")
+
+
+def gis_min_parcel_len(county: str | None, state: str | None) -> int:
+    """Shortest parcel id worth a GIS lookup in this county: 6, unless the county's own
+    layer is known to use shorter ids (Cowlitz: 5). Every eligibility gate uses this."""
+    cfg = _KNOWN_GIS_ENDPOINTS.get(f"{(county or '').lower()}_{(state or '').upper()}") or {}
+    return cfg.get("min_parcel_len", 6)
 
 
 def _effective_gis_config(county_key: str) -> dict | None:
@@ -699,7 +710,8 @@ def _empty() -> dict[str, str | None]:
 # The PACS counties and Thurston (audit 2026-10-02: every one of them stored 0% mailing
 # because it had no source here) answer through pacs_parcel.py / thurston_assessor.py,
 # which close parcel identity on the county's own page before taking an address.
-_PACS_MAILING_COUNTIES = ("benton", "clallam", "jefferson", "grant", "whatcom", "island", "chelan", "asotin")
+_PACS_MAILING_COUNTIES = ("benton", "clallam", "jefferson", "grant", "whatcom", "island", "chelan", "asotin",
+                          "columbia")
 _BULK_MAILING_SOURCES: dict[str, str] = {
     "snohomish_WA": "snohomish_assessor_roll",
     "clark_WA": "clark_pic",
@@ -1407,13 +1419,14 @@ def _batch_query_county(
     out_fields = gis_config.get("out_fields", "*")
     results: dict[str, dict] = {}
     chunk_size = 50
+    min_len = gis_config.get("min_parcel_len", 6)
 
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
         # clean (query/server form) -> every caller id that spells it that way.
         clean_to_originals: dict[str, list[str]] = {}
         for pid in chunk:
-            if pid and len(pid.strip()) >= 6:
+            if pid and len(pid.strip()) >= min_len:
                 clean_to_originals.setdefault(pid.replace("-", "").strip(), []).append(pid)
         if not clean_to_originals:
             continue
@@ -1514,28 +1527,23 @@ def _batch_query_wa_statewide(
     results: dict[str, dict] = {}
     chunk_size = 50
 
-    for i in range(0, len(parcel_ids), chunk_size):
-        chunk = parcel_ids[i:i + chunk_size]
-
-        # Build (query_value, original_parcel_id) pairs so we can map
-        # responses back to the scraper's parcel_id regardless of format.
-        # Formatters may return multiple candidate formats (e.g., Kitsap
-        # uses two different dash patterns) — we try them all.
-        query_pairs: list[tuple[str, str]] = []
-        for pid in chunk:
-            if not pid or len(pid.strip()) < 6:
-                continue
-            plain = pid.replace("-", "").strip()
-            if formatter:
-                candidates = formatter(plain)
-                if candidates:
-                    for c in candidates:
-                        query_pairs.append((c, pid))
-                    continue
-            query_pairs.append((plain, pid))
-
-        if not query_pairs:
+    # Build (query_value, original_parcel_id) pairs so we can map responses back to
+    # the scraper's parcel_id regardless of format. Formatters may return several
+    # candidate formats (Kitsap uses two dash patterns) — we try them all.
+    all_pairs: list[tuple[str, str]] = []
+    for pid in parcel_ids:
+        if not pid or len(pid.strip()) < 6:
             continue
+        plain = pid.replace("-", "").strip()
+        candidates = (formatter(plain) if formatter else None) or [plain]
+        all_pairs.extend((c, pid) for c in candidates)
+
+    # Chunked by QUERY VALUES, not parcels: the IN clause rides in a GET URL, and
+    # Kitsap's two spellings per parcel made a 50-parcel chunk 100 values long. Past
+    # ~26 Kitsap parcels the service refused the URL and the whole batch came back
+    # empty, so no Kitsap probate lead got a property address (2026-11-16).
+    for i in range(0, len(all_pairs), chunk_size):
+        query_pairs = all_pairs[i:i + chunk_size]
 
         # Reverse map: query_value -> every caller parcel_id that asked for it. The
         # same _callers_for resolver as the county path, so a returned id that
@@ -1562,6 +1570,9 @@ def _batch_query_wa_statewide(
             # S4: safe_http (SSRF defense-in-depth) — see batch note above.
             resp = safe_get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=30)
             if resp.status_code != 200:
+                # Never silent: this is how a whole county's addresses went missing.
+                _logger.warning("Statewide GIS batch: HTTP %s for %d %s parcel value(s)",
+                                resp.status_code, len(query_pairs), county)
                 continue
 
             data = resp.json()

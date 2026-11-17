@@ -492,7 +492,8 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
                        # A settled parcel_not_found keeps the snapshot too: the extract
                        # that lacked it is part of that proof.
                        snapshot=(data.get("snapshot")
-                                 if mailing or outcome == "parcel_not_found" else None))
+                                 if mailing or outcome == "parcel_not_found" else None),
+                       extra=_owner_keys(row, data.get("owner_name") if mailing else None))
 
         _key = {"found": "found", "none": "none", "parcel_not_found": "none",
                 "parcel_mismatch": "parcel_mismatch",
@@ -500,8 +501,22 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
         stats[_key] = stats.get(_key, 0) + 1
 
 
+def _owner_keys(row, owner: str | None) -> dict:
+    """The probate family's display-only current-owner keys, as the inline path writes
+    them (enrich._run_inline_enrichment): the recovery sweep fills most PACS mailing
+    addresses, so without this a recovered row never said who holds title now
+    (Benton 2026-11-15: a parcel an unrelated buyer owns carried no flag)."""
+    if not owner or getattr(row, "record_type", None) not in ("probate", "death_certificate"):
+        return {}
+    from src.utils.lead_formatting import classify_probate_title_status
+
+    return {"assessor_current_owner": owner,
+            "title_status": classify_probate_title_status(getattr(row, "party_name", None), owner)}
+
+
 def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
-               source: str | None = None, snapshot: str | None = None) -> None:
+               source: str | None = None, snapshot: str | None = None,
+               extra: dict | None = None) -> None:
     """Conditional single-row write. Never overwrites, never widens its blast radius.
 
     The guard is the WHERE clause, not a read-then-write: this tick's lookup began
@@ -530,6 +545,8 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
         payload["mailing_source"] = source
         if snapshot:
             payload["mailing_rpacct_snapshot"] = snapshot
+    # In the same guarded UPDATE, so they land only when this write fills the mailing.
+    payload.update(extra or {})
     # The owner-location flags are derived from the mailing address, and the job's
     # own recompute (tasks.py) ran while it was still NULL. Without this a recovered
     # absentee owner never reaches the absentee / out-of-state filters. Computed only
@@ -626,7 +643,7 @@ _GIS_CANDIDATE_PARCELS_SQL = """
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
     WHERE r.mailing_address IS NULL
       AND r.parcel_id IS NOT NULL
-      AND length(btrim(r.parcel_id)) >= 6
+      AND length(btrim(r.parcel_id)) >= 5  -- per-county floor applied in Python (gis_min_parcel_len)
       AND coalesce(r.enrichment_data->>'mailing_lookup_deferred', '') = 'true'
       AND coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) < :max_attempts
       AND j.status = 'done'
@@ -639,7 +656,8 @@ _GIS_CANDIDATE_PARCELS_SQL = """
 
 _GIS_CANDIDATE_SQL = """
     SELECT r.id, r.user_id, r.parcel_id, r.enrichment_data,
-           r.property_address, r.property_city, r.property_state, r.property_zip
+           r.property_address, r.property_city, r.property_state, r.property_zip,
+           r.party_name, sc.record_type
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -661,6 +679,7 @@ def recover_deferred_gis_mailing() -> dict:
     from src.scrapers.enrichment.county_gis import (
         batch_enrich_parcels_gis,
         gis_mailing_source_counties,
+        gis_min_parcel_len,
         has_gis_mailing_source,
     )
 
@@ -680,6 +699,8 @@ def recover_deferred_gis_mailing() -> dict:
             sa_text(_GIS_CANDIDATE_PARCELS_SQL),
             {"max_attempts": _MAX_ATTEMPTS, "counties": counties},
         ).all()
+        parcel_rows = [r for r in parcel_rows
+                       if len(r.parcel_id) >= gis_min_parcel_len(r.county, "WA")]
         picked = sorted(parcel_rows,
                         key=lambda r: (r.attempts, r.last_at, r.county, r.parcel_id))
         picked = picked[:_GIS_BATCH_PARCELS]
@@ -755,6 +776,8 @@ def recover_deferred_gis_mailing() -> dict:
                     # A page that named a different parcel says nothing about this one.
                     "parcel_lookup": "mismatch" if lookup == "parcel_mismatch" else None,
                     "source": row.get("mailing_source"),
+                    # The assessor's current owner, when the source names it (PACS).
+                    "owner_name": row.get("owner_name"),
                 }
             stats["parcels"] += len(attempted)
             _apply(db, by_parcel, attempted, enriched, stats)

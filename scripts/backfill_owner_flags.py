@@ -102,6 +102,73 @@ def recompute_suffixless(commit: bool) -> None:
     print(f"corrected: {changed}" + ("" if commit else "  (DRY RUN — re-run with --commit)"))
 
 
+# Recompute (2026-11-15) of every absentee_owner=TRUE row after the same-place fixes
+# (glued city on Chelan situs, unit spellings on King). Writes ONLY absentee_owner, so
+# a repair can never overwrite the state / out-of-state flags (Codex). Keyset paging,
+# because a corrected row leaves the TRUE set and OFFSET would skip rows; the UPDATE
+# re-checks the inputs it was computed from, so a concurrent edit is skipped, not clobbered.
+_SELECT_ABSENTEE = text(
+    """
+    SELECT id, property_address, mailing_address, property_city, property_state, property_zip
+    FROM results
+    WHERE absentee_owner IS TRUE AND id > :after
+      AND property_address IS NOT NULL AND mailing_address IS NOT NULL
+    ORDER BY id
+    LIMIT :lim
+    """
+)
+_UPDATE_ABSENTEE = text(
+    """
+    UPDATE results SET absentee_owner = :absentee
+    WHERE id = :id AND absentee_owner IS TRUE
+      AND property_address IS NOT DISTINCT FROM :pa AND mailing_address IS NOT DISTINCT FROM :ma
+      AND property_city IS NOT DISTINCT FROM :pc AND property_state IS NOT DISTINCT FROM :ps
+      AND property_zip IS NOT DISTINCT FROM :pz
+    """
+)
+
+
+def recompute_absentee(commit: bool, batch: int) -> None:
+    after = "00000000-0000-0000-0000-000000000000"
+    scanned = to_false = to_none = written = skipped = 0
+    shown = 0
+    with system_sync_session() as db:
+        while True:
+            rows = db.execute(_SELECT_ABSENTEE, {"after": after, "lim": batch}).fetchall()
+            if not rows:
+                break
+            for rid, pa, ma, pc, ps, pz in rows:
+                scanned += 1
+                new = compute_owner_flags(pa, ma, property_city=pc, property_state=ps,
+                                          property_zip=pz)["absentee_owner"]
+                if new is True:
+                    continue
+                if new is False:
+                    to_false += 1
+                else:
+                    to_none += 1
+                if shown < 40:  # sample for operator review in the run log
+                    print(f"  {rid}: True -> {new}  [{pa!r} vs {ma!r}]", flush=True)
+                    shown += 1
+                if commit:
+                    n = db.execute(_UPDATE_ABSENTEE, {"id": rid, "absentee": new, "pa": pa, "ma": ma,
+                                                      "pc": pc, "ps": ps, "pz": pz}).rowcount
+                    written += n
+                    skipped += 1 - n
+            after = str(rows[-1][0])
+            if commit:
+                db.commit()
+            print(f"  scanned={scanned} true->false={to_false} true->none={to_none}", flush=True)
+    print("\n=== absentee recompute ===")
+    print(f"scanned:       {scanned}")
+    print(f"True -> False: {to_false}")
+    print(f"True -> None:  {to_none}")
+    if commit:
+        print(f"written: {written}  skipped (row changed meanwhile): {skipped}")
+    else:
+        print("DRY RUN - re-run with --commit")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--commit", action="store_true", help="apply updates (default: dry run)")
@@ -110,7 +177,14 @@ def main() -> None:
         "--recompute-suffixless", action="store_true",
         help="only re-evaluate absentee=TRUE rows whose mailing street extends the property street",
     )
+    ap.add_argument(
+        "--recompute-absentee", action="store_true",
+        help="re-evaluate every absentee=TRUE row with the structured situs parts; writes absentee_owner only",
+    )
     args = ap.parse_args()
+    if args.recompute_absentee:
+        recompute_absentee(args.commit, max(100, min(args.batch, 5000)))
+        return
     if args.recompute_suffixless:
         recompute_suffixless(args.commit)
         return

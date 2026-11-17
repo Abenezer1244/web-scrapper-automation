@@ -47,7 +47,7 @@ nothing from the request tables.
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,7 +56,9 @@ from sqlalchemy import text
 from src.privacy import keys
 from src.privacy.subjects import (
     KIND_UNRESOLVED,
+    NAME_ORDER_NATURAL,
     NORMALIZATION_VERSION,
+    Subject,
     email_key_value,
     phone_key_value,
     subject_key_values,
@@ -284,16 +286,29 @@ def _hmac(kind: str, value: str, version: str) -> str:
         raise RuleSnapshotError(f"privacy key {version} unavailable: {exc}") from exc
 
 
+def natural_order_subjects(names: Iterable[Any], *, source_field: str) -> list[Subject]:
+    """Subjects for people a source names in natural order outside the row (a probate
+    notice's personal representatives), one name at a time. Anything that is not a
+    non-empty string names nobody."""
+    return [s for name in names if isinstance(name, str) and name.strip()
+            for s in subjects_from(name, role="contact", source_field=source_field,
+                                   name_order=NAME_ORDER_NATURAL)]
+
+
 def authorize(snapshot: RuleSnapshot, row: Any, *, record_type: str | None,
-              county: str | None, state: str | None) -> Decision:
-    """Whether ``row`` (a Result or a dict with its columns) may be delivered."""
+              county: str | None, state: str | None,
+              extra_subjects: Sequence[Subject] = ()) -> Decision:
+    """Whether ``row`` (a Result or a dict with its columns) may be delivered.
+
+    ``extra_subjects`` are people tied to the row who are not in its columns (built with
+    natural_order_subjects); they are judged exactly like the row's own subjects."""
     if not snapshot.by_anchor:
         return Decision(ALLOWED)
     if isinstance(row, Mapping):
         missing = [c for c in ROW_COLUMNS if c not in row]
         if missing:  # a caller's projection bug: fail the operation, never allow
             raise RuleSnapshotError(f"row is missing authorize() columns {missing}")
-    subjects = _subjects(row, record_type, county)
+    subjects = _subjects(row, record_type, county) + list(extra_subjects)
     anchors = _anchor_values(row, county, state)
     unresolved = any(s.kind == KIND_UNRESOLVED for s in subjects)
     keyed_subjects = [kv for s in subjects for kv in subject_key_values(s)]

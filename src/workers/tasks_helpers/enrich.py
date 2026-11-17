@@ -1267,9 +1267,11 @@ def _run_inline_enrichment(
 
     # GIS batch enrichment for property AND mailing addresses
     # Run for records missing either property address or mailing address
+    from src.scrapers.enrichment.county_gis import gis_min_parcel_len
+    min_pid = gis_min_parcel_len(config.county, config.state)  # Cowlitz ids can be 5 chars
     results_need_addr = [
         res for res in lookup_rows
-        if res.parcel_id and len(res.parcel_id.strip()) >= 6
+        if res.parcel_id and len(res.parcel_id.strip()) >= min_pid
         and (not res.property_address or res.property_address == "(enrichment unavailable)"
              or not res.mailing_address)
     ]
@@ -1351,14 +1353,16 @@ def _run_inline_enrichment(
                         # path does. Display-only: never overwrites party_name, never drops
                         # the lead (heirs are valid sellers; the assessor lags). Benton,
                         # 2026-11-15: a death certificate recorded for a sale named a parcel
-                        # an unrelated buyer now owns, and nothing on the lead said so.
+                        # an unrelated buyer now owns, and nothing on the lead said so. An
+                        # owner string naming a care-of or a representative (Asotin prints
+                        # 'ESTATE C/O <rep> PR') is not shown, and a stored pair is removed.
                         _owner = gis_data.get("owner_name")
                         if _owner and config.record_type in ("probate", "death_certificate"):
-                            from src.utils.lead_formatting import classify_probate_title_status
+                            from src.utils.lead_formatting import current_owner_fields
                             _ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                            _ed["assessor_current_owner"] = _owner
-                            _ed["title_status"] = classify_probate_title_status(res.party_name, _owner)
-                            res.enrichment_data = _ed
+                            _ed.pop("assessor_current_owner", None)
+                            _ed.pop("title_status", None)
+                            res.enrichment_data = _ed | current_owner_fields(res.party_name, _owner)
                         if mail and bulk_source:
                             _bulk_fills.append((res, gis_data))
                         # Migration 085 (#188) — capture the REAL situs parts BEFORE the
@@ -1909,7 +1913,7 @@ def _run_inline_enrichment(
                                 job_id, str(exc)[:120])
         needs = [
             res for res in lookup_rows
-            if res.parcel_id and len(res.parcel_id.strip()) >= 6
+            if res.parcel_id and len(res.parcel_id.strip()) >= min_pid
             # A privacy-withheld lead (its owner tombstoned above) gets no county request.
             and res.privacy_suppressed_at is None
             and (not res.mailing_address
@@ -1999,7 +2003,7 @@ def _run_inline_enrichment(
             # (suspenders, so probate/death-cert King rows sharing this enrichment
             # path are never touched).
             from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
-            from src.utils.lead_formatting import classify_probate_title_status
+            from src.utils.lead_formatting import current_owner_fields
             # (is_tax_delinquent computed above, where it also selects `needs`.)
             # Probate + death-cert: party_name is the DECEASED. The Assessor's owner
             # is who holds title NOW — often an heir/trust. Surface it + a conservative
@@ -2093,12 +2097,14 @@ def _run_inline_enrichment(
                             res.party_name = owner
                         # Display-only: record the Assessor's current owner + a humble
                         # "differs/entity" flag. NEVER overwrite party_name, NEVER drop the
-                        # lead (Assessor lag; heirs are valid motivated sellers).
+                        # lead (Assessor lag; heirs are valid motivated sellers). An owner
+                        # string naming a care-of or a representative is not shown, and
+                        # one stored by an earlier enrichment is removed.
                         if is_probate_family and owner:
                             ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                            ed["assessor_current_owner"] = owner
-                            ed["title_status"] = classify_probate_title_status(res.party_name, owner)
-                            res.enrichment_data = ed
+                            ed.pop("assessor_current_owner", None)
+                            ed.pop("title_status", None)
+                            res.enrichment_data = ed | current_owner_fields(res.party_name, owner)
                         # The county printed a malformed parcel and we recovered the
                         # real one. parcel_id STAYS as the county printed it (it feeds
                         # the frozen dedup_hash); the resolved PIN + the evidence that
@@ -2668,7 +2674,7 @@ def _run_inline_enrichment(
             summary["mailing_missing"] = len([
                 res for res in all_results
                 if not res.is_duplicate and not res.mailing_address
-                and res.parcel_id and len(res.parcel_id.strip()) >= 6
+                and res.parcel_id and len(res.parcel_id.strip()) >= min_pid
             ])
         except Exception as exc:  # noqa: BLE001 -- a report must never fail the job
             _logger.warning("mailing_missing count skipped: %s", str(exc)[:120])

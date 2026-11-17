@@ -213,6 +213,11 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
             "auction_location": notice.auction_location,
             "source": notice.source,
             "source_url": notice.source_url,
+            # The address the notice printed, when property_address is the parcel's
+            # current site address instead (migration 164); None otherwise.
+            "address_on_notice": (
+                notice.address_on_notice if notice.address_source == "assessor_situs" else None
+            ),
         },
     }
     return rec
@@ -288,6 +293,13 @@ class _TrusteeSaleScraper(BridgeScraper):
         horizon = today + timedelta(days=span) if span is not None else None
 
         with system_sync_session() as db:
+            # Read under the cancellation lock, shared: an operator's address refresh
+            # (exclusive) either sees this job running and refuses, or commits before
+            # this read, so a run never delivers an address a refresh has since replaced
+            # (Codex P1). Held only for this read transaction.
+            from src.workers.nts_matcher_task import take_nts_cancel_lock_shared
+
+            take_nts_cancel_lock_shared(db)
             conditions = [
                 func.lower(NtsNotice.county) == self.COUNTY,
                 NtsNotice.is_active.is_(True),
@@ -466,6 +478,34 @@ class ChelanWATrusteeSaleScraper(_TrusteeSaleScraper):
             kind="document_type",
             items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
             note="Recorded trustee-sale notices from the Chelan County Auditor's recorded documents, "
+                 "each reviewed against its recorded image.",
+        )
+
+
+class CowlitzWATrusteeSaleScraper(_TrusteeSaleScraper):
+    """Cowlitz County (WA) auction leads: recorded notices (CCITT scans from the
+    Laserfiche viewer, OCR'd), each one checked by an operator against its recorded
+    image before it is a notice (nts_crawler.approve_recorder_document)."""
+
+    COUNTY = "cowlitz"
+
+    def _source_gap(self, db, now: datetime) -> str | None:
+        # A recording not yet reviewed (or not readable) is a sale missing from the cache,
+        # however fresh the crawl is: checked here, at delivery time (as Chelan).
+        from src.workers.nts_crawler import recorder_unresolved_reason
+
+        return recorder_unresolved_reason(db, now, "cowlitz")
+
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type != RECORD_TYPE:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
+            note="Recorded trustee-sale notices from the Cowlitz County Auditor's recorded documents, "
                  "each reviewed against its recorded image.",
         )
 

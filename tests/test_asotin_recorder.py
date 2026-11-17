@@ -355,3 +355,84 @@ def test_a_submitted_token_is_forgotten():
         assert key not in captcha._token_cache
     finally:
         captcha._token_cache.pop(key, None)
+
+
+# --- migration 165 -----------------------------------------------------------------------
+
+def _migration():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / \
+        "165_add_asotin_lis_pendens_connector.py"
+    spec = importlib.util.spec_from_file_location("_mig165", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod, path.read_text(encoding="utf-8")
+
+
+def test_the_connector_offers_lis_pendens_only_and_is_seeded_off():
+    import importlib
+
+    mig, source = _migration()
+    assert (mig.revision, mig.down_revision) == ("165", "164")
+    module_path, name = mig._SCRAPER_CLASS.rsplit(".", 1)
+    assert module_path in _ALLOWED_SCRAPER_MODULES
+    assert getattr(importlib.import_module(module_path), name) is ar.AsotinWARecorderScraper
+    assert mig._RECORD_TYPES == '["pre_foreclosure"]'
+    values = source.split("SELECT", 1)[1].split("WHERE NOT EXISTS")[0]
+    assert values.strip().endswith("false")          # the owner switches it on
+    # The canary takes this source's proven empty weeks as healthy (health.py).
+    assert ar.AsotinWARecorderScraper.CANARY_ACCEPTS_VALIDATED_EMPTY is True
+
+
+def _detail(number="2026-388852", recorded="03/02/2026 02:15:09 PM", doc_type="Lis Penden",
+            direct=("BANK OF NOWHERE NA",), indirect=("DOE, ADA M",), parcels=("10510000400000000",)):
+    lis = lambda xs: "".join(f"<li>{x}</li>" for x in xs)  # noqa: E731
+    rows = "".join(f"<tr><td>{p}</td><td>1</td><td>24</td><td>LOT 1</td></tr>" for p in parcels)
+    return f"""<html><body><main><h1 class="font-size-h2">Document Details</h1>
+      <div class="row"><div class="col-sm-4"><strong>Document Number:</strong>
+        <span class="recording-link label-document-number">{number}</span></div>
+      <div class="col-sm-4"><p class="font-size-h5">Recording Date</p></div>
+      <div class="col-sm-8"><p class="flex-container"><span>{recorded}</span></p></div>
+      <div class="col-sm-4"><p class="font-size-h5">Document Type</p></div>
+      <div class="col-sm-8"><p>{doc_type}</p></div></div>
+      <div class="tab-section"><h3>Parties</h3><div class="flex-container">
+        <div><h4 class="header-h5">DIRECT</h4><ul class="list-unstyled">{lis(direct)}</ul></div>
+        <div><h4 class="header-h5">INDIRECT</h4><ul class="list-unstyled">{lis(indirect)}</ul></div></div></div>
+      <div class="tab-section"><h3>Legal Descriptions</h3><table class="table-condensed">
+        <thead><tr><th>Tax Parcel #</th><th>Section</th><th>Township</th><th>Legal</th></tr></thead>
+        <tbody>{rows}</tbody></table></div></main></body></html>"""
+
+
+def test_a_single_result_opens_its_details_page_which_is_read_as_one_card():
+    page = ar.parse_page(_detail(), "https://x/DigitalResearchRoom/Document/Details?year=2026&document=1")
+    assert (page.state, page.total, page.first, page.last) == ("detail", 1, 1, 1)
+    [card] = page.cards
+    assert (card.number, card.recorded, card.doc_type) == ("2026-388852", "03/02/2026 02:15:09 PM", "Lis Penden")
+    assert (card.direct, card.indirect, card.parcels) == (
+        ("BANK OF NOWHERE NA",), ("DOE, ADA M",), ("10510000400000000",))
+    start, end = datetime(2026, 3, 1), datetime(2026, 3, 31)
+    ar.check_page(page, expected_first=1, start=start, end=end, subtype_label="Lis Penden")
+    assert ar.check_progress(page, total=None, seen=set(), start=start, end=end) == 1
+    # It echoes no search, so its own type and date are what keep it honest.
+    with pytest.raises(ScraperExecutionError, match="'Deed' card"):
+        ar.check_page(ar.parse_page(_detail(doc_type="Deed")), expected_first=1, start=start,
+                      end=end, subtype_label="Lis Penden")
+    with pytest.raises(ScraperExecutionError, match="outside the window"):
+        ar.check_progress(ar.parse_page(_detail(recorded="04/01/2026 09:00:00 AM")), total=None,
+                          seen=set(), start=start, end=end)
+
+
+def test_a_rate_limited_answer_is_named_not_counted_as_zero():
+    html = ("<html><head><title>Too Many Requests</title></head><body><header>Asotin</header>"
+            "</body></html>")
+    page = ar.parse_page(html, ar.ROOT)
+    assert (page.state, page.reason) == ("blocked", "rate-limited")
+    with pytest.raises(ScraperExecutionError, match="refused the search"):
+        _check(page)
+
+
+def test_a_year_is_three_paced_searches_and_rolling_90_is_one():
+    assert len(ar.search_windows(datetime(2026, 1, 1), datetime(2026, 12, 31))) == 3
+    assert len(ar.search_windows(datetime(2026, 8, 18), datetime(2026, 11, 15))) == 1   # rolling 90

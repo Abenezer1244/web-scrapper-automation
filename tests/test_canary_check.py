@@ -574,3 +574,38 @@ def test_a_time_limit_inside_the_marker_step_stops_the_run(connector, monkeypatc
             health._probe_unit(c, "probate", [])
         else:
             health._apply_mark(c, "probate", ("ok", "1 records in the last 7 days"))
+
+
+# --- a source that proves its empty answers (Asotin's recorder) ------------------------
+
+_PROVES_EMPTY = "src.scrapers.asotin_wa_recorder.AsotinWARecorderScraper"
+
+
+@pytest.mark.parametrize("status", ["healthy", "unknown", "degraded"])
+def test_a_validated_empty_week_is_healthy_without_a_history_probe(connector, monkeypatch, status):
+    calls = _portal(monkeypatch, now=[], history=[])
+    c = connector(record_types=("pre_foreclosure",), status=status)
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE county_connectors SET scraper_class = :k WHERE id = CAST(:i AS uuid)"),
+                  {"k": _PROVES_EMPTY, "i": c.id})
+        s.commit()
+    assert _probe(c, "pre_foreclosure") == ("healthy", [])
+    assert calls == [_THIS_WEEK]                         # no historical probe, no extra solves
+
+
+def test_a_validated_empty_source_that_breaks_is_still_down(connector, monkeypatch):
+    _portal(monkeypatch, now=RuntimeError("portal changed"), history=[])
+    c = connector(record_types=("pre_foreclosure",))
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE county_connectors SET scraper_class = :k WHERE id = CAST(:i AS uuid)"),
+                  {"k": _PROVES_EMPTY, "i": c.id})
+        s.commit()
+    status, alerts = _probe(c, "pre_foreclosure")
+    assert status == "down" and [k for k, _ in alerts] == ["canary"]
+
+
+def test_other_sources_empty_everywhere_are_still_zero_output(connector, monkeypatch):
+    _portal(monkeypatch, now=[], history=[])
+    c = connector(record_types=("pre_foreclosure",))
+    assert _probe(c, "pre_foreclosure") == (
+        "degraded", [("canary_zero_output", f"{c.county}/WA/pre_foreclosure")])

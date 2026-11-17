@@ -9,6 +9,7 @@ Flow (read live 2026-11-16):
    "I Agree". The session then searches and pages with no further captcha.
 2. /?mode=Advanced: ISO dates (``type=date``) and a server-side document subtype.
 3. Results: "N Results Found Displaying results a - b", 50 cards a page, "Next 50".
+   Exactly one result: the portal opens that document's details page instead.
    No results: "No matching results found", with the form echoing the search.
 
 Record types, owner decision 2026-11-16:
@@ -29,6 +30,7 @@ portal will not unlock fails the run (ScraperExecutionError).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from collections.abc import Awaitable, Callable
@@ -44,7 +46,7 @@ from src.scrapers.doc_types import normalize_doc_type
 from src.scrapers.enrichment import asotin_parcels as ap
 from src.scrapers.preforeclosure import orient_pre_foreclosure_party
 from src.scrapers.probate import orient_probate_party
-from src.scrapers.reliability import ScraperExecutionError
+from src.scrapers.reliability import ScraperExecutionError, detect_block
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.asotin_wa_recorder")
@@ -62,13 +64,17 @@ SUBTYPES: dict[str, tuple[str, str, str]] = {
     "pre_foreclosure": ("39", "Lis Penden", "LIS PENDENS"),
 }
 _COUNTY, _STATE = "asotin", "WA"
-_CHUNK_DAYS = 31
+# The portal answers a burst of searches with "Too Many Requests" (read live 2026-11-16):
+# a few wide windows (lis pendens run ~2 a year, death certificates ~2 a month, far under
+# a 50-card page), paced.
+_CHUNK_DAYS = 180
+_PAUSE_S = 5.0
 _PAGE_SIZE = 50
 _MAX_PAGES = 40
 _MAX_UNLOCKS = 2
 
 _HEADER_RE = re.compile(
-    r"([\d,]+)\s+Results?\s+Found\s+Displaying\s+results\s+([\d,]+)\s*-\s*([\d,]+)", re.I)
+    r"([\d,]+)\s+Results?\s+Found\s+Displaying\s+results?\s+([\d,]+)\s*-\s*([\d,]+)", re.I)
 _CRITERIA_RE = re.compile(
     r"Search\s+Criteria:\s*Date:\s*(\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\s*(.*?)\s*View\s+By",
     re.I | re.S)
@@ -98,12 +104,13 @@ class Card:
 
 @dataclass(frozen=True)
 class Page:
-    state: str                 # results | empty | disclaimer | unknown
+    state: str                 # results | detail | empty | disclaimer | blocked | unknown
     total: int = 0
     first: int = 0
     last: int = 0
     cards: tuple[Card, ...] = ()
     criteria: tuple[str, str, str] | None = None   # (from M/D/YYYY, to, subtype label)
+    reason: str | None = None                       # why a blocked page refused
 
 
 def _text(el) -> str:
@@ -144,12 +151,45 @@ def _card(el) -> Card:
     return Card(_text(link), recorded, doc_type, tuple(direct), tuple(indirect), tuple(parcels))
 
 
+def _value_after(soup, label: str) -> str:
+    """On a document's details page: the value column beside a label paragraph."""
+    p = soup.find("p", string=lambda t: t is not None and t.strip() == label)
+    col = p.find_parent("div") if p is not None else None
+    value = col.find_next_sibling("div") if col is not None else None
+    return _text(value)
+
+
+def _detail_card(soup) -> Card:
+    """A search with ONE result opens that document's details page instead of a list."""
+    parties: dict[str, list[str]] = {"DIRECT": [], "INDIRECT": []}
+    for h4 in soup.find_all("h4"):
+        side = _text(h4).upper()
+        ul = h4.find_next_sibling("ul")
+        if side in parties and ul is not None:
+            parties[side] = [_text(li) for li in ul.find_all("li") if _text(li)]
+    parcels: list[str] = []
+    for table in soup.find_all("table"):
+        heads = [_text(th) for th in table.select("thead th")]
+        if "Tax Parcel #" in heads:
+            col = heads.index("Tax Parcel #")
+            for tr in table.select("tbody tr"):
+                tds = tr.find_all("td")
+                if len(tds) > col and _text(tds[col]):
+                    parcels.append(_text(tds[col]))
+    return Card(_text(soup.select_one(".label-document-number")), _value_after(soup, "Recording Date"),
+                _value_after(soup, "Document Type"), tuple(parties["DIRECT"]),
+                tuple(parties["INDIRECT"]), tuple(parcels))
+
+
 def parse_page(html: str, url: str = "") -> Page:
     """What one portal page says. Pure: no network."""
     soup = BeautifulSoup(html, "html.parser")
     if ("/Disclaimer" in url or soup.select_one(".g-recaptcha") is not None
             or soup.select_one("form[action$='/Disclaimer']") is not None):
         return Page("disclaimer")
+    h1 = soup.find("h1")
+    if h1 is not None and _text(h1) == "Document Details":
+        return Page("detail", 1, 1, 1, (_detail_card(soup),))
     header = soup.select_one("#search-results-header")
     if header is not None:
         text = _text(header)
@@ -169,7 +209,8 @@ def parse_page(html: str, url: str = "") -> Page:
         if start is not None and end is not None and sel is not None:
             criteria = (start.get("value") or "", end.get("value") or "", _text(sel))
         return Page("empty", criteria=criteria)
-    return Page("unknown")
+    reason = detect_block(html)
+    return Page("blocked", reason=reason) if reason else Page("unknown")
 
 
 def _mdy(d: datetime) -> str:
@@ -188,10 +229,15 @@ def check_page(page: Page, *, expected_first: int, start: datetime, end: datetim
         if expected_first != 1:
             raise _fail("asotin recorder: results vanished while paging")
         return
-    if page.state != "results":
+    if page.state == "blocked":
+        raise _fail(f"asotin recorder: the portal refused the search ({page.reason})")
+    if page.state not in ("results", "detail"):
         raise _fail("asotin recorder: unreadable results page (layout changed?)")
-    if page.criteria is None or page.criteria[:2] != (_mdy(start), _mdy(end)) \
-            or page.criteria[2].casefold() != subtype_label.casefold():
+    # A single result opens its details page, which echoes no search: its type is checked
+    # below and its recording date against the window (check_progress).
+    if page.state == "results" and (
+            page.criteria is None or page.criteria[:2] != (_mdy(start), _mdy(end))
+            or page.criteria[2].casefold() != subtype_label.casefold()):
         raise _fail(f"asotin recorder: results for another search ({page.criteria})")
     if page.first != expected_first or page.last < page.first or page.last > page.total:
         raise _fail(
@@ -356,6 +402,10 @@ def recorder_to_natural(name: str) -> str | None:
 class AsotinWARecorderScraper(BridgeScraper):
     """Asotin death certificates and lis pendens from the Helion recorder portal."""
 
+    # An empty answer is proven to be this search (check_page), so the canary may take
+    # an empty week as a verified zero (scheduler_helpers/health.py).
+    CANARY_ACCEPTS_VALIDATED_EMPTY = True
+
     @classmethod
     def collection_scope(cls, record_type: str):
         if record_type not in SUBTYPES:
@@ -387,7 +437,9 @@ class AsotinWARecorderScraper(BridgeScraper):
         records: list[ScrapedRecord] = []
         held: dict[str, int] = {}
         cards = 0
-        for c_start, c_end in search_windows(start, end):
+        for i, (c_start, c_end) in enumerate(search_windows(start, end)):
+            if i:
+                await asyncio.sleep(_PAUSE_S)      # the portal throttles bursts
             for card in await self._search_with_unlock(c_start, c_end):
                 cards += 1
                 if self.record_type == "death_certificate":

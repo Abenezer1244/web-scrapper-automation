@@ -108,6 +108,56 @@ _ARCHIVE_REFRESH_DAYS = 7     # re-read an issue whose newest row is older than 
 # statutory RCW 61.24.040 notices.
 _CLARK_MAX_ADS = 60  # hard cap on ad-detail fetches per run (the listing is ~32)
 
+# security._assert_resolved_ips_safe's two DNS failures: transient, so retried. Every
+# other ValueError from safe_get (SSRF refusal, origin, HTTPS, redirects, size) is final.
+_DNS_FAILURES = frozenset({"Target host could not be resolved", "Target host did not resolve"})
+
+
+def _get_with_retry(fetch, *, waits=None, sleep=time.sleep, deadline=None, clock=time.monotonic):
+    """``fetch()`` until it answers, retrying only what can pass: a connection error or
+    timeout (not SSL), a DNS failure, HTTP 5xx or 429. Anything else is returned or
+    raised at once; no retry starts past ``deadline`` (a ``clock()`` value). Returns
+    (response or None, attempts made, last error or None)."""
+    import requests
+
+    from src.utils.celery_limits import reraise_time_limit
+
+    waits = _NWM_SITEMAP_WAITS if waits is None else waits
+    last = None
+    attempts = 0
+    for wait in waits:
+        if attempts and deadline is not None and clock() + wait >= deadline:
+            break
+        if wait:
+            sleep(wait)
+            if deadline is not None and clock() >= deadline:
+                break                      # a late wake-up starts nothing past the deadline
+        attempts += 1
+        try:
+            resp = fetch()
+        except requests.exceptions.SSLError:
+            raise                          # a certificate problem never passes on a retry
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last = exc
+            continue
+        except ValueError as exc:
+            if str(exc) not in _DNS_FAILURES:
+                raise                      # a refused target never passes on a retry
+            last = exc
+            continue
+        except Exception as exc:  # noqa: BLE001 — anything else is not transient
+            reraise_time_limit(exc)
+            raise
+        if resp.status_code >= 500 or resp.status_code == 429:
+            last = RuntimeError(f"HTTP {resp.status_code}")
+            close = getattr(resp, "close", None)
+            if close is not None:
+                close()
+            continue
+        return resp, attempts, None
+    return None, attempts, last
+
+
 # ── Lewiston Tribune on nwmarket.com (Asotin County) ──
 # ~15 new adverts/day, two requests each at the 20 s robots.txt delay. The window heals
 # a missed run or a lagging sitemap; the Redis memo keeps each advert to one read.
@@ -115,6 +165,9 @@ _NWM_WINDOW_DAYS = 7
 _NWM_MAX_ADVERTS = 60          # per run; the rest wait for the next run, logged
 _NWM_DEADLINE_S = 45 * 60      # under the 55 min soft limit
 _NWM_SEEN_TTL_S = 14 * 86400   # outlives the window
+# The sitemap is the run's only door: one transient failure (prod 2026-11-16 10:00 UTC,
+# 'Target host could not be resolved') cost the whole day and froze the heartbeat.
+_NWM_SITEMAP_WAITS = (0, 15, 45)   # seconds before each attempt
 _NWM_MIN_TEXT_CHARS = 100      # below this a PDF is unreadable (scan); real notices are 800+
 # Probate re-checks run after the advert loop, inside this much of the soft limit's slack
 # (each is one county-layer query, 20 s timeout at worst; the loop's own last advert can
@@ -423,11 +476,21 @@ def crawl_nts_nwmarket_asotin() -> dict:
         db.rollback()
 
     try:
-        resp = safe_get(nwm.SITEMAP_URL, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers)
+        resp, attempts, last = _get_with_retry(lambda: safe_get(
+            nwm.SITEMAP_URL, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers),
+            deadline=deadline)
     except Exception as exc:  # noqa: BLE001 — a bad sitemap fetch must not crash the beat
-        _logger.warning("Asotin NTS sitemap fetch failed: %s", str(exc)[:140])
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
+        resp, attempts, last = None, 1, exc
+    if resp is None:
+        _logger.warning("Asotin NTS sitemap fetch failed after %d attempt(s): %s",
+                        attempts, str(last)[:140])
         _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
         return summary
+    if attempts > 1:
+        _logger.info("Asotin NTS sitemap answered on attempt %d", attempts)
     if resp.status_code != 200:
         _logger.warning("Asotin NTS sitemap HTTP %d", resp.status_code)
         _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
@@ -1323,6 +1386,10 @@ def chelan_cache_is_fresh(summary: dict) -> bool:
 
 
 def chelan_unresolved_reason(db, now: datetime) -> str | None:
+    return recorder_unresolved_reason(db, now, "chelan")
+
+
+def recorder_unresolved_reason(db, now: datetime, county: str) -> str | None:
     """Why Chelan's notice cache is short, or None: a recording first seen more than
     RECORDER_REVIEW_LAG_DAYS ago that is still awaiting review, or could not be read
     (failed, including expired unreviewed), until an operator approves or rejects it.
@@ -1332,7 +1399,7 @@ def chelan_unresolved_reason(db, now: datetime) -> str | None:
     from src.db.models import NtsRecorderDocument as Doc
 
     oldest = db.execute(select(func.min(Doc.created_at)).where(
-        Doc.county == "chelan", Doc.status.in_(("pending_review", "failed")),
+        Doc.county == county, Doc.status.in_(("pending_review", "failed")),
         Doc.created_at < now - timedelta(days=RECORDER_REVIEW_LAG_DAYS))).scalar()
     if oldest is None:
         return None
@@ -1365,7 +1432,9 @@ def purge_stale_recorder_documents(db, now: datetime | None = None) -> int:
 
 
 def stage_recorder_document(db, *, county: str, state: str, doc: dict, detail_html: str | None,
-                            pdf: bytes | None, tesseract: str | None = None) -> str:
+                            pdf: bytes | None, tesseract: str | None = None,
+                            recording_apns: list[str] | None = None,
+                            related_dts: list[str] | None = None) -> str:
     """OCR one discovered recording into staging; returns the status written, or
     "kept" when an existing row must not change. Caller commits.
 
@@ -1386,8 +1455,9 @@ def stage_recorder_document(db, *, county: str, state: str, doc: dict, detail_ht
 
     now = datetime.now(UTC)
     record_date = datetime.strptime(doc["record_date"], "%m/%d/%Y").date()
-    apns = parse_detail_apns(detail_html) if detail_html else None
-    dts = related_deeds_of_trust(detail_html) if detail_html else None
+    # Chelan reads them off the detail page; Laserfiche lists them in entry properties.
+    apns = parse_detail_apns(detail_html) if detail_html else recording_apns
+    dts = related_deeds_of_trust(detail_html) if detail_html else related_dts
     kw = {"tesseract": tesseract} if tesseract else {}
     out = (read_notice(pdf, record_date, **kw) if pdf
            else {"ok": False, "reason": "pdf not downloaded", "pdf_sha256": None})
@@ -1442,6 +1512,28 @@ def purge_nts_recorder_staging() -> int:
 
 # ── operator review: a staged recording becomes a notice only on approval (4a-3a) ──
 CHELAN_RECORDER_SOURCE = "chelan_recorder"
+COWLITZ_RECORDER_SOURCE = "cowlitz_recorder"
+_COWLITZ_RECORDER = "https://www.cowlitzinfo.net/WLAudPublic"
+# The counties whose recorded notices are staged and reviewed here. A notice's codes,
+# its nts_notices source and its public page differ by recorder; everything else is
+# shared. A discontinuance is staged as "NOD" for every county.
+_RECORDER_PROFILES = {
+    ("chelan", "WA"): {
+        "source": CHELAN_RECORDER_SOURCE, "nts_codes": frozenset(_CHELAN_NTS_CODES),
+        "url": lambda item: f"{_CHELAN_RECORDER}/details/documentdetails/{item}/1/1/11",
+    },
+    ("cowlitz", "WA"): {
+        "source": COWLITZ_RECORDER_SOURCE, "nts_codes": frozenset({"NTTRUS"}),
+        "url": lambda item: f"{_COWLITZ_RECORDER}/DocView.aspx?id={item}&dbid=0&repo=CCIMAGES",
+    },
+}
+
+
+def _profile(county: str, state: str) -> dict:
+    prof = _RECORDER_PROFILES.get((county, state))
+    if prof is None:
+        raise ReviewError(f"no recorder review pipeline for {county}, {state}")
+    return prof
 _AMOUNT_BASES = ("principal", "sum_owing")   # migration 128's CHECK
 _AMOUNT_MAX = 10 ** 10                       # nts_notices.principal_owing is Numeric(12, 2)
 # Fixed codes, not free text: a typed reason could carry the borrower's name past the
@@ -1464,8 +1556,8 @@ def _recorder_doc_for_review(db, doc_id: str, statuses: tuple[str, ...] = ("pend
         raise ReviewError("no staged document with that id")
     if doc.status not in statuses:
         raise ReviewError(f"the document is {doc.status}, not " + " or ".join(s.replace("_", " ") for s in statuses))
-    if (doc.county, doc.state) != ("chelan", "WA"):
-        raise ReviewError("only Chelan County recordings are reviewed here")
+    if (doc.county, doc.state) not in _RECORDER_PROFILES:
+        raise ReviewError(f"{doc.county}, {doc.state} recordings are not reviewed here")
     return doc
 
 
@@ -1533,7 +1625,8 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         raise ReviewError("--supersedes and --independent contradict each other")
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
     doc = _recorder_doc_for_review(db, doc_id)
-    if doc.doc_code not in _CHELAN_NTS_CODES:
+    prof = _profile(doc.county, doc.state)
+    if doc.doc_code not in prof["nts_codes"]:
         raise ReviewError("this is a discontinuance, not a notice: use resolve-nod")
     if discontinued_by and not_discontinued:
         raise ReviewError("--discontinued-by and --not-discontinued contradict each other")
@@ -1607,7 +1700,7 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
 
     key = _key(doc.instrument_number)
     already_cancelled = db.execute(
-        select(NtsNotice.cancelled_at).where(NtsNotice.source == CHELAN_RECORDER_SOURCE,
+        select(NtsNotice.cancelled_at).where(NtsNotice.source == prof["source"],
                                              NtsNotice.ts_number == key)).scalar()
     printed = " ".join((values.get("property_address") or "").split())[:512] or None
     situs = " ".join((situs or "").split())[:512] or None
@@ -1623,7 +1716,7 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     payload = "|".join(str(v or "") for v in (doc.instrument_number, *approved.values()))
     now = datetime.now(UTC)
     _upsert_notice(db, NtsNotice, {
-        "source": CHELAN_RECORDER_SOURCE, "ts_number": key, "county": "chelan", "state": "WA",
+        "source": prof["source"], "ts_number": key, "county": doc.county, "state": doc.state,
         "parcel": parcel, "property_address": addr,
         "property_address_normalized": (address_match_key(addr) or None) if addr else None,
         "address_source": "assessor_situs" if situs else ("notice" if printed else None),
@@ -1634,20 +1727,20 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         "beneficiary": (approved["beneficiary"] or "")[:255] or None,
         "principal_owing": amount, "principal_owing_basis": basis,
         "note_amount": None, "nod_date": None,
-        "source_url": f"{_CHELAN_RECORDER}/details/documentdetails/{doc.transaction_item_id}/1/1/11",
+        "source_url": prof["url"](doc.transaction_item_id),
         "raw_hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "is_active": auction >= today and already_cancelled is None,
         "fetched_at": now,
     })
-    notice_id = db.execute(select(NtsNotice.id).where(NtsNotice.source == CHELAN_RECORDER_SOURCE,
+    notice_id = db.execute(select(NtsNotice.id).where(NtsNotice.source == prof["source"],
                                                       NtsNotice.ts_number == key)).scalar_one()
     if target is not None:
-        _cancel_notices(db, CHELAN_RECORDER_SOURCE, [_key(target.instrument_number)])
+        _cancel_notices(db, prof["source"], [_key(target.instrument_number)])
         target.status = "superseded"
         target.decision_note = f"superseded by {doc.instrument_number}"
         target.updated_at = now
     if ending is not None:
-        _cancel_notices(db, CHELAN_RECORDER_SOURCE, [key])
+        _cancel_notices(db, prof["source"], [key])
         _note_cancelled(ending, doc.instrument_number, "direct" if ending in direct else "operator", now)
     doc.status, doc.ocr_text, doc.nts_notice_id = "approved", None, notice_id
     doc.reviewed_by, doc.reviewed_at, doc.updated_at = reviewer, now, now
@@ -1731,7 +1824,7 @@ def reject_recorder_document(db, doc_id: str, *, reviewer: str, reason: str) -> 
     if reason not in REJECT_REASONS:
         raise ReviewError(f"the reason must be one of {REJECT_REASONS}")
     doc = _recorder_doc_for_review(db, doc_id, ("pending_review", "failed"))
-    if doc.doc_code not in _CHELAN_NTS_CODES and doc.status != "failed":
+    if doc.doc_code not in _profile(doc.county, doc.state)["nts_codes"] and doc.status != "failed":
         raise ReviewError("a readable discontinuance is resolved with resolve-nod, not rejected")
     now = datetime.now(UTC)
     doc.status, doc.ocr_text, doc.decision_note = "rejected", None, reason
@@ -1750,7 +1843,7 @@ def _note_cancelled(nod, instrument: str, basis: str, now: datetime) -> None:
     nod.fields, nod.updated_at = f, now
 
 
-def _live_approved_chelan(db, on_or_before):
+def _live_approved(db, county: str, state: str, on_or_before):
     from sqlalchemy import select
 
     from src.db.models import NtsNotice
@@ -1758,12 +1851,14 @@ def _live_approved_chelan(db, on_or_before):
 
     return db.execute(
         select(Doc).join(NtsNotice, NtsNotice.id == Doc.nts_notice_id)
-        .where(Doc.county == "chelan", Doc.state == "WA", Doc.status == "approved",
+        .where(Doc.county == county, Doc.state == state, Doc.status == "approved",
                NtsNotice.cancelled_at.is_(None), Doc.record_date <= on_or_before)
         .with_for_update(of=Doc)).scalars().all()
 
 
-def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html: str | None) -> str:
+def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html: str | None,
+                         related_afns: list[str] | None = None,
+                         recording_apns: list[str] | None = None) -> str:
     """Record one Notice of Discontinuance from its detail page (no OCR) and apply it.
     Returns the status written, or "kept" for a row already settled. Caller commits.
 
@@ -1773,7 +1868,10 @@ def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html:
     tells us nothing: both wait for an operator (pending review, which holds the
     county's cache stale). A discontinuance that matches no approved notice is kept as
     evidence: approving that notice later applies it. Holds NTS_CANCEL_LOCK_KEY from
-    before anything is read (Codex 4a-3c)."""
+    before anything is read (Codex 4a-3c).
+
+    A recorder whose discontinuance lists its references as data (Cowlitz's entry
+    properties: ``related_afns``, ``recording_apns``) passes them instead of a page."""
     from uuid import uuid4
 
     from src.db.models import NtsRecorderDocument as Doc
@@ -1788,9 +1886,12 @@ def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html:
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
     now = datetime.now(UTC)
     record_date = datetime.strptime(doc["record_date"], "%m/%d/%Y").date()
-    code = detail_doc_code(detail_html) if detail_html else None
-    related = related_numbers(detail_html) if code == "NOD" else None
-    apns = parse_detail_apns(detail_html) if code == "NOD" else None
+    if detail_html is None and related_afns is not None:
+        code, related, apns = "NOD", [(a, None) for a in related_afns], recording_apns
+    else:
+        code = detail_doc_code(detail_html) if detail_html else None
+        related = related_numbers(detail_html) if code == "NOD" else None
+        apns = parse_detail_apns(detail_html) if code == "NOD" else None
     values = {
         "county": county, "state": state, "transaction_item_id": doc["item_id"],
         "instrument_number": doc["instrument"], "doc_code": "NOD", "record_date": record_date,
@@ -1799,7 +1900,7 @@ def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html:
         "ocr_engine": None, "parser_version": PARSER_VERSION, "updated_at": now,
     }
     direct: list = []
-    if detail_html is None:
+    if detail_html is None and related_afns is None:
         values.update(status="failed", decision_note="detail page not downloaded",
                       fields={"recording_apns": None})
     elif code != "NOD" or related is None:
@@ -1807,7 +1908,7 @@ def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html:
                       fields={"recording_apns": None})
     else:
         numbers = {n for n, _code in related}
-        live = _live_approved_chelan(db, record_date)
+        live = _live_approved(db, county, state, record_date)
         direct = [d for d in live if d.instrument_number in numbers]
         by_loan = [d for d in live if d not in direct
                    and numbers & set(_recording_facts(d)["related_deeds_of_trust"] or [])]
@@ -1840,7 +1941,7 @@ def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html:
     if row is None:
         return "kept"
     if direct:
-        _cancel_notices(db, CHELAN_RECORDER_SOURCE, [f"REC-{d.instrument_number}" for d in direct])
+        _cancel_notices(db, _profile(county, state)["source"], [f"REC-{d.instrument_number}" for d in direct])
     return row[0]
 
 
@@ -1855,13 +1956,15 @@ def resolve_discontinuance(db, nod_id: str, *, reviewer: str, cancels: list[str]
     if nod.doc_code != "NOD":
         raise ReviewError("this is a notice, not a discontinuance: use approve or reject")
     wanted = set(cancels)
-    targets = [d for d in _live_approved_chelan(db, nod.record_date) if d.instrument_number in wanted]
+    targets = [d for d in _live_approved(db, nod.county, nod.state, nod.record_date)
+               if d.instrument_number in wanted]
     if len(targets) != len(wanted):
         raise ReviewError("--cancels must name approved, live notices recorded on or before "
                           "the discontinuance")
     now = datetime.now(UTC)
     if targets:
-        _cancel_notices(db, CHELAN_RECORDER_SOURCE, [f"REC-{d.instrument_number}" for d in targets])
+        _cancel_notices(db, _profile(nod.county, nod.state)["source"],
+                        [f"REC-{d.instrument_number}" for d in targets])
     for d in targets:
         _note_cancelled(nod, d.instrument_number, "operator", now)
     nod.status, nod.reviewed_by, nod.reviewed_at, nod.updated_at = "discontinuance", reviewer, now, now
@@ -1896,6 +1999,24 @@ def chelan_work_order(discovered: list[dict], retries: list[dict]) -> list[dict]
     failing = {d["item_id"] for d in retries}
     fresh = [d for d in discovered if d["item_id"] not in failing]
     return nod_first(fresh + retries[:_CHELAN_RETRY_SHARE])
+
+
+def recorder_gap_beyond_reach(today, last_read: datetime | None) -> str | None:
+    """The unread stretch when the last complete read is older than the window can
+    reach (an outage longer than _CHELAN_MAX_REACH_DAYS), or None. Pure."""
+    if last_read is None:
+        return None
+    floor = today - timedelta(days=_CHELAN_MAX_REACH_DAYS)
+    if last_read.date() - timedelta(days=2) >= floor:
+        return None
+    return (f"recordings {last_read.date().isoformat()} to {floor.isoformat()} were never read "
+            "(outage longer than the crawl reaches): backfill before trusting this county")
+
+
+def deferred_retries(retries: list[dict]) -> int:
+    """Stored failures chelan_work_order leaves for a later run (past the retry share):
+    work this run did not read, so it counts as unread. Pure."""
+    return max(0, len(retries) - _CHELAN_RETRY_SHARE)
 
 
 class _NoPdfNeeded(Exception):  # noqa: N818 -- control flow inside the crawl loop only
@@ -2003,11 +2124,14 @@ def crawl_nts_chelan_recorder() -> dict:
         summary["kept"] = len(valid) - len(todo)  # already staged or decided
         retries = [d for d in stored_failures if _ITEM_ID_RE.fullmatch(d["item_id"])]
         todo = chelan_work_order(todo, retries)
+        # Stored failures past this run's retry share wait for a later run: unread, so
+        # the cache is not called fresh while they do (Codex 3b P1).
+        summary["unread"] = deferred_retries(retries)
         headers = {"User-Agent": _PDF_BROWSER_UA}
         for i, doc in enumerate(todo):
             left = deadline - time.monotonic()
             if i >= _CHELAN_MAX_DOCS or left < _CHELAN_DOC_RESERVE_S:
-                summary["unread"] = len(todo) - i
+                summary["unread"] += len(todo) - i
                 break
             time.sleep(_CHELAN_PACE_S)
             detail_html = pdf = None
@@ -2070,6 +2194,185 @@ def crawl_nts_chelan_recorder() -> dict:
             rds.close()
 
 
+# ── Cowlitz County recorder (Laserfiche WebLink): NTS documents OCR'd into staging ──
+# Same contract as Chelan: nothing here reaches nts_notices or a customer until an
+# operator approves it (scripts/nts_review.py). Cowlitz's notices are recorded scans
+# (CCITT, no text layer); the viewer's free "Print (as PDF)" serves them, and the
+# recording's own parcels and related numbers come from its entry properties (live
+# 2026-11-15: ~12 NTS and ~3 discontinuances a month). The portal needs a browser for
+# both the search and the PDF.
+_COWLITZ_LOCK_KEY = "bl:nts_cowlitz_recorder:lock"
+_COWLITZ_MAX_DOCS = 20          # per run
+_COWLITZ_DEADLINE_S = 40 * 60   # under the task's soft limit
+# One recording, worst case: viewer navigation + entry check (60), the download event
+# (120), the streamed refetch (120 + one 60 s read overrun), pacing, then OCR's wall limit
+# and the database write. The last two are checked again before staging starts.
+_COWLITZ_STAGE_RESERVE_S = 300 + 60
+_COWLITZ_DOC_RESERVE_S = 60 + 120 + 180 + 5 + _COWLITZ_STAGE_RESERVE_S
+_COWLITZ_PACE_S = 3.0
+
+
+def _cowlitz_doc_url(item_id: str) -> str:
+    return _RECORDER_PROFILES[("cowlitz", "WA")]["url"](item_id)
+
+
+@app.task(name="src.workers.nts_crawler.crawl_nts_cowlitz_recorder",
+          soft_time_limit=50 * 60, time_limit=55 * 60)
+def crawl_nts_cowlitz_recorder() -> dict:
+    """Stage Cowlitz County NTS recordings for review (beat: crawl-nts-cowlitz-recorder).
+
+    Purge first, then one browser session: the recorder's complete per-day search over
+    Chelan's window (chelan_window_start) (LaserficheWebLinkScraper.discover: every Notice of
+    Trustee's Sale and Discontinuance, with entry properties) and each new notice's PDF.
+    Then OCR and staging. Discontinuances are applied from their related numbers (no
+    OCR). One run at a time (Redis lock); one time budget; every recording ends up
+    counted as staged, discontinuance, failed, kept, invalid or unread, and anything
+    not staged raises an alert. The heartbeat is recorded only after a complete read.
+    """
+    import asyncio
+    from uuid import uuid4
+
+    import redis as sync_redis
+    from celery.exceptions import SoftTimeLimitExceeded
+    from sqlalchemy import select
+
+    from src.config import settings
+    from src.db.models import NtsRecorderDocument as Doc
+    from src.db.session import system_sync_session
+    from src.scrapers.enrichment.source_health import get_source_state
+    from src.scrapers.reliability import ScraperExecutionError
+    from src.scrapers.templates.laserfiche_weblink import LaserficheWebLinkScraper
+    from src.scrapers.trustee_sale import nts_crawl_heartbeat_key
+
+    summary = {"source": COWLITZ_RECORDER_SOURCE, "expired": 0, "discovered": 0, "staged": 0,
+               "discontinuance": 0, "failed": 0, "kept": 0, "invalid": 0, "unread": 0}
+    rds = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    token = str(uuid4())
+    if not rds.set(_COWLITZ_LOCK_KEY, token, nx=True, ex=_COWLITZ_DEADLINE_S + 20 * 60):
+        _logger.info("Cowlitz NTS recorder crawl already running; skipped")
+        rds.close()
+        return {**summary, "skipped": "locked"}
+    deadline = time.monotonic() + _COWLITZ_DEADLINE_S
+    error: str | None = None
+    try:
+        with system_sync_session() as db:
+            summary["expired"] = purge_stale_recorder_documents(db)
+            db.commit()
+            retry = and_(Doc.status == "failed",
+                         Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
+            settled = {r[0] for r in db.execute(
+                select(Doc.transaction_item_id).where(Doc.county == "cowlitz", ~retry))}
+            # A failed notice is retried even once it is outside the window, from what
+            # staging kept of its recording (its parcels and related numbers).
+            stored_failures = [
+                {"item_id": r.transaction_item_id, "instrument": r.instrument_number,
+                 "doc_code": r.doc_code, "record_date": r.record_date.strftime("%m/%d/%Y"),
+                 "recording_apns": (r.fields or {}).get("recording_apns") or [],
+                 "related": (r.fields or {}).get("related_deeds_of_trust") or [],
+                 "href": _cowlitz_doc_url(r.transaction_item_id)}
+                for r in db.execute(select(Doc).where(Doc.county == "cowlitz", retry,
+                                                      Doc.doc_code != "NOD")
+                                    .order_by(Doc.updated_at)).scalars()]
+            last_read = (get_source_state(db, nts_crawl_heartbeat_key("cowlitz")) or {}).get("last_success_at")
+
+        today = datetime.now(UTC).date()
+        # Back to the last complete read after an outage (a gap must not hide a
+        # discontinuance), never past the reach limit: Chelan's rule (Codex 3b P1).
+        start = chelan_window_start(today, last_read).strftime("%m/%d/%Y")
+        # Past the reach limit the gap is not read at all: never call the cache fresh,
+        # and say so every run until an operator backfills it (Codex 3b r2 P1).
+        gap = recorder_gap_beyond_reach(today, last_read)
+
+        def _stage_one(doc: dict, pdf: bytes | None) -> str:
+            """OCR and stage one recording right after it is read (sync, in a thread)."""
+            try:
+                with system_sync_session() as db:
+                    try:
+                        if doc["doc_code"] == "NOD":
+                            status = stage_discontinuance(
+                                db, county="cowlitz", state="WA", doc=doc, detail_html=None,
+                                related_afns=doc["related"], recording_apns=doc["recording_apns"])
+                        else:
+                            status = stage_recorder_document(
+                                db, county="cowlitz", state="WA", doc=doc, detail_html=None, pdf=pdf,
+                                recording_apns=doc["recording_apns"], related_dts=doc["related"])
+                        db.commit()
+                        return status
+                    except Exception:
+                        db.rollback()
+                        raise
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- counted and alerted, the run goes on
+                _logger.warning("Cowlitz NTS %s not staged: %s", doc["item_id"], type(exc).__name__)
+                return "failed"
+
+        async def _run() -> None:
+            s = LaserficheWebLinkScraper(f"{_COWLITZ_RECORDER}/welcome.aspx?dbid=0&repo=CCIMAGES",
+                                         "cowlitz", "WA", record_type="pre_foreclosure")
+            async with s:
+                docs = await s.discover(start, today.strftime("%m/%d/%Y"))
+                valid = [d for d in docs if _ITEM_ID_RE.fullmatch(d.get("item_id") or "")]
+                summary["discovered"] = len(docs)
+                summary["invalid"] = len(docs) - len(valid)
+                fresh = [d for d in valid if d["item_id"] not in settled]
+                summary["kept"] = len(valid) - len(fresh)
+                retries = [d for d in stored_failures if _ITEM_ID_RE.fullmatch(d["item_id"])]
+                todo = chelan_work_order(fresh, retries)   # discontinuances first
+                summary["unread"] = deferred_retries(retries)
+                for i, doc in enumerate(todo):
+                    # Each recording is read AND staged inside the budget (Codex 3b P2).
+                    if i >= _COWLITZ_MAX_DOCS or deadline - time.monotonic() < _COWLITZ_DOC_RESERVE_S:
+                        summary["unread"] += len(todo) - i
+                        return
+                    pdf = None
+                    if doc["doc_code"] != "NOD":  # a discontinuance needs no document read
+                        await asyncio.sleep(_COWLITZ_PACE_S)
+                        try:
+                            pdf = await s.fetch_pdf(doc, _RECORDER_PDF_MAX_BYTES)
+                        except ScraperExecutionError as exc:  # staged as failed, with the reason
+                            _logger.warning("Cowlitz NTS %s PDF failed: %s", doc["item_id"], str(exc)[:120])
+                    if deadline - time.monotonic() < _COWLITZ_STAGE_RESERVE_S:
+                        # Not enough left to OCR and write it: retried next run, unread now.
+                        summary["unread"] += len(todo) - i
+                        return
+                    status = await asyncio.to_thread(_stage_one, doc, pdf)
+                    summary["staged" if status == "pending_review" else status] += 1
+
+        async def _bounded() -> None:
+            await asyncio.wait_for(_run(), timeout=max(deadline - time.monotonic(), 1))
+
+        try:
+            asyncio.run(_bounded())
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- reported, not hidden: the run is not fresh
+            error = f"crawl failed: {type(exc).__name__}: {str(exc)[:200]}"
+            return {**summary, "error": "crawl failed"}
+        with system_sync_session() as db:
+            if chelan_cache_is_fresh(summary) and gap is None:  # the same complete-read rule
+                _record_crawl_heartbeat(db, "cowlitz")
+            error = gap or recorder_unresolved_reason(db, datetime.now(UTC), "cowlitz")
+        _logger.info("Cowlitz NTS recorder crawl: %s", summary)
+        return summary
+    except SoftTimeLimitExceeded:
+        error = "time limit reached mid-run"
+        raise
+    except Exception as exc:
+        error = f"run failed: {type(exc).__name__}"
+        raise
+    finally:
+        problems = [f"{summary[k]} {k}" for k in ("failed", "invalid", "unread") if summary[k]]
+        if error or problems:
+            _alert_recorder(error or "recordings not staged", ", ".join(problems) or "see logs", "cowlitz")
+        try:
+            rds.eval(_RELEASE_LOCK_LUA, 1, _COWLITZ_LOCK_KEY, token)
+        except Exception as exc:  # noqa: BLE001 -- the lock expires on its own; never mask the run
+            _logger.warning("Cowlitz NTS lock release failed: %s", type(exc).__name__)
+        finally:
+            rds.close()
+
+
 def _bounded_fetch(url: str, max_bytes: int, wall_s: float, headers: dict) -> bytes:
     """One recorder download: SSRF-guarded, no redirects, byte-capped and time-boxed
     (wall clock, not just per-read), through a temp file removed afterwards."""
@@ -2093,13 +2396,14 @@ def _bounded_fetch(url: str, max_bytes: int, wall_s: float, headers: dict) -> by
             pass
 
 
-def _alert_recorder(what: str, detail: str) -> None:
+def _alert_recorder(what: str, detail: str, county: str = "chelan") -> None:
     from src.workers.ops_alerts import send_ops_alert
 
+    name = county.title()
     send_ops_alert(
-        kind="nts_recorder", key="nts_recorder:chelan",
-        subject=f"Chelan NTS recorder crawl: {what}",
-        body=(f"The Chelan County NTS recorder crawl: {what} ({detail}).\n\n"
+        kind="nts_recorder", key=f"nts_recorder:{county}",
+        subject=f"{name} NTS recorder crawl: {what}",
+        body=(f"The {name} County NTS recorder crawl: {what} ({detail}).\n\n"
               "Staged notices await operator review; nothing reaches customers from here. "
               "Check the crawler logs and nts_recorder_documents."),
     )

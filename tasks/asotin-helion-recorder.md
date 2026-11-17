@@ -35,12 +35,29 @@ no automated-access prohibition. One owner-approved probe established the facts 
 - Fixtures: expired session, rejected token, solving disabled, real empty, repeated page,
   multi-parcel. Redacted; synthetic names only.
 
-## Phases (<= 5 files each)
-- [ ] Phase 1 — scraper `src/scrapers/asotin_wa_recorder.py`, `registry.py` allowlist,
-      `doc_types.py` Asotin tokens, `tests/test_asotin_recorder.py`, and the redacted fixtures.
-- [ ] Phase 2 — migration 165 (three inactive connectors) and a read-only live run of each type
-      (counts only); then Codex review, journal, PR, deploy.
-- [ ] Phase 3 — owner switches the types on.
+## Owner decisions (2026-11-16)
+- Volumes, measured live: Decree Dis 0 in 2025 and 2026, so divorce is dropped. Lis Penden is
+  ~2 a year. Death certificates are ~2 a month, but 7 real ones gave 0 leads, because none
+  lists a parcel and none of the deceased owns an estate-marked Asotin parcel.
+- The owner chose LIS PENDENS ONLY. The death-certificate reader stays in the module, tested
+  but not wired.
+
+## Phases
+- [x] Phase 1: `asotin_wa_recorder.py`, `captcha.forget_token`, registry, tests. Codex NO-GO
+      (inclusive windows, per-party orientation, paging that cannot repeat), fixed, then GO.
+- [x] Phase 2: `health.py` `CANARY_ACCEPTS_VALIDATED_EMPTY` and migration 169 (one inactive
+      pre_foreclosure row; 165-168 were taken on main).
+  - The live runs found that a single result opens `/Document/Details` and that bursts get
+    "Too Many Requests". Both are handled.
+  - Codex NO-GO: the details page must be this search's redirect, and a block is recognised
+    before an empty answer. Fixed, then GO.
+  - Live run (2026-01-01..11-15): 2 cards, 2 leads, 0 held, both through the details redirect.
+- [ ] Phase 3: the owner switches the connector on.
 
 ## Review
-(to fill in)
+- Never a silent zero: every page is bound to its search. An empty answer must echo the search
+  it answers. A block, a disclaimer, a skipped or repeated page, or a moved total fails the run.
+- Each run costs one 2Captcha solve, plus one per session expiry. The portal rate-limits bursts:
+  180-day windows, paced 5 s, with one 60 s backoff.
+- One live lead has a 15-digit parcel (Asotin's are usually 17). Downstream enrichment holds it
+  if the parcel is not found.

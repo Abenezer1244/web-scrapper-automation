@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en-US" xmlns="http://www.w3.org/1999/xhtml"><head>
+<base href="/WLAUDPublic/"/>
+<title>3799745-0</title><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1" name="viewport"/>
+
+<style>.LoginSquare { background-image: url(images/WatermarkLogin.gif); }.LeftPanel, .DocViewerMainTable .LeftPanelContentDiv, .DocViewerMainTable .LeftPanelContentDivMobile { background-image: url(images/WatermarkSideNav.gif); }.DocumentPageToolbar8, .DocumentPageToolbar, .DocumentPageToolbar8Mobile, .DocumentPageToolbarMobile { background-image: url(images/docTBbg.gif); }</style>
+
+
+
+<style>.v-outer[_ngcontent-c0] {
+      height: 100%;
+      width: 100%;
+      display: flex;
+    }
+
+    .left-component[_ngcontent-c0] {
+      width: calc(50% - 4px);
+    }
+
+    .right-component[_ngcontent-c0] {
+      width: calc(50% - 4px);
+    }</style><style>[_nghost-c1] {
+      background-color: #fff;
+      border-left: 1px solid #ddd;
+      cursor: ew-resize;
+      position: relative;
+    }
+    [_nghost-c1]:hover {
+      background-color: #fafafa;
+    }
+
+    .invisible-extension[_ngcontent-c1] {
+      position: absolute;
+      height: 100%;
+      width: 100%;
+      min-width: 7px;
+    }
+
+    .handle[_ngcontent-c1] {
+      width: 100%;
+      height: 35px;
+      background-color: #eee;
+      position: absolute;
+      top: calc(50% - 17px);
+    }</style><style>
+
+ .bootstrap-switch {
+   display: inline-block;
+   direction: ltr;
+   cursor: pointer;
+   border-radius: 4px;
+   border: 1px solid;
+   border-color: #cccccc;
+   position: relative;
+   text-align: left;
+   overflow: hidden;
+   line-height: 8px;
+   z-index: 0;
+   -webkit-user-select: none;
+   -moz-user-select: none;
+   -ms-user-select: none;
+   user-select: none;
+   vertical-align: middle;
+   -webkit-transition: border-color ease-in-out .15s, box-shadow ease-in-out .15s;
+   transition: border-color ease-in-out .15s, box-shadow ease-in-out .15s;
+ }
+ .bootstrap-switch .bootstrap-switch-container {
+   display: inline-block;
+   top: 0;
+   border-radius: 4px;
+   -webkit-transform: translate3d(0, 0, 0);
+   transform: translate3d(0, 0, 0);
+   background: #fff;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on,
+ .bootstrap-switch .bootstrap-switch-handle-off,
+ .bootstrap-switch .bootstrap-switch-label {
+   -webkit-box-sizing: border-box;
+   -moz-box-sizing: border-box;
+   box-sizing: border-box;
+   cursor: pointer;
+   display: inline-block !important;
+   height: 100%;
+   padding: 6px 12px;
+   font-size: 14px;
+   line-height: 20px;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on,
+ .bootstrap-switch .bootstrap-switch-handle-off {
+   text-align: center;
+   z-index: 1;
+   white-space: nowrap;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on.bootstrap-switch-primary,
+ .bootstrap-switch .bootstrap-switch-handle-off.bootstrap-switch-primary {
+   color: #fff;
+   background: #428bca;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on.bootstrap-switch-info,
+ .bootstrap-switch .bootstrap-switch-handle-off.bootstrap-switch-info {
+   color: #fff;
+   background: #5bc0de;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on.bootstrap-switch-success,
+ .bootstrap-switch .bootstrap-switch-handle-off.bootstrap-switch-success {
+   color: #fff;
+   background: #5cb85c;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on.bootstrap-switch-warning,
+ .bootstrap-switch .bootstrap-switch-handle-off.bootstrap-switch-warning {
+   background: #f0ad4e;
+   color: #fff;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on.bootstrap-switch-danger,
+ .bootstrap-switch .bootstrap-switch-handle-off.bootstrap-switch-danger {
+   color: #fff;
+   background: #d9534f;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on.bootstrap-switch-default,
+ .bootstrap-switch .bootstrap-switch-handle-off.bootstrap-switch-default {
+   color: #000;
+   background: #eeeeee;
+ }
+ .bootstrap-switch .bootstrap-switch-label {
+   text-align: center;
+   margin-top: -1px;
+   margin-bottom: -1px;
+   z-index: 100;
+   color: #333333;
+   background: #ffffff;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-on {
+   border-bottom-left-radius: 3px;
+   border-top-left-radius: 3px;
+ }
+ .bootstrap-switch .bootstrap-switch-handle-off {
+   border-bottom-right-radius: 3px;
+   border-top-right-radius: 3px;
+ }
+ .bootstrap-switch input[type='radio'],
+ .bootstrap-switch input[type='checkbox'] {
+   position: absolute !important;
+   top: 0;
+   left: 0;
+   opacity: 0;
+   filter: alpha(opacity=0);
+   z-index: -1;
+ }
+ .bootstrap-switch input[type='radio'].form-control,
+ .bootstrap-switch input[type='checkbox'].form-control {
+   height: auto;
+ }
+ .bootstrap-switch.bootstrap-switch-mini .bootstrap-switch-handle-on,
+ .bootstrap-switch.bootstrap-switch-mini .bootstrap-switch-handle-off,
+ .bootstrap-switch.bootstrap-switch-mini .bootstrap-switch-label {
+   padding: 1px 5px;
+   font-size: 12px;
+   line-height: 1.5;
+ }
+ .bootstrap-switch.bootstrap-switch-small .bootstrap-switch-handle-on,
+ .bootstrap-switch.bootstrap-switch-small .bootstrap-switch-handle-off,
+ .bootstrap-switch.bootstrap-switch-small .bootstrap-switch-label {
+   padding: 5px 10px;
+   font-size: 12px;
+   line-height: 1.5;
+ }
+ .bootstrap-switch.bootstrap-switch-large .bootstrap-switch-handle-on,
+ .bootstrap-switch.bootstrap-switch-large .bootstrap-switch-handle-off,
+ .bootstrap-switch.bootstrap-switch-large .bootstrap-switch-label {
+   padding: 6px 16px;
+   font-size: 18px;
+   line-height: 1.33;
+ }
+ .bootstrap-switch.bootstrap-switch-disabled,
+ .bootstrap-switch.bootstrap-switch-readonly,
+ .bootstrap-switch.bootstrap-switch-indeterminate {
+   cursor: default !important;
+ }
+ .bootstrap-switch.bootstrap-switch-disabled .bootstrap-switch-handle-on,
+ .bootstrap-switch.bootstrap-switch-readonly .bootstrap-switch-handle-on,
+ .bootstrap-switch.bootstrap-switch-indeterminate .bootstrap-switch-handle-on,
+ .bootstrap-switch.bootstrap-switch-disabled .bootstrap-switch-handle-off,
+ .bootstrap-switch.bootstrap-switch-readonly .bootstrap-switch-handle-off,
+ .bootstrap-switch.bootstrap-switch-indeterminate .bootstrap-switch-handle-off,
+ .bootstrap-switch.bootstrap-switch-disabled .bootstrap-switch-label,
+ .bootstrap-switch.bootstrap-switch-readonly .bootstrap-switch-label,
+ .bootstrap-switch.bootstrap-switch-indeterminate .bootstrap-switch-label {
+   opacity: 0.5;
+   filter: alpha(opacity=50);
+   cursor: default !important;
+ }
+ .bootstrap-switch.bootstrap-switch-animate .bootstrap-switch-container {
+   -webkit-transition: margin-left 0.5s;
+   transition: margin-left 0.5s;
+ }
+ .bootstrap-switch.bootstrap-switch-inverse .bootstrap-switch-handle-on {
+   border-bottom-left-radius: 0;
+   border-top-left-radius: 0;
+   border-bottom-right-radius: 3px;
+   border-top-right-radius: 3px;
+ }
+ .bootstrap-switch.bootstrap-switch-inverse .bootstrap-switch-handle-off {
+   border-bottom-right-radius: 0;
+   border-top-right-radius: 0;
+   border-bottom-left-radius: 3px;
+   border-top-left-radius: 3px;
+ }
+ .bootstrap-switch.bootstrap-switch-focused {
+   border-color: #66afe9;
+   outline: 0;
+   -webkit-box-shadow: inset 0 1px 1px rgba(0,0,0,.075), 0 0 8px rgba(102, 175, 233, 0.6);
+   box-shadow: inset 0 1px 1px rgba(0,0,0,.075), 0 0 8px rgba(102, 175, 233, 0.6);
+ }
+ .bootstrap-switch.bootstrap-switch-on .bootstrap-switch-label,
+ .bootstrap-switch.bootstrap-switch-inverse.bootstrap-switch-off .bootstrap-switch-label {
+   border-bottom-right-radius: 3px;
+   border-top-right-radius: 3px;
+ }
+ .bootstrap-switch.bootstrap-switch-off .bootstrap-switch-label,
+ .bootstrap-switch.bootstrap-switch-inverse.bootstrap-switch-on .bootstrap-switch-label {
+   border-bottom-left-radius: 3px;
+   border-top-left-radius: 3px;
+ }</style></head>
+<body class="ltr" id="docPage" style="overflow: hidden;">
+<doc-viewer-app ng-version="4.4.7">
+<div aria-live="assertive" id="AnnouncementBox" role="alert" style="position: absolute; width: 5px; top: -100px; left: -100px">Press Alt + R to read the document text or Alt + P to download or print.</div>
+<div class="navbar navbar-inverse navbar-fixed-top actionBar dvActionBar" role="banner">
+<div>
+<a aria-label="Home" class="homeLink" href="Welcome.aspx?dbid=0&amp;repo=CCIMAGES" lflocalizearialabelandtitle="STR_HOME" title="Home"><img alt="Laserfiche WebLink" class="logoImage"/></a>
+<div class="homeLink" hidden=""><img alt="Laserfiche WebLink" class="logoImage"/></div>
+<div class="document-search-container">
+<div class="quickSearchBox" style="display: inline-block;">
+<input class="searchBox ng-untouched ng-pristine ng-valid" name="searchInput" placeholder="Search in document" style="display: none;" type="text"/>
+<button aria-label="Search" class="searchButton btn btn-primary" lflocalizearialabelandtitle="STR_SEARCH" style="display: none;" title="Search">
+<img/>
+</button>
+<!-- -->
+<!-- -->
+</div>
+<!-- -->
+<!-- -->
+</div>
+<div class="topBarNavigation">
+<!-- -->
+<div class="dropdown more-dropdown" dropdown="" id="moreDropdown">
+<button aria-expanded="false" aria-haspopup="true" class="dropdownButton btn dropdown-toggle" dropdown-open="">
+<span lflocalize="STR_MORE">More</span> <div class="icon icon-down"></div>
+</button>
+<ul class="dropdown-menu" dropdown-not-closable-zone="">
+<li><a href="javascript:void(0)"><span lflocalize="STR_HELP">Help</span></a></li>
+<li><a href="javascript:void(0)"><span lflocalize="STR_ABOUT">About</span></a></li>
+<li><a href="javascript:void(0)"><span lflocalize="STR_LOGOUT">Sign Out</span></a></li>
+</ul>
+</div>
+</div>
+</div>
+</div>
+<!-- --><div class="noBreadcrumbTitleContainer angularPageBackground">
+<span class="noBreadcrumbTitle">3799745-0</span>
+<!-- -->
+</div>
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><vertical-split-pane _nghost-c0="" class="docViewerMain" local-storage-key="split-pane-docview" separator-thickness="5" style="top: 166px;">
+<div _ngcontent-c0="" class="v-outer">
+<div _ngcontent-c0="" class="left-component" style="width: 80%;">
+<div class="split-pane-content-primary">
+<!-- --><div style="height: 100%"><!-- -->
+<div class="left">
+<div class="thumbsPane" id="thumbsPane">
+<!-- --><div class="thumbsContainer" id="thumbsContainer" style="height: 444px;">
+<!-- --><div aria-label="Page 1" aria-pressed="true" class="thumbWrapper selectedThumb" role="button" tabindex="0">
+<img class="preview_thumbnail" role="presentation" style="height: 103px;"/><span>1</span>
+</div><div aria-label="Page 2" aria-pressed="false" class="thumbWrapper" role="button" tabindex="0">
+<img class="preview_thumbnail" role="presentation" style="height: 103px;"/><span>2</span>
+</div><div aria-label="Page 3" aria-pressed="false" class="thumbWrapper" role="button" tabindex="0">
+<img class="preview_thumbnail" role="presentation" style="height: 103px;"/><span>3</span>
+</div>
+</div>
+<!-- -->
+</div>
+<div class="imagePane" style="width: 874px;">
+<!-- --><div class="dvToolbar imageToolbar DocumentPageToolbar" id="imageToolbar" style="display: block;">
+<!-- --><!-- -->
+<!-- --><button aria-label="Previous page" class="btn iconography-primary" disabled="" id="STR_PREVIOUS_PAGE" name="STR_PREVIOUS_PAGE" type="button">
+<!-- --><div class="docViewerIcon arrow-top"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Next page" class="btn iconography-primary" id="STR_NEXT_PAGE" name="STR_NEXT_PAGE" type="button">
+<!-- --><div class="docViewerIcon arrow-bottom"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><input aria-label="Page" class="ng-untouched ng-pristine ng-valid" id="pageNum" type="text"/><!-- --><div style="display: inline-block;"> / 3</div>
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Pan" class="btn iconography-primary shrinkIcon" id="STR_PAN" name="STR_PAN" type="button">
+<!-- --><div class="docViewerIcon panning"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Zoom" class="btn iconography-primary" id="STR_ZOOM" name="STR_ZOOM" type="button">
+<!-- --><div class="docViewerIcon zoom"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Zoom in" class="btn iconography-primary" id="STR_ZOOM_IN" name="STR_ZOOM_IN" type="button">
+<!-- --><div class="docViewerIcon zoom-in"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Zoom out" class="btn iconography-primary" id="STR_ZOOM_OUT" name="STR_ZOOM_OUT" type="button">
+<!-- --><div class="docViewerIcon zoom-out"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><!-- -->
+<!-- --><select aria-label="Zoom" class="ng-untouched ng-pristine ng-valid" id="zoomDropDown" style="width: 100px;">
+<!-- --><!-- --><!-- --><!-- --><!-- --><!-- --><option role="menuitem" value="P">Fit window</option><!-- --><!-- --><!-- --><option role="menuitem" value="W">Fit width</option><!-- --><!-- --><!-- --><option role="menuitem" value="H">Fit height</option><!-- --><!-- --><!-- --><option role="menuitem" value="400">400%</option><!-- --><!-- --><!-- --><option role="menuitem" value="200">200%</option><!-- --><!-- --><!-- --><option role="menuitem" value="100">100%</option><!-- --><!-- --><!-- --><option role="menuitem" value="75">75%</option><!-- --><!-- --><!-- --><option role="menuitem" value="50">50%</option><!-- --><!-- --><!-- --><option role="menuitem" value="25">25%</option><!-- -->
+</select>
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Rotate right" class="btn iconography-primary shrinkIcon" id="STR_ROTATE_RIGHT" name="STR_ROTATE_RIGHT" type="button">
+<!-- --><div class="docViewerIcon rotate"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Print (as PDF)" class="btn iconography-primary shrinkIcon" id="STR_DOWNLOAD_PDF" name="STR_DOWNLOAD_PDF" type="button">
+<!-- --><div class="docViewerIcon print"></div>
+<!-- -->
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><button aria-label="Text mode" class="btn btn-link" id="TEXTMODE" name="TEXTMODE" type="button">
+<!-- -->
+<!-- --><span>View plain text</span>
+</button><!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- --><!-- -->
+<!-- -->
+<!-- -->
+<!-- --><div class="dropdown more-dropdown" dropdown="" style="margin-top: -4px">
+<button aria-haspopup="true" class="dropdownButton btn iconography-primary shrinkIcon dropdown-toggle" dropdown-open=""> <div class="docViewerIcon overflow"></div></button>
+<ul class="dropdown-menu pull-right">
+<!-- --><!-- -->
+<!-- --><li><a href="javascript:void(0)">
+<!-- --><span>Full screen</span>
+</a></li>
+</ul>
+</div>
+</div>
+<div class="tilesPane grab" id="tilesPane" style="" tabindex="0">
+<div class="imageCanvas" id="imageCanvas" style="height: 3231px; width: 853px;">
+<!-- --><div class="currentImageBoxShadow" id="imgPage1" style="position: absolute; left: 15px; top: 10px; width: 823.905px; height: 1066.23px;">
+<!-- --><div class="imagePageInner">
+<!-- --><img style="position: absolute; left: 0px; top: 0px;" tile-loader=""/><img style="position: absolute; left: 256px; top: 0px;" tile-loader=""/><img style="position: absolute; left: 512px; top: 0px;" tile-loader=""/><img style="position: absolute; left: 768px; top: 0px;" tile-loader=""/><img style="position: absolute; left: 0px; top: 256px;" tile-loader=""/><img style="position: absolute; left: 256px; top: 256px;" tile-loader=""/><img style="position: absolute; left: 512px; top: 256px;" tile-loader=""/><img style="position: absolute; left: 768px; top: 256px;" tile-loader=""/><img style="position: absolute; left: 0px; top: 512px;" tile-loader=""/><img style="position: absolute; left: 256px; top: 512px;" tile-loader=""/><img style="position: absolute; left: 512px; top: 512px;" tile-loader=""/><img style="position: absolute; left: 768px; top: 512px;" tile-loader=""/><img style="position: absolute; left: 0px; top: 768px;" tile-loader=""/><img style="position: absolute; left: 256px; top: 768px;" tile-loader=""/><img style="position: absolute; left: 512px; top: 768px;" tile-loader=""/><img style="position: absolute; left: 768px; top: 768px;" tile-loader=""/><img style="position: absolute; left: 0px; top: 1024px;" tile-loader=""/><img style="position: absolute; left: 256px; top: 1024px;" tile-loader=""/><img style="position: absolute; left: 512px; top: 1024px;" tile-loader=""/><img style="position: absolute; left: 768px; top: 1024px;" tile-loader=""/>
+<!-- -->
+<!-- -->
+<svg style="width: 823.905px; height: 1066.23px; position: absolute;">
+<g transform="matrix(0.3231, 0.00000000, 0.00000000, 0.3231, 0.00000000, 0.00000000)">
+<!-- -->
+<!-- -->
+</g>
+</svg>
+</div>
+<!-- -->
+</div><div class="imageBoxShadow" id="imgPage2" style="position: absolute; left: 15px; top: 0px; width: 0px; height: 0px;">
+<!-- --><div class="imagePageInner">
+<!-- -->
+<!-- -->
+<!-- -->
+<svg style="width: 0px; height: 0px; position: absolute;">
+<g transform="matrix(0.3231, 0.00000000, 0.00000000, 0.3231, 0.00000000, 0.00000000)">
+<!-- -->
+<!-- -->
+</g>
+</svg>
+</div>
+<!-- -->
+</div><div class="imageBoxShadow" id="imgPage3" style="position: absolute; left: 15px; top: 0px; width: 0px; height: 0px;">
+<!-- --><div class="imagePageInner">
+<!-- -->
+<!-- -->
+<!-- -->
+<svg style="width: 0px; height: 0px; position: absolute;">
+<g transform="matrix(0.3231, 0.00000000, 0.00000000, 0.3231, 0.00000000, 0.00000000)">
+<!-- -->
+<!-- -->
+</g>
+</svg>
+</div>
+<!-- -->
+</div>
+</div>
+</div>
+<!-- -->
+<div class="noPagesPane" hidden="" id="noPagesPane">
+<span id="docNoPages" lflocalize="STR_DOCUMENT_NO_PAGES" tabindex="0">This document contains no pages.</span>
+</div>
+</div>
+</div>
+</div>
+<!-- -->
+</div>
+</div>
+<vertical-split-separator _ngcontent-c0="" _nghost-c1="" style="width: 5px;">
+<div _ngcontent-c1="" class="invisible-extension" style="left: -1px;"></div>
+<div _ngcontent-c1="" class="handle"></div>
+</vertical-split-separator>
+<div _ngcontent-c0="" class="right-component" style="width: calc(20% - 5px);">
+<div class="split-pane-content-secondary">
+<!-- --><metadata-pane class="" docviewer="true">
+<div class="metaData dvMetadata DocViewerMainTable" dir="ltr" role="document" tabindex="0">
+<!-- -->
+<!-- --><div style="height:100%;">
+<div class="header">
+<!-- -->
+<ul class="ulTabs">
+<li class="selectedTab" tabindex="0"><span lflocalize="STR_METADATA">Metadata</span></li>
+<!-- -->
+<!-- --><li tabindex="0"><span lflocalize="STR_ANNOTATIONS">Annotations</span></li>
+</ul>
+</div>
+<div class="LeftPanel previewTab" hidden="">
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+
+<!-- -->
+</div>
+<div class="tableContainer LeftPanelContentDiv LeftPanel">
+<table id="metadataTable" tabindex="0">
+<tbody><tr class="mainHeader">
+<td colspan="2" lflocalize="STR_ENTRY_PROPERTIES">Entry Properties</td>
+</tr>
+<!-- -->
+<tr>
+<td><div class="mTitle" lflocalize="STR_MODIFIED">Modified</div></td>
+<td><!-- --><span>11/13/2026 6:49:26 PM</span></td>
+</tr>
+<tr>
+<td><div class="mTitle" lflocalize="STR_CREATED">Created</div></td>
+<td><!-- --><span>11/13/2026 6:48:03 PM</span></td>
+</tr>
+<!-- -->
+<tr class="mainHeader">
+<td colspan="2"><span lflocalize="STR_TEMPLATE">Template</span></td>
+</tr>
+<tr>
+<td colspan="2" style="padding-bottom:25px"><!-- --><span>AUD - Recorded Documents</span></td>
+</tr>
+<!-- --><!-- -->
+<!-- --><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr><tr class="fieldPane">
+<!-- -->
+<!-- -->
+<!-- -->
+</tr>
+<tr class="mainHeader borderSeparator"><td colspan="2" lflocalize="STR_FIELDS">Fields</td></tr>
+<!-- --><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc AFN</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>3799745</div>
+</td>
+</tr><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc Recording Date</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>11/12/2026</div>
+</td>
+</tr><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc Related AFN</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>3718972</div>
+</td>
+</tr><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc Document Type</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>NTTRUS</div>
+</td>
+</tr><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc Type Desc</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>Notice Of Trustees Sale</div>
+</td>
+</tr><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc Grantor</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>QUALITY LOAN SERVICE CORPORATION</div>
+</td>
+</tr><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc Grantee</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>ALPHA TIFFANY</div><div>FIDELITY NATIONAL TITLE COMPANY</div><div>GUILD MORTGAGE COMPANY</div><div>MORTGAGE ELECTRONIC REGISTRATION SYSTEMS</div><div>BRAVO CHAD D</div>
+</td>
+</tr><tr class="fieldPane">
+<!-- --><td>
+<div>Rec Doc Parcel</div>
+</td>
+<!-- -->
+<!-- --><td>
+<!-- --><div>61896</div><div>6190401</div>
+</td>
+</tr>
+<!-- -->
+<!-- -->
+</tbody></table>
+</div>
+<div class="tableContainer LeftPanelContentDiv LeftPanel" hidden="">
+<!-- -->
+</div>
+<!-- --><div class="annotationPane tableContainer LeftPanelContentDiv LeftPanel" hidden="" id="annotationPane">
+<div hidden="">
+<label>
+<span lflocalize="DISPLAY_ANNOTATIONS_PROMPT">Display annotations:</span>  
+                            <switch aria-checked="true" aria-label="Display annotations:" class="ng-tns-c2-0" role="checkbox" tabindex="0"><div class="bootstrap-switch bootstrap-switch-wrapper bootstrap-switch-animate bootstrap-switch-off bootstrap-switch-normal" style="width: 120px;">
+<div class="bootstrap-switch-container ng-trigger ng-trigger-statusChange" style="width: 180px; transform: translateX(0px);">
+<span class="bootstrap-switch-handle-on bootstrap-switch-primary" style="min-width: 60px; width: 60px;">ON</span>
+<span class="bootstrap-switch-label" style="width: 50px;"></span>
+<span class="bootstrap-switch-handle-off bootstrap-switch-default" style="width: 60px;">OFF</span>
+</div>
+</div>
+</switch>
+</label>
+<!-- -->
+</div>
+</div>
+</div>
+</div>
+</metadata-pane>
+<!-- -->
+</div>
+</div>
+</div>
+</vertical-split-pane>
+<!-- -->
+<!-- -->
+</doc-viewer-app>
+<span class="media-display" id="mediaDisplay"><div class="media-backdrop"></div><div class="media-container" id="media-container"><div class="media-header" id="media-header"><span class="media-icon" id="media-icon"><i></i></span><div class="media-name" id="media-name"></div><button class="media-share" id="media-share" title="Share"><i></i></button><div class="media-url-container" id="media-url-container"><label class="media-url-input-label" for="media-url-input">The URL can be used to link to this page</label><input class="media-url-input" id="media-url-input" name="media-url-input" type="text"/></div><button class="media-download" id="media-download" title="Download"><i></i></button><button class="media-close" id="media-close" title="Close"><i></i></button></div><video controls="" id="video"><source id="source"/><div>Your browser does not support the video tag.</div></video></div></span>
+
+<span id="CrawlerPreRender"></span>
+</body></html>

@@ -84,6 +84,8 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
 
     COUNTY = "asotin"
     SOURCE = SOURCE
+    # Fail instead of returning a shorter list when a qualifying parcel is held (Ferry).
+    FAIL_ON_HELD = False
 
     @classmethod
     def collection_scope(cls, record_type: str):
@@ -141,6 +143,13 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
             )
         records = [record_from_row(r, self.SOURCE) for r in rows if deliverable(r)]
         held = len(rows) - len(records)
+        if held and self.FAIL_ON_HELD:
+            raise ScraperExecutionError(
+                county, "lead_quality",
+                f"{held} of {len(rows)} qualifying parcel(s) lack an owner, a house-numbered "
+                "property address or a mailing address and are held; refusing to return a "
+                "shorter list", record_type=RECORD_TYPE,
+            )
         _logger.info("%s tax_delinquent: %d qualifying parcel(s), %d delivered, %d held "
                      "(missing owner/address/mailing); coverage %.1f%%",
                      county, len(rows), len(records), held, cov * 100)

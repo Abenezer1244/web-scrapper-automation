@@ -56,6 +56,9 @@ Risk ratings:
 | Tacoma | code_violation | Tacoma ArcGIS | REST | none | "no legal restrictions on use or reuse" | RCW 42.56 | L |
 | Bellevue, Burien | code_violation | ArcGIS / Cityworks | REST | none | Not found | RCW 42.56 | L/M |
 | WA courts (Odyssey, LINX) | none | not scraped | n/a | n/a | Registration required; no bulk (GR 31) | GR 31 | n/a |
+| Ferry (added 2026-11-15, connector INACTIVE) | tax_delinquent (owner name, situs, mailing, balances) | ferrywa-taxsifter.publicaccessnow.com Treasurer.aspx | HTTP per parcel, 1 s spacing, lease; inventory = statewide parcel layer (9,195) | Clicks "I Agree" by script (owner-approved 2026-11-15) | Read in full 2026-11-15: "as is", accuracy, indemnity, donation request. **No commercial-use or automation clause**, which is silence, not a grant. | RCW 84.56; RCW 42.56.070(8) list question | **M**. Reuse right unresolved; relies on the 2026-10-02 owner clearance (no counsel memo). Not scheduled until the owner approves the first crawl. |
+| Ferry (added 2026-11-15, connectors INACTIVE) | probate, divorce | digitalarchives.wa.gov Superior Court case index (title 3007) | Playwright, 2 s pacing; never requests `/Record/` (robots-disallowed) | none | Policies page: records "open to the public ... under the Public Records Act"; no commercial or automation clause. | **GR 31(c)(4)** (dockets/indexes are court records); **GR 31(g)(4)** bars "commercial solicitation of individuals named in the court records" distributed in bulk | **H**. Code never delivers a lead (every run raises). Needs counsel before any use. |
+| Ferry | pre_foreclosure, trustee_sale (not built) | Auditor recording: request form only (no online index) | n/a | n/a | Form: requester "agree[s] not to use the information requested nor allow others to use it" for profit-making contact | RCW 42.56.070(8) | n/a (not used) |
 
 ## Superseded claims (docs that now contradict code)
 
@@ -77,3 +80,15 @@ Risk ratings:
 The production `county_connectors` dump; the production values of `CAPTCHA_ENABLED` and `COUNTY_GIS_RESTRICTED_MAILING_ENABLED`;
 and any written advice behind the 2026-09-14 (Tacoma owner name) and 2026-10-02 (RCW 42.56.070 "cleared for all counties")
 decisions.
+
+## Ferry County: questions for counsel (2026-11-15)
+
+1. TaxSifter: the county publishes per-parcel owner, address and tax balance pages behind a clickwrap with no
+   commercial-use term. Does compiling those pages into a delinquent-owner lead list sold to investors fall under
+   RCW 42.56.070(8) (an agency "list of individuals ... for commercial purposes"), given we never request a list
+   from the agency? Does the 2019 AG opinion on listings of taxable property change the answer?
+2. Automated acceptance of that clickwrap: any exposure beyond the terms' own text (accuracy, indemnity)?
+3. State Archives court index: is crawling a county's whole docket index "bulk distribution" under GR 31(c)(3),
+   and does GR 31(g)(4) then bar marketing to the named estates and divorcing spouses even though the Archives
+   publishes it free with no reuse terms?
+4. If (3) bars solicitation, is any use left (for example, a property-only signal with no named party)?

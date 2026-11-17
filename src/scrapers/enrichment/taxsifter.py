@@ -56,13 +56,21 @@ TAXSIFTER_ORIGINS: dict[str, str] = {
 # disclaimer). Whitman's GIS page says its data may not be used "to generate commercial
 # mailing lists" (RCW 42.56.070(9)); owner cleared all counties 2026-10-02 and asked for
 # Whitman 2026-10-04, so it answers to COUNTY_GIS_RESTRICTED_MAILING_ENABLED.
+# Ferry (verified 2026-11-15): PublicAccessNow, same markup; disclaimer has no
+# commercial-use or automation clause. Used only for the per-parcel TAX pass
+# (resolve_tax); it is not wired into county_gis mailing recovery.
 TAXSIFTER_PARCEL_SITES: dict[str, str] = {
     "whitman": "https://terrascan.whitmancounty.net/Taxsifter",
+    "ferry": "https://ferrywa-taxsifter.publicaccessnow.com",
 }
+# Counties whose parcel pass answers to COUNTY_GIS_RESTRICTED_MAILING_ENABLED (a
+# commercial-mailing-list clause on the county's own pages).
+_LICENSE_RESTRICTED = frozenset({"whitman"})
 
 _DISCLAIMER_PATH = "/Disclaimer.aspx"
 _RESULTS_PATH = "/Search/Results.aspx"
 _ASSESSOR_PATH = "/Assessor.aspx"
+_TREASURER_PATH = "/Treasurer.aspx"
 _AGREE_FIELD = "ctl00$cphContent$btnAgree"
 # Where an accepted disclaimer 302s to (the live portal: /default.aspx, which then
 # redirects to the results page). Anything else means the acceptance failed.
@@ -409,6 +417,86 @@ def parse_parcel_assessor(html: str, parcel_key: str):
     return MailingAnswer(FOUND, mailing_address=mailing, role="taxpayer")
 
 
+_TAX_AS_OF = re.compile(r"Data\s+current\s+as\s+of:?\s*(\d{1,2}/\d{1,2}/\d{4})", re.I)
+_STATEMENT = re.compile(r"^\s*(\d{4})-(\d{1,20})\s*$")
+_MONEY = re.compile(r"^\$([0-9,]+\.[0-9]{2})$")
+
+
+def parse_parcel_treasurer(html: str, parcel_key: str):
+    """pacs_tax.TaxAnswer for a Treasurer.aspx page, which must name exactly our parcel.
+
+    Read: the "5 Year Tax History" statements (one ``YYYY-<parcel>`` row each, its
+    Balance Due), the "Data current as of" date, and the owner block. Balance Due is
+    taxes + assessments + fees still unpaid; TaxSifter does not show accrued interest
+    or penalty on this table, so both stay 0 and the amount is a floor, never inflated.
+    Unknown is never zero: no as-of date, no history table or no statement row for
+    this parcel is ``unparsed``.
+    """
+    from datetime import datetime as _dt
+    from decimal import Decimal
+
+    from src.scrapers.enrichment.pacs import normalize_pacs_parcel
+    from src.scrapers.enrichment.pacs_tax import (
+        FOUND,
+        PARCEL_MISMATCH,
+        UNPARSED,
+        Statement,
+        TaxAnswer,
+    )
+
+    soup = BeautifulSoup(html, "html.parser")
+    echo = soup.find(id="cphContent_ParcelOwnerInfo1_lbParcelNumber")
+    if echo is None:
+        return TaxAnswer(UNPARSED)
+    if normalize_pacs_parcel(" ".join(echo.get_text(" ").split())) != parcel_key:
+        return TaxAnswer(PARCEL_MISMATCH)
+    stamp = soup.find(id="lblDataDate")
+    as_of = _TAX_AS_OF.search(stamp.get_text(" ")) if stamp else None
+    heading = next((h for h in soup.find_all("h1")
+                    if " ".join(h.get_text(" ").split()).upper() == "5 YEAR TAX HISTORY"), None)
+    table = heading.find_next("table", class_="dataGridPrimary") if heading else None
+    if as_of is None or table is None:
+        return TaxAnswer(UNPARSED)
+    statements: list[Statement] = []
+    for row in table.find_all("tr", recursive=False):
+        cells = row.find_all("td", recursive=False)
+        if row.find("th", recursive=False) is not None and not cells:
+            continue                                   # column header row
+        if len(cells) == 1 and cells[0].get("colspan") == "6" and not cells[0].get_text(strip=True):
+            continue                                   # spacer
+        if len(cells) == 2 and cells[1].get("colspan") == "5" and (
+                cells[1].find("table", class_="dataGridSecondary") is not None
+                or not cells[1].get_text(strip=True)):
+            continue                                   # receipts (or none) under a statement
+        if len(cells) != 6:
+            return TaxAnswer(UNPARSED)                 # a row shape we do not know
+        kind = " ".join(cells[0].get_text(" ").split()).upper()
+        if kind == "PERSONAL PROPERTY":
+            continue  # a parcel's real-property tax only; personal property is not the land
+        stmt = _STATEMENT.match(cells[1].get_text(" "))
+        money = _MONEY.match(" ".join(cells[5].get_text(" ").split()))
+        # Every real-property statement must be ours and readable: skipping a broken
+        # owing row while a paid one parses would report a false zero (Codex).
+        if (kind != "REAL PROPERTY" or stmt is None or money is None
+                or normalize_pacs_parcel(stmt.group(2)) != parcel_key):
+            return TaxAnswer(UNPARSED)
+        statements.append(Statement(
+            year=int(stmt.group(1)), statement_id=f"{stmt.group(1)}-{stmt.group(2)}",
+            amount_due=Decimal(money.group(1).replace(",", "")),
+            penalty=Decimal("0"), interest=Decimal("0")))
+    if not statements:
+        return TaxAnswer(UNPARSED)
+
+    def span(suffix: str) -> str | None:
+        el = soup.find(id=f"cphContent_ParcelOwnerInfo1_{suffix}")
+        text = " ".join(el.get_text(" ").split()) if el else ""
+        return text or None
+
+    return TaxAnswer(FOUND, as_of=_dt.strptime(as_of.group(1), "%m/%d/%Y").date(),
+                     statements=statements, owner_name=span("lbOwnerName"),
+                     property_address=span("lbSitus"), mailing_address=_mailing_from(soup))
+
+
 def resolve_mailing(county: str, parcel_ids: list[str], *,
                     time_budget_s: float = _PARCEL_CALL_BUDGET_S) -> dict:
     """Taxpayer mailing for one county's parcels, keyed by CALLER id. Never raises.
@@ -418,6 +506,26 @@ def resolve_mailing(county: str, parcel_ids: list[str], *,
     defers them. One stream fleet-wide per county (SourceAdmission), every request
     spaced, a 403/429 stops the pass and cools the source.
     """
+    from src.scrapers.enrichment.snohomish_assessor_roll import MailingAnswer
+
+    return _parcel_pass(county, parcel_ids, time_budget_s, _ASSESSOR_PATH,
+                        parse_parcel_assessor, MailingAnswer)
+
+
+def resolve_tax(county: str, parcel_ids: list[str], *,
+                time_budget_s: float = _PARCEL_CALL_BUDGET_S) -> dict:
+    """pacs_tax.TaxAnswer per parcel off Treasurer.aspx, with every guarantee of
+    resolve_mailing (lease, spacing, identity chain, block cooldown, drift breaker).
+    Same contract as pacs_parcel.resolve_tax, so workers/pacs_tax_crawler can use it."""
+    from src.scrapers.enrichment.pacs_tax import TaxAnswer
+
+    return _parcel_pass(county, parcel_ids, time_budget_s, _TREASURER_PATH,
+                        parse_parcel_treasurer, TaxAnswer)
+
+
+def _parcel_pass(county: str, parcel_ids: list[str], time_budget_s: float,
+                 detail_path: str, parse_detail, make) -> dict:
+    """One paced, lease-guarded search -> detail-page pass; see resolve_mailing."""
     from src.scrapers.enrichment.pacs import normalize_pacs_parcel
     from src.scrapers.enrichment.pacs_parcel import (
         PARCEL_NOT_FOUND,
@@ -425,28 +533,27 @@ def resolve_mailing(county: str, parcel_ids: list[str], *,
         UNPARSED,
         query_digits,
     )
-    from src.scrapers.enrichment.snohomish_assessor_roll import (
-        FOUND,
-        SOURCE_UNAVAILABLE,
-        MailingAnswer,
-    )
+    from src.scrapers.enrichment.snohomish_assessor_roll import FOUND, SOURCE_UNAVAILABLE
     from src.scrapers.enrichment.source_admission import SourceAdmission
     from src.scrapers.enrichment.source_health import (
         SourceUnavailableError,
         check_source_or_raise,
         record_source_blocked,
     )
+    from src.utils.celery_limits import reraise_time_limit
 
     county = (county or "").lower()
-    out = {pid: MailingAnswer(SOURCE_UNAVAILABLE) for pid in parcel_ids}
-    if county not in TAXSIFTER_PARCEL_SITES or not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED:
+    out = {pid: make(SOURCE_UNAVAILABLE) for pid in parcel_ids}
+    if county not in TAXSIFTER_PARCEL_SITES:
+        return out
+    if county in _LICENSE_RESTRICTED and not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED:
         return out
     by_key: dict[str, list[str]] = {}
     queries: dict[str, str] = {}  # key -> the longest caller spelling (zeros kept)
     for pid in parcel_ids:
         key = normalize_pacs_parcel(pid)
         if key is None:
-            out[pid] = MailingAnswer(PARCEL_NOT_FOUND)
+            out[pid] = make(PARCEL_NOT_FOUND)
             continue
         by_key.setdefault(key, []).append(pid)
         q = query_digits(pid)
@@ -475,6 +582,7 @@ def resolve_mailing(county: str, parcel_ids: list[str], *,
             _logger.info("%s: %s; %d parcel(s) deferred", source_key, exc, len(by_key))
             return out
         except Exception as exc:  # noqa: BLE001 -- a source problem defers, never raises
+            reraise_time_limit(exc)
             _logger.warning("%s unavailable: %s", source_key, type(exc).__name__)
             return out
 
@@ -483,6 +591,7 @@ def resolve_mailing(county: str, parcel_ids: list[str], *,
             try:
                 resp = client._get(path, **params)
             except Exception as exc:  # noqa: BLE001
+                reraise_time_limit(exc)
                 _logger.warning("%s request %s", source_key, type(exc).__name__)
                 return None, False
             if resp.status_code in _BLOCK_STATUSES:
@@ -503,14 +612,14 @@ def resolve_mailing(county: str, parcel_ids: list[str], *,
             if not blocked and resp is not None:
                 outcome, link = parse_parcel_results(resp.text, key)
                 if outcome != FOUND:
-                    answer = MailingAnswer(outcome)
+                    answer = make(outcome)
                 elif time.monotonic() > deadline:
                     break  # the second request would overrun the budget: defer this parcel
                 elif admission.still_held():
-                    resp, blocked = _page(_ASSESSOR_PATH, keyId=link[0], parcelNumber=link[1],
+                    resp, blocked = _page(detail_path, keyId=link[0], parcelNumber=link[1],
                                           typeID="1")
                     if not blocked and resp is not None:
-                        answer = parse_parcel_assessor(resp.text, key)
+                        answer = parse_detail(resp.text, key)
                 else:
                     break
             if blocked:
@@ -518,7 +627,7 @@ def resolve_mailing(county: str, parcel_ids: list[str], *,
                 _logger.warning("%s blocked; pass stopped", source_key)
                 break
             if answer is None:
-                answer = MailingAnswer(REQUEST_FAILED)
+                answer = make(REQUEST_FAILED)
             for pid in callers:
                 out[pid] = answer
             counts[answer.outcome] = counts.get(answer.outcome, 0) + 1

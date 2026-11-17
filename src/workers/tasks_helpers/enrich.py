@@ -1267,9 +1267,11 @@ def _run_inline_enrichment(
 
     # GIS batch enrichment for property AND mailing addresses
     # Run for records missing either property address or mailing address
+    from src.scrapers.enrichment.county_gis import gis_min_parcel_len
+    min_pid = gis_min_parcel_len(config.county, config.state)  # Cowlitz ids can be 5 chars
     results_need_addr = [
         res for res in lookup_rows
-        if res.parcel_id and len(res.parcel_id.strip()) >= 6
+        if res.parcel_id and len(res.parcel_id.strip()) >= min_pid
         and (not res.property_address or res.property_address == "(enrichment unavailable)"
              or not res.mailing_address)
     ]
@@ -1911,7 +1913,7 @@ def _run_inline_enrichment(
                                 job_id, str(exc)[:120])
         needs = [
             res for res in lookup_rows
-            if res.parcel_id and len(res.parcel_id.strip()) >= 6
+            if res.parcel_id and len(res.parcel_id.strip()) >= min_pid
             # A privacy-withheld lead (its owner tombstoned above) gets no county request.
             and res.privacy_suppressed_at is None
             and (not res.mailing_address
@@ -2672,7 +2674,7 @@ def _run_inline_enrichment(
             summary["mailing_missing"] = len([
                 res for res in all_results
                 if not res.is_duplicate and not res.mailing_address
-                and res.parcel_id and len(res.parcel_id.strip()) >= 6
+                and res.parcel_id and len(res.parcel_id.strip()) >= min_pid
             ])
         except Exception as exc:  # noqa: BLE001 -- a report must never fail the job
             _logger.warning("mailing_missing count skipped: %s", str(exc)[:120])

@@ -1,0 +1,583 @@
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+
+<html lang="en-us" xmlns="http://www.w3.org/1999/xhtml">
+<head id="Head1"><title>
+
+	TerraScan TaxSifter -
+
+        Ferry County Washington
+
+</title>
+<!-- png tranparency fix -->
+<!--[if lt IE 7]>
+
+        <script type="text/javascript" src='/js/pngfix/unitpngfix.js'></script>
+
+    <![endif]-->
+<link href="../Theme/CSS/DynamicCSS.aspx" rel="stylesheet" type="text/css"/>
+<script src="../JS/jquery.js" type="text/javascript"></script>
+<style type="text/css">
+
+        .bar
+
+        {
+
+            background-color: #58725A;
+
+            height: 35px;
+
+            padding: 10px;
+
+        }
+
+        #search
+
+        {
+
+            float: left;
+
+        }
+
+        /* search text box */
+
+        #search #q
+
+        {
+
+            height: 30px;
+
+            width: 300px;
+
+            vertical-align: middle;
+
+            padding-left: 5px;
+
+            line-height: 30px;
+
+            font-size: 20px;
+
+            border: 0px;
+
+        }
+
+        #search #submit
+
+        {
+
+            height: 32px;
+
+            width: 60px;
+
+            vertical-align: middle;
+
+        }
+
+        #result-area
+
+        {
+
+            background-color:#BDBDBD;
+
+        }
+
+        .result
+
+        {
+
+            height: 135px;
+
+            padding: 10px;
+
+            background-color: #fff;
+
+            margin-bottom:5px;
+
+        }
+
+        .result .links a
+
+        {
+
+            margin-right: 10px;
+
+        }
+
+        .result:hover
+
+        {
+
+            background-color: #F5F5F5;
+
+        }
+
+        .result .property-photo
+
+        {
+
+            float: left;
+
+            height: 130px;
+
+            margin-right: 10px;
+
+        }
+
+        
+
+        .apResult
+
+        {
+
+            height: 135px;
+
+            padding: 10px;
+
+            background-color: #EEE;
+
+            margin-bottom:5px;
+
+            margin-left:25px;
+
+        }
+
+        .apResult .links a
+
+        {
+
+            margin-right: 10px;
+
+        }
+
+        .apResult:hover
+
+        {
+
+            background-color: #E5E5E5;
+
+        }
+
+        .apResult .property-photo
+
+        {
+
+            float: left;
+
+            height: 130px;
+
+            margin-right: 10px;
+
+        }
+
+        
+
+        .details
+
+        {
+
+            height: 100px;
+
+        }
+
+        .details div
+
+        {
+
+            font: bold 16px/14px Arial;
+
+            color: #595959;
+
+            padding-bottom: 5px;
+
+        }
+
+        .details .match
+
+        {
+
+            font: bold 18px/18px Arial;
+
+            color: #000;
+
+            letter-spacing: 0px;
+
+        }
+
+        
+
+        .nav ul
+
+        {
+
+            margin-left: 10px;
+
+            padding-left: 0;
+
+        }
+
+        .nav ul li
+
+        {
+
+            list-style: none;
+
+            display: inline;
+
+        }
+
+        .nav ul li a:link, .nav ul li a:visited
+
+        {
+
+            color: #fff;
+
+            background-color: #58725A;
+
+            padding: 5px 10px 5px 10px;
+
+            text-decoration: none;
+
+            font-size: 12px;
+
+            /* letter-spacing: -1px; */
+
+        }
+
+        .pager
+
+        {
+
+            float: right;
+
+        }
+
+        .pager div
+
+        {
+
+            float: left;
+
+            min-width: 25px;
+
+            height: 35px; /* center */
+
+            text-align: center;
+
+            line-height: 35px;
+
+            border: solid 1px #666;
+
+            margin-right: 3px;
+
+            background-color:#595959;
+
+        }
+
+        .pager a
+
+        {
+
+            text-decoration: none;
+
+            font-weight: normal;
+
+            font-size: 20px;
+
+            color: #fff;
+
+            padding: 10px 5px 10px 5px;
+
+        }
+
+        .pager .selected
+
+        {
+
+            background-color: #454545;
+
+        }
+
+        .resultCount
+
+        {
+
+        	float:right;
+
+            margin-top: 20px;
+
+            margin-bottom: 0px;
+
+            margin-left: 0px;
+
+            margin-right: 15px;
+
+            font: bold 16px/16px Arial;
+
+            color: #fff
+
+        }
+
+        #no-results
+
+        {
+
+            margin-left: 40px;
+
+            font-family: Arial;
+
+        }
+
+        #no-results p
+
+        {
+
+            font-size: 24px;
+
+            font-weight: bold;
+
+            letter-spacing: -1px;
+
+        }
+
+        #no-results ul li
+
+        {
+
+            font-size: 18px;
+
+        }
+
+        #no-results ul ul li
+
+        {
+
+            font-size: 16px;
+
+            list-style: none;
+
+        }
+
+    </style>
+<style type="text/css">
+
+        .RollYear
+
+        {
+
+            font-size:9px;
+
+            background-color:#fff;
+
+            color:#333;
+
+            padding-right:5px;
+
+            float:right;
+
+        }
+
+        .lastMod
+
+        {
+
+            font-size:9px;
+
+            background-color:#fff;
+
+            color:#333;
+
+            text-align:center;
+
+        }
+
+    </style>
+</head>
+<body>
+<form action="./Results.aspx?q=33715440001000" id="form1" method="post">
+<div class="aspNetHidden">
+<input id="__VIEWSTATE" name="__VIEWSTATE" type="hidden" value=""/>
+</div>
+<div class="aspNetHidden">
+<input id="__VIEWSTATEGENERATOR" name="__VIEWSTATEGENERATOR" type="hidden" value=""/>
+</div>
+<div id="main">
+<div id="header">
+<div id="logo">
+<a href="https://www.ferry-county.com/" target="_blank">
+<img alt="County Seal" src="/theme/imgs/ferrylogo.gif" style="border: none"/>
+</a>
+</div>
+<div id="thomsonReutersLogo">
+<img alt="Aumentum Tech Logo" class="thomsonReutersLogo" id="imgLogo" src="../Images/AumentumTech_Condensed_Logo.png"/></div>
+<div id="countyName">
+
+                Ferry County</div>
+<div id="location">
+
+                Washington</div>
+<div id="productName">
+
+                TaxSifter
+
+            </div>
+<div id="nav">
+<style type="text/css">
+
+.cart_disabled
+
+{
+
+  visibility:hidden;
+
+  display:none;
+
+}
+
+</style>
+<div class="navLink">
+<a href="Results.aspx" id="Navigation1_rptTabs_HyperLink1_0" target="_self" title="Perform a search using simple criteria">Simple Search</a>
+</div>
+<div class="navLink">
+<a href="../SalesSearch/SalesSearch.aspx" id="Navigation1_rptTabs_HyperLink1_1" target="_self" title="Perform a search based on property sales">Sales Search</a>
+</div>
+<div class="navLink">
+<a href="http://ferrywa.reetsifter.com/" id="Navigation1_rptTabs_HyperLink1_2" target="_self" title="Go to the Online Affidavit search">REETSifter</a>
+</div>
+<div class="navLink">
+<a href="https://www.ferry-county.com/" id="Navigation1_rptTabs_HyperLink1_3" target="_blank" title="Open the County Home Page (New window)">County Home Page</a>
+</div>
+<div class="navLink">
+<a href="../Contact.aspx" id="Navigation1_rptTabs_HyperLink1_4" target="_self" title="View contact information">Contact</a>
+</div>
+<div class="navLink">
+<a href="../Disclaimer.aspx" id="Navigation1_rptTabs_HyperLink1_5" target="_self" title="View the legal disclaimer">Disclaimer</a>
+</div>
+<div class="navLink">
+<a href="../Help.aspx" id="Navigation1_rptTabs_HyperLink1_6" target="_self" title="View the help FAQ's">Help</a>
+</div>
+<div class="navLink" id="Navigation1_divCartLink" style="float:right; padding-right: 15px;">
+<a href="../Cart.aspx" id="Navigation1_lnkCart" target="_self" title="Manage your Payment Cart">PAYMENT CART(0)</a>
+</div>
+</div>
+</div>
+<div id="content">
+<div id="container">
+<script type="text/javascript">
+
+        $(document).ready(function() {
+
+
+
+
+
+            $("#submit").click(function() {
+
+                window.location = "results.aspx?q=" + encodeURI($.trim($("#q").val()));
+
+                return false; // don't submit form
+
+            });
+
+
+
+
+
+            $("#q").keypress(function(event) {
+
+                if (event.keyCode == 13) {
+
+                    $("#submit").click();
+
+                    return false; // don't submit form
+
+                }
+
+            });
+
+
+
+        });
+
+        
+
+
+
+        function popUp(url)
+
+        {
+
+            mywindow = window.open (url,"_blank","location=0,status=0,scrollbars=0,width=750,height=600");
+
+        } 
+
+
+
+    </script>
+<!-- perform search -->
+<div class="bar">
+<div id="search">
+<input id="q" name="q" title="Search" type="text" value="33715440001000"/>
+<input id="page" name="page" type="hidden" value=""/>
+<input class="btnGeneric" id="submit" onkeypress="return false;" type="submit" value="Search"/>
+</div>
+<div class="pager">
+<div class="selected"><a href="?q=33715440001000&amp;page=1&amp;1=1#rslts">1</a></div>
+</div>
+<div class="resultCount">
+
+            1 records found.
+
+        </div>
+</div>
+<br style="clear: both"/>
+<!-- no records found -->
+<!-- results -->
+<div id="result-area">
+<div class="result" id="cphContent_Repeater1_pnlResult_0">
+<div class="property-photo">
+<img alt="Parcel Image" class="propertyImage" onclick="popUp('../ViewImage.aspx?pnum=33715440001000&amp;situs=REDACTED&amp;img=~/Attachments/30000/841/05/84105_m.jpg');" src="../Attachments/30000/841/05/84105_s.jpg" style="border-width:1px;border-style:solid;" title="Click to view larger image."/>
+</div>
+<div class="details">
+<div class="match">
+
+                        33715440001000
+
+                        (Parcel Number)
+
+                        <font color="#CC0000"></font>
+</div>
+<div>
+
+                        33715440001000
+
+                    </div>
+<div>REDACTED</div>
+<div>REDACTED</div>
+<div>REDACTED</div>
+</div>
+<div class="nav">
+<ul>
+<li><a href="/Assessor.aspx?keyId=360650&amp;parcelNumber=33715440001000&amp;typeID=1">Assessor</a></li>
+<li><a href="/Treasurer.aspx?keyId=360650&amp;parcelNumber=33715440001000&amp;typeID=1">Treasurer</a></li>
+<li><a href="/AppraisalDetails.aspx?keyId=360650&amp;parcelNumber=33715440001000&amp;typeID=1">REDACTED</a></li>
+<li><a href="http://ferrywa.mapsifter.com/default.aspx?parcel=33715440001000" target="_blank">MapSifter</a></li>
+<li>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<br style="clear: both"/>
+</div>
+<table border="0" cellpadding="0" cellspacing="0" style="background-color:#FFFFFF" width="100%">
+<tr>
+<td width="33%"><span id="footer">1.0.9607.39669</span></td>
+<td style="text-align:center" width="34%"><span class="lastMod" id="lblDataDate">Data current as of: 11/12/2026 2:12 PM</span></td>
+<td width="33%"><span class="RollYear" id="lblRollYear">TX_RollYear_Search: 2027</span></td>
+</tr>
+</table>
+</div>
+</div>
+</form>
+</body>
+</html>

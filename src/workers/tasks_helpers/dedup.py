@@ -171,7 +171,18 @@ _TRUSTED_TAX_SOURCES = frozenset({
     "clallam_county_tax_foreclosure_certificate",
     "asotin_pacs_tax",                     # Asotin — per-parcel PACS tax tables (pacs_tax)
     "columbia_pacs_tax",                   # Columbia — the same reader and tables
+    # Cowlitz — the Treasurer's current tax-foreclosure listing, re-issued as parcels
+    # redeem; amount = the minimum bid (redemption total), no per-parcel year.
+    "cowlitz_county_tax_foreclosure",
+    "ferry_taxsifter_tax",                 # Ferry — per-parcel TaxSifter Treasurer pages
 })
+
+# Trusted sources that publish the amount owed but not the oldest unpaid year for each
+# parcel. Their rows carry bill_year None and are accepted without one; a year is never
+# invented. Months filters then exclude them, which is correct: their age is unknown.
+# Cowlitz: the Treasurer's listing gives the minimum bid only (certificate: "unpaid
+# property taxes from 2023 or earlier", not per parcel).
+_YEAR_UNPUBLISHED_TAX_SOURCES = frozenset({"cowlitz_county_tax_foreclosure"})
 
 
 def _extract_tax_fields(
@@ -259,7 +270,8 @@ def validate_tax_delinquent_records(records, record_type: str) -> None:
                 f"(with county-qualification sign-off + fixtures) before enabling it."
             )
         amount, year = _extract_tax_fields(enrichment, record_type)
-        if amount is None or year is None:
+        year_optional = source in _YEAR_UNPUBLISHED_TAX_SOURCES
+        if amount is None or (year is None and not year_optional):
             raise TaxDelinquentInvariantError(
                 f"tax_delinquent record #{idx} from {source!r} is missing required "
                 f"structured tax fields (delinquent_amount={amount!r}, "

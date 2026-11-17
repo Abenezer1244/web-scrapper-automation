@@ -29,7 +29,10 @@ from src.workers import app
 
 _logger = setup_logger("workers.pacs_tax_crawler")
 
-COUNTIES = ("asotin", "columbia")   # PACS counties with no delinquent list
+# Counties with no delinquent list. Ferry reads TaxSifter Treasurer pages instead of PACS
+# (owner approved its first full crawl 2026-11-15).
+COUNTIES = ("asotin", "columbia", "ferry")
+_TAX_SOURCE = {"asotin": "pacs", "columbia": "pacs", "ferry": "taxsifter"}
 _STATE = "WA"
 _BATCH = 400                        # more than one budget can reach; the rest wait
 _BUDGET_S = 20 * 60                 # inside the hourly slot, leaving the lease free
@@ -42,6 +45,9 @@ INVENTORY_KEY = "pacs_tax_inventory:{}".format  # external_source_health heartbe
 # The page's "as of" is the county's own today; a date further off is a stale or broken
 # snapshot, never a fresh answer.
 _AS_OF_SLACK = timedelta(days=3)
+# TaxSifter stamps the date its data was last loaded ("Data current as of"), not today:
+# Ferry's read 3 days old on 2026-11-15. Two weeks covers a weekly load plus one miss.
+_AS_OF_SLACK_BY_COUNTY = {"ferry": timedelta(days=14)}
 # No settled answer for this long (lost year, layout, a block): alert even when the pass
 # could ask nothing at all, which "asked but not settled" alone misses.
 _SILENT_AFTER = timedelta(hours=6)
@@ -130,6 +136,17 @@ def statewide_parcel_ids(county: str, fetch) -> list[str]:
     return distinct
 
 
+def _owed_by_year(statements) -> dict[str, str]:
+    """Past-due amount per tax year. Summed, never last-wins: a parcel the county lists
+    under two accounts has one statement per account for the same year (Codex)."""
+    from decimal import Decimal
+
+    owed: dict[str, Decimal] = {}
+    for s in statements:
+        owed[str(s.year)] = owed.get(str(s.year), Decimal("0")) + s.amount_due
+    return {year: str(amount) for year, amount in owed.items()}
+
+
 def _settled_row(answer, gate) -> dict:
     """The column values one settled answer writes."""
     from src.scrapers.enrichment.pacs_tax import FOUND
@@ -140,7 +157,7 @@ def _settled_row(answer, gate) -> dict:
         return row
     row.update(as_of=answer.as_of, amount=answer.delinquent_amount,
                oldest=answer.oldest_delinquent_year,
-               years=json.dumps({str(s.year): str(s.amount_due) for s in answer.past_due}))
+               years=json.dumps(_owed_by_year(answer.past_due)))
     # Personal fields only with an owner: an ownerless row could neither be delivered
     # (the scraper holds it) nor be found by erasure, which keys on the owner.
     if answer.delinquent_amount > 0 and answer.owner_name:
@@ -199,7 +216,8 @@ def crawl_county(county: str, db, *, fetch, resolve, now: datetime | None = None
         summary["asked"] += 1
         key = {"county": county, "state": _STATE, "parcel": parcel, "now": now}
         stale = (answer.outcome == "found"
-                 and abs(answer.as_of - now.date()) > _AS_OF_SLACK)
+                 and abs(answer.as_of - now.date())
+                 > _AS_OF_SLACK_BY_COUNTY.get(county, _AS_OF_SLACK))
         if answer.outcome in _SETTLED and not stale:
             row = _settled_row(answer, lambda r, p=parcel: gate({**r, "parcel": p}))
             db.execute(_SETTLE, {**key, **row})
@@ -231,9 +249,23 @@ _SETTLED = frozenset({"found", "parcel_not_found"})
 
 @app.task(name="src.workers.pacs_tax_crawler.crawl_pacs_tax")
 def crawl_pacs_tax() -> dict:
-    """Beat entry: one bounded run per county; never raises for a source problem."""
+    """Beat entry: one task per county, so each pass has its own time limit.
+
+    Three counties at a 20-minute budget each no longer fit one task's 55-minute soft
+    limit (Codex): the last county's pass would be cut off before it wrote anything."""
+    for county in COUNTIES:
+        crawl_pacs_tax_county.delay(county)
+    return {"dispatched": list(COUNTIES)}
+
+
+# Budget 20 min + inventory/DB/alerts: well inside 25 min soft, 30 min hard.
+@app.task(name="src.workers.pacs_tax_crawler.crawl_pacs_tax_county",
+          soft_time_limit=25 * 60, time_limit=30 * 60)
+def crawl_pacs_tax_county(county: str) -> dict:
+    """One bounded run for one county; never raises for a source problem."""
     from src.db.session import system_sync_session
-    from src.scrapers.enrichment.pacs_parcel import resolve_tax
+    from src.scrapers.enrichment import pacs_parcel, taxsifter
+    from src.utils.celery_limits import reraise_time_limit
     from src.utils.safe_http import safe_get
 
     def fetch(url: str) -> dict:
@@ -241,36 +273,39 @@ def crawl_pacs_tax() -> dict:
         resp.raise_for_status()
         return resp.json()
 
-    results = []
-    for county in COUNTIES:
-        try:
-            with system_sync_session() as db:
-                summary = crawl_county(county, db, fetch=fetch, resolve=resolve_tax)
-        except Exception as exc:  # noqa: BLE001 — one county must not stop the others
-            _logger.error("PACS tax crawl %s failed: %s", county, str(exc)[:200])
-            summary = {"county": county, "error": type(exc).__name__}
-        from src.workers.ops_alerts import send_ops_alert
+    if county not in COUNTIES:
+        raise ValueError(f"no tax crawl for {county}")
+    resolvers = {"pacs": pacs_parcel.resolve_tax, "taxsifter": taxsifter.resolve_tax}
+    try:
+        with system_sync_session() as db:
+            summary = crawl_county(county, db, fetch=fetch,
+                                   resolve=resolvers[_TAX_SOURCE[county]])
+    except Exception as exc:  # noqa: BLE001 — a source problem is logged, not raised
+        reraise_time_limit(exc)
+        _logger.error("PACS tax crawl %s failed: %s", county, str(exc)[:200])
+        summary = {"county": county, "error": type(exc).__name__}
+    from src.workers.ops_alerts import send_ops_alert
 
-        if summary.get("asked") and not summary.get("settled"):
-            send_ops_alert(
-                kind="pacs_tax_unsettled", key=f"pacs_tax_unsettled:{county}",
-                subject=f"PACS tax crawl settled nothing ({county})",
-                body=f"{summary['asked']} parcels asked, 0 answered. The PACS layout or "
-                     "the tax table may have changed.",
-            )
-        try:
-            with system_sync_session() as db:
-                quiet = silent_since(county, db, datetime.now(UTC))
-        except Exception as exc:  # noqa: BLE001 — the heartbeat must not stop the crawl
-            _logger.error("PACS tax heartbeat %s unreadable: %s", county, type(exc).__name__)
-            quiet = None
-        if quiet is not None:
-            send_ops_alert(
-                kind="pacs_tax_silent", key=f"pacs_tax_silent:{county}",
-                subject=f"PACS tax crawl has settled nothing for {_SILENT_AFTER} ({county})",
-                body=f"No parcel answered since {quiet.isoformat()}. Check the county "
-                     "portal (year selector, layout, a block) and the PACS lease.",
-            )
-        _logger.info("PACS tax crawl: %s", summary)  # counts only, no parcels or names
-        results.append(summary)
-    return {"counties": results}
+    if summary.get("asked") and not summary.get("settled"):
+        send_ops_alert(
+            kind="pacs_tax_unsettled", key=f"pacs_tax_unsettled:{county}",
+            subject=f"PACS tax crawl settled nothing ({county})",
+            body=f"{summary['asked']} parcels asked, 0 answered. The PACS layout or "
+                 "the tax table may have changed.",
+        )
+    try:
+        with system_sync_session() as db:
+            quiet = silent_since(county, db, datetime.now(UTC))
+    except Exception as exc:  # noqa: BLE001 — the heartbeat must not stop the crawl
+        reraise_time_limit(exc)
+        _logger.error("PACS tax heartbeat %s unreadable: %s", county, type(exc).__name__)
+        quiet = None
+    if quiet is not None:
+        send_ops_alert(
+            kind="pacs_tax_silent", key=f"pacs_tax_silent:{county}",
+            subject=f"PACS tax crawl has settled nothing for {_SILENT_AFTER} ({county})",
+            body=f"No parcel answered since {quiet.isoformat()}. Check the county "
+                 "portal (year selector, layout, a block) and the PACS lease.",
+        )
+    _logger.info("PACS tax crawl: %s", summary)  # counts only, no parcels or names
+    return summary

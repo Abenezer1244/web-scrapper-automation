@@ -13,15 +13,15 @@ registry reads active rows only, so it never answers for pre_foreclosure while o
 Data INSERT only. Idempotent: WHERE NOT EXISTS on (county, state, scraper_class, the
 record type); the downgrade deletes exactly that row.
 
-Revision ID: 165
-Revises: 164
+Revision ID: 169
+Revises: 168
 Create Date: 2026-11-16
 """
 
 from alembic import op
 
-revision = "165"
-down_revision = "164"
+revision = "169"
+down_revision = "168"
 branch_labels = None
 depends_on = None
 

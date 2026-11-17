@@ -357,15 +357,15 @@ def test_a_submitted_token_is_forgotten():
         captcha._token_cache.pop(key, None)
 
 
-# --- migration 165 -----------------------------------------------------------------------
+# --- migration 169 -----------------------------------------------------------------------
 
 def _migration():
     import importlib.util
     from pathlib import Path
 
     path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / \
-        "165_add_asotin_lis_pendens_connector.py"
-    spec = importlib.util.spec_from_file_location("_mig165", path)
+        "169_add_asotin_lis_pendens_connector.py"
+    spec = importlib.util.spec_from_file_location("_mig169", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod, path.read_text(encoding="utf-8")
@@ -375,7 +375,7 @@ def test_the_connector_offers_lis_pendens_only_and_is_seeded_off():
     import importlib
 
     mig, source = _migration()
-    assert (mig.revision, mig.down_revision) == ("165", "164")
+    assert (mig.revision, mig.down_revision) == ("169", "168")
     module_path, name = mig._SCRAPER_CLASS.rsplit(".", 1)
     assert module_path in _ALLOWED_SCRAPER_MODULES
     assert getattr(importlib.import_module(module_path), name) is ar.AsotinWARecorderScraper

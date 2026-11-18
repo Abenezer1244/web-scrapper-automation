@@ -118,7 +118,9 @@ _CACHE_FILL_ROWS = 5000
 _ELIGIBLE_ROW = """
       (r.is_duplicate = false
        OR (r.is_duplicate = true AND coalesce(r.duplicate_reason, 'prior_run') = 'prior_run'))
-  AND r.enrichment_data->>'delivery_excluded_reason' IS NULL
+  -- held only for having had no address when its run delivered (lead_actionability
+  -- NO_ADDRESS): still enriched, as before that hold existed; never delivered by this
+  AND coalesce(r.enrichment_data->>'delivery_excluded_reason', '') IN ('', 'no_address')
   AND coalesce(r.enrichment_data->>'owner_lookup_outcome', '') <> 'not_on_record'
   AND coalesce(r.enrichment_data->>'owner_recovery_outcome', '')
       NOT IN ('found', 'not_on_record', 'parcel_mismatch', 'gave_up', 'privacy_withheld')

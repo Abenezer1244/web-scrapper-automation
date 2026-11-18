@@ -1582,7 +1582,6 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     return " ".join((found or "").split())[:512] or None
 
 
-_APN_SEPARATOR_RE = re.compile(r"[&/+,;:#]")
 _CHELAN_APN_RE = re.compile(r"\d{12}")
 
 
@@ -1610,27 +1609,27 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     apns = parse_detail_apns(html_text)
     if apns is None:
         return None
-    # Trusted only when it is the whole, clean answer (Codex): the run of number tokens
-    # right after the APN label must be 12-digit Chelan parcels, every one, and exactly
-    # what the parser found. A spaced or partial APN, or one the parser missed, makes
-    # the answer unknown, never a shorter list. Entities are decoded first (&nbsp;).
+    # Trusted only when it is the whole, clean answer (Codex). The legal after the APN
+    # label is read for runs of digit groups separated only by spaces or punctuation
+    # (never by a word). A run of 9+ digits must be whole 12-digit Chelan APNs; shorter
+    # runs are lots, blocks and plats. The APNs found must be exactly the parser's.
+    # Anything else (a split, spaced or odd-length number) makes the answer unknown,
+    # never a shorter list. Entities are decoded first (&nbsp;, &amp;).
     text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", html_text)).split())
     legal = _DOC_LEGAL_RE.search(text)
     label = re.search(r"\bAPN\b", legal.group(1), re.I) if legal else None
-    run: list[str] = []
-    # Separators become spaces before splitting, wherever they sit ("&252104" too).
-    field = _APN_SEPARATOR_RE.sub(" ", legal.group(1)[label.end():]) if label else ""
-    for token in field.split():
-        if token.upper() in ("AND", "APN", "APNS"):
-            continue  # "APN 1 AND 2", "APN 1; APN 2": a repeated label is still the field
-        if not re.fullmatch(r"[\d-]+", token):
-            break  # the first word ends the field ("NORTH ENTIAT LOT 2")
-        run.append(token.replace("-", ""))
-    if not run:
+    if not label:
         return apns if not apns else None
-    if any(not _CHELAN_APN_RE.fullmatch(t) for t in run) or list(dict.fromkeys(run)) != apns:
-        return None
-    return apns
+    field = re.sub(r"(?<=\d)-(?=\d)", "", legal.group(1)[label.end():])
+    found: list[str] = []
+    for run in re.finditer(r"\d+(?:[^\w]+\d+)*", field):
+        groups = re.findall(r"\d+", run.group(0))
+        if sum(len(g) for g in groups) < 9:
+            continue
+        if any(not _CHELAN_APN_RE.fullmatch(g) for g in groups):
+            return None
+        found.extend(groups)
+    return apns if list(dict.fromkeys(found)) == apns else None
 
 
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,

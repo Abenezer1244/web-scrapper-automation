@@ -143,10 +143,15 @@ def _page(*lines: str) -> str:
     (["SP 2019-008 LOT 7"], []),                                       # no APN line: none listed
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE'S DEED", "APN NO. #"], None),
     (["APN"], None),                                                    # an empty APN line
+    (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE&#39;S DEED", "ADDITIONAL APN 252104732030"],
+     None),                                                             # an APN on any line counts
+    (["APN 222014846080", "REC 2521 0473 2030"], None),                # spaced APN-size number
+    (["APN 222014846080", "SP 2019-008 LOT 7 SEC 12 TWP 23 RGE 20 12-23-20"], ["222014846080"]),
 ], ids=["real", "2629393", "two-on-a-line", "two-lines", "colon-comma", "hash", "dashed",
         "nine-digit", "spaced-second", "spaced-only", "amp-split", "glued-amp", "nbsp",
         "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn",
-        "empty-apn-line", "bare-label"])
+        "empty-apn-line", "bare-label", "additional-apn", "spaced-elsewhere",
+        "short-numbers"])
 def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, lines, expected):
     page = _page(*lines)
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())

@@ -1626,20 +1626,30 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     lines = _doc_legal_lines(html_text)
     if lines is None:  # no DocLegal block to check against
         return apns if not apns else None
-    # Trusted only when it is the whole, clean answer (Codex). Each line of the
-    # DocLegal block that starts with APN must hold nothing but whole 12-digit Chelan
-    # APNs (separators, NO. and # aside); other lines are the legal description. The
-    # block comes from the page structure, not from where a word happens to appear.
+    # Trusted only when it is the whole, clean answer (Codex). The block comes from the
+    # page structure, not from where a word happens to appear, and every line of it is
+    # read: a line that starts with APN must hold nothing but whole 12-digit Chelan APNs
+    # (separators, NO. and # aside), and on ANY line a number of APN size (digit groups
+    # joined only by spaces or punctuation, 9+ digits in all) must be whole 12-digit
+    # APNs. Shorter numbers are lots, blocks, plats and section-township-range. The
+    # APNs found must be exactly the parser's; otherwise unknown, never a shorter list.
     found: list[str] = []
     for line in lines:
+        line = re.sub(r"(?<=\d)-(?=\d)", "", line)
         head = re.match(r"\s*APNS?\b(.*)", line, re.I | re.S)
-        if not head:
+        if head:
+            tokens = re.sub(r"[&/+,;:#]|\b(?:NO|NOS|AND|APNS?)\b\.?", " ", head.group(1), flags=re.I).split()
+            if not tokens or any(not _CHELAN_APN_RE.fullmatch(t) for t in tokens):
+                return None  # an APN line with no APN, or with anything else, is unread
+            found.extend(tokens)
             continue
-        rest = re.sub(r"(?<=\d)-(?=\d)", "", head.group(1))
-        tokens = re.sub(r"[&/+,;:#]|\b(?:NO|NOS|AND|APNS?)\b\.?", " ", rest, flags=re.I).split()
-        if not tokens or any(not _CHELAN_APN_RE.fullmatch(t) for t in tokens):
-            return None  # an APN line with no APN, or with anything else, is unread
-        found.extend(tokens)
+        for run in re.finditer(r"\d+(?:[^\w]+\d+)*", line):
+            groups = re.findall(r"\d+", run.group(0))
+            if sum(len(g) for g in groups) < 9:
+                continue
+            if any(not _CHELAN_APN_RE.fullmatch(g) for g in groups):
+                return None
+            found.extend(groups)
     return apns if list(dict.fromkeys(found)) == apns else None
 
 

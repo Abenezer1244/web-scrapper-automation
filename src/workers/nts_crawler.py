@@ -1645,6 +1645,12 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
             found.append(number)
         elif len(number) >= 3:
             return None
+    # Numbers side by side (only spaces or punctuation between) must all be whole APNs:
+    # an APN in short pieces ("25 21 04 73 20 30") is never read as fewer APNs. A lone
+    # short number after a word ("LOT 2", "SEC 12") is the legal description.
+    for run in re.finditer(r"\d+(?:[^\w]+\d+)+", block):
+        if any(not _CHELAN_APN_RE.fullmatch(g) for g in re.findall(r"\d+", run.group(0))):
+            return None
     for label in re.finditer(r"\bAPNS?\b", block, re.I):
         after = re.sub(r"[&/+,;:#()]", " ", block[label.end():]).split()
         first = next((t for t in after if not _APN_LIST_WORD.fullmatch(t)), "")

@@ -144,7 +144,9 @@ def _page(*lines: str) -> str:
     (["APN 222014846080", "SEC 12 TWP 23 RGE 20", "12-23-20"], None),
     (["SP 2019-008 LOT 7"], None),                                    # plat numbers: unknown
     (["NORTH ENTIAT LOT 2 BLK 2"], []),                               # no APN, no number: none listed
-    (["APN 222014846080", "AND (252104", "732030)"], None),           # Codex: parenthesised pieces                                       # no APN line: none listed
+    (["APN 222014846080", "AND (252104", "732030)"], None),           # Codex: parenthesised pieces
+    (["APN 222014846080 AND 25 21 04 73 20 30"], None),               # Codex: two-digit pieces
+    (["APN 252104732030", "NORTH ENTIAT LOT 2 BLK 2 SEC 12"], ["252104732030"]),  # lone short numbers                                       # no APN line: none listed
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE'S DEED", "APN NO. #"], None),
     (["APN"], None),                                                    # an empty APN line
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE&#39;S DEED", "ADDITIONAL APN 252104732030"],
@@ -163,7 +165,7 @@ def _page(*lines: str) -> str:
     (["APN 222014846080", "AND", "", "252104732030"], ["222014846080", "252104732030"]),
 ], ids=["real", "2629393", "two-on-a-line", "two-lines", "colon-comma", "hash", "dashed",
         "nine-digit", "spaced-second", "spaced-only", "amp-split", "glued-amp", "nbsp",
-        "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn", "no-numbers", "paren-pieces",
+        "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn", "no-numbers", "paren-pieces", "two-digit-pieces", "lone-short",
         "empty-apn-line", "bare-label", "additional-apn", "spaced-elsewhere",
         "short-numbers", "split-across-break", "inline-tags", "label-apart",
         "bare-line-pieces", "bare-line-apn",

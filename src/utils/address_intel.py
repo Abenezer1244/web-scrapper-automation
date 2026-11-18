@@ -194,7 +194,8 @@ def _sep_kind(sep: str) -> str:
     return sep if sep in (".", "-") else "mixed:" + "".join(sep.split())
 
 
-def _break_is_spacing(raw: list[str], canon: list[str], i: int, kind: str) -> bool:
+def _break_is_spacing(raw: list[str], canon: list[str], seps: list[str], i: int,
+                      kind: str) -> bool:
     """A break between chunk i and i+1 that the other address does not have.
 
     Deliberately narrow (six Codex rounds): only shapes that cannot be read two ways.
@@ -203,9 +204,15 @@ def _break_is_spacing(raw: list[str], canon: list[str], i: int, kind: str) -> bo
     """
     prev = canon[i - 1] if i > 0 else None
     nxt = canon[i + 2] if i + 2 < len(canon) else None
-    if (i > 0 and canon[i].isdigit() and raw[i + 1] in ("TH", "ND")
-            and _ordinal_ok(canon[i], raw[i + 1]) and nxt in _STREET_TYPE_WORDS):
-        return True  # 19|TH AVE. Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
+    if (i > 0 and canon[0].isdigit() and canon[i].isdigit() and len(canon[i]) <= 3
+            and raw[i + 1] in ("TH", "ND") and _ordinal_ok(canon[i], raw[i + 1])
+            and nxt in _STREET_TYPE_WORDS
+            and all(s.isspace() for s in seps[:i])
+            and all(c in _TRAILING_OPTIONAL_TOKENS for c in canon[1:i])):
+        # "5233 19 TH AVE", "14703 NE 35 TH ST": right after the house number (or its
+        # compass words), plain spaces only, so a range like "120-122 ND AVE" never
+        # feeds it (Codex). Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
+        return True
     if (raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and kind == "." and nxt is None
             and prev in _STREET_TYPE_WORDS and i >= 3):
         # "16TH AVE. S.W.": a DOTTED pair, the street's last two chunks, after a type that
@@ -246,9 +253,16 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
                 # "LOT-AB RD" / "LOT.AB RD" is a street name; "LOT AB" is a unit.
                 if canon[k] in _UNIT_WORD_SET:
                     return False
+                # A single letter beside a re-spelled break may be a unit, a house letter
+                # or a lettered street ("123 A-B ST" vs "123 A B ST"). A dotted
+                # compass pair after a type ("AVE. S.W.") has no dash and stays allowed.
+                if len(canon[k]) == 1 or (
+                        len(canon[k + 1]) == 1 and "-" in (kind_a + kind_b)):
+                    return False
             continue
-        raw, canon, (idx, kind) = (ra, ca, ba[pos]) if pos in ba else (rb, cb, bb[pos])
-        if not _break_is_spacing(raw, canon, idx, kind):
+        raw, canon, seps, (idx, kind) = ((ra, ca, sa, ba[pos]) if pos in ba
+                                         else (rb, cb, sb, bb[pos]))
+        if not _break_is_spacing(raw, canon, seps, idx, kind):
             return False
     return True
 

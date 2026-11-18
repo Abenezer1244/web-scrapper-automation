@@ -162,12 +162,12 @@ _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 _ROAD_NUMBER_RE = re.compile(r"\bNO\.?\s*(?=\d)", re.IGNORECASE)
 
 
-_STREET_TYPE_ALT = "|".join(sorted(set(_SUFFIX) | set(_SUFFIX.values()), key=len, reverse=True))
-# A "unit" followed by a street-type word is part of the name ("OLD LOT 5 RD"), so in
-# comparisons it is glued and kept, never stripped with the rest of the street (Codex).
+# In comparisons a unit is stripped only when it ENDS the street. Anything after it
+# ("OLD LOT 5 RD", "OLD LOT 5 ACCESS RD") makes it part of the name, so it is glued and
+# kept rather than stripped with the rest of the street (Codex).
 _NAMED_UNIT_RE = re.compile(
     rf"\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\s*#?\s*([A-Z0-9-]{{1,6}})"
-    rf"(?=\s+(?:{_STREET_TYPE_ALT})\b)",
+    r"(?=\s+[A-Z0-9])",
     re.IGNORECASE,
 )
 

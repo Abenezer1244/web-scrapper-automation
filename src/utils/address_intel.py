@@ -186,29 +186,28 @@ def _chunks(street: str) -> tuple[list[str], list[str], list[str]]:
     return raw, canon, _SEP_RE.findall(s)
 
 
-def _break_is_spacing(raw: list[str], canon: list[str], i: int, dash: bool) -> bool:
-    """A break between chunk i and i+1 that the other address does not have."""
-    left, right = canon[i], canon[i + 1]
+def _sep_kind(sep: str) -> str:
+    return "-" if "-" in sep else ("." if "." in sep else " ")
+
+
+def _break_is_spacing(raw: list[str], canon: list[str], i: int, kind: str) -> bool:
+    """A break between chunk i and i+1 that the other address does not have.
+
+    Deliberately narrow (six Codex rounds): only shapes that cannot be read two ways.
+    Anything else keeps today's answer (absentee), never a merge of two properties.
+    No word|word rule: "RIDGE WOOD" vs "RIDGEWOOD" may be two streets.
+    """
     prev = canon[i - 1] if i > 0 else None
     nxt = canon[i + 2] if i + 2 < len(canon) else None
-    # No word|word rule: "RIDGE WOOD" vs "RIDGEWOOD" may be two streets (Codex). A
-    # hyphen-vs-space pair ("BEL-RED" / "BEL RED") is a break on BOTH sides and is
-    # judged in _same_street_modulo_punctuation instead.
-    if (i > 0 and left.isdigit() and raw[i + 1] in ("ST", "ND", "RD", "TH")
-            and _ordinal_ok(left, raw[i + 1]) and nxt in _STREET_TYPE_WORDS):
-        return True  # 19|TH AVE; never the house number, never "23 ROAD"
-    # RAW single letters only: "N WEST LAKE" is North West Lake, not NW Lake (Codex).
-    if raw[i] in ("N", "S") and raw[i + 1] in ("E", "W"):
-        # Post-directional after a street type (AVE S.W.), or a pre-directional before
-        # a real name (S.E. 272ND). "N E ST" / "123 N E" may be North E Street.
-        return prev in _STREET_TYPE_WORDS or (
-            prev is not None and nxt is not None and nxt not in _STREET_TYPE_WORDS)
-    if i == 0 and left.isdigit() and len(raw[i + 1]) == 1 and right.isalpha():
-        # House letter: "8337 A" / "8337-A" vs "8337A". A compass letter only when the
-        # hyphen proves it ("1508-E"); "1508 E" may be East (Codex). A real street name
-        # must follow: "2651 B ST" may be B Street.
-        return ((right not in _COMPASS or dash)
-                and any(t not in _TRAILING_OPTIONAL_TOKENS for t in canon[i + 2:]))
+    if (i > 0 and canon[i].isdigit() and raw[i + 1] in ("TH", "ND")
+            and _ordinal_ok(canon[i], raw[i + 1]) and nxt in _STREET_TYPE_WORDS):
+        return True  # 19|TH AVE. Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
+    if raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and prev in _STREET_TYPE_WORDS:
+        return True  # AVE S.W.: a post-directional. "123 N E MAIN" may be North E Main.
+    if (i == 0 and canon[i].isdigit() and len(raw[i + 1]) == 1 and raw[i + 1].isalpha()
+            and kind == "-"
+            and any(t not in _TRAILING_OPTIONAL_TOKENS for t in canon[i + 2:])):
+        return True  # 8337-A 12TH AVE: the hyphen proves a house letter
     return False
 
 
@@ -222,28 +221,28 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
         out, pos = {}, 0
         for i, sep in enumerate(seps):
             pos += len(canon[i])
-            out[pos] = (i, "-" in sep)
+            out[pos] = (i, _sep_kind(sep))
         return out
 
     ba, bb = breaks(ca, sa), breaks(cb, sb)
     for pos in set(ba) | set(bb):
         if pos in ba and pos in bb:
-            (ia, dash_a), (ib, dash_b) = ba[pos], bb[pos]
-            if dash_a == dash_b:
+            (ia, kind_a), (ib, kind_b) = ba[pos], bb[pos]
+            if kind_a == kind_b:
                 continue
             for canon, k in ((ca, ia), (cb, ib)):  # both sides, so order never matters
                 # A dash between two house-like numbers is a range ("1508 - 1510A").
                 if _HOUSE_LIKE_RE.fullmatch(canon[k]) and _HOUSE_LIKE_RE.fullmatch(canon[k + 1]):
                     return False
-                # "1508-E" is house 1508E; "1508 E" is 1508 East.
-                if k == 0 and canon[1] in _COMPASS:
+                # "123-A MAIN" is house 123A; "123 A MAIN" may be A Main (any letter).
+                if k == 0 and len(canon[1]) == 1:
                     return False
-                # "LOT-AB RD" is a street name; "LOT AB" is a unit (Codex).
+                # "LOT-AB RD" / "LOT.AB RD" is a street name; "LOT AB" is a unit.
                 if canon[k] in _UNIT_WORD_SET:
                     return False
             continue
-        raw, canon, (idx, dash) = (ra, ca, ba[pos]) if pos in ba else (rb, cb, bb[pos])
-        if not _break_is_spacing(raw, canon, idx, dash):
+        raw, canon, (idx, kind) = (ra, ca, ba[pos]) if pos in ba else (rb, cb, bb[pos])
+        if not _break_is_spacing(raw, canon, idx, kind):
             return False
     return True
 

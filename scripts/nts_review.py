@@ -19,6 +19,8 @@ Commands
             The parcel's current site address is looked up and becomes the property
             address; --address (what the notice printed) is kept beside it. A printed
             address can be years out of date. --keep-notice-address uses the printed one.
+            When the crawl stored no APN (Chelan indexes it some time after recording),
+            the recorder page is read again and the parcel must be one it lists now.
   refresh-address  --doc of an approved notice: give it the parcel's current site
             address, keeping the printed one. Refused once it has gone out as a
             trustee-sale lead (its address is part of that lead's identity).
@@ -52,6 +54,7 @@ from src.workers.nts_crawler import (  # noqa: E402
     REJECT_REASONS,
     ReviewError,
     approve_recorder_document,
+    chelan_live_recording_apns,
     lookup_parcel_situs,
     refresh_notice_address,
     reject_recorder_document,
@@ -133,12 +136,20 @@ def cmd_approve(db, op, args) -> None:
         "principal_owing": _amount(args.amount), "principal_owing_basis": args.amount_basis,
         "trustee": args.trustee, "beneficiary": args.beneficiary,
     }
-    # Before approval takes its lock: a network lookup must not hold it (Codex).
+    # Before approval takes its lock: network reads must not hold it (Codex).
+    live_apns = None
+    d = db.get(Doc, args.doc)
+    if d is not None and (d.county, d.state) == ("chelan", "WA") and (d.fields or {}).get("recording_apns") == []:
+        item = d.transaction_item_id
+        db.rollback()  # end the read before the network fetch
+        live_apns = chelan_live_recording_apns(item)
+        print(f"the crawl stored no APN; the recorder page lists now: {live_apns}")
     situs = lookup_parcel_situs("chelan", "WA", args.parcel) if not args.keep_notice_address else None
     notice = approve_recorder_document(db, args.doc, reviewer=op, values=values,
                                        supersedes=args.supersedes, independent=args.independent,
                                        discontinued_by=args.discontinued_by,
-                                       not_discontinued=args.not_discontinued, situs=situs)
+                                       not_discontinued=args.not_discontinued, situs=situs,
+                                       live_apns=live_apns)
     db.commit()
     print(f"approved: notice {notice}")
     _print_address(args.address, situs)

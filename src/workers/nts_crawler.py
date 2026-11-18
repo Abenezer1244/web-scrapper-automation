@@ -1582,10 +1582,30 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     return " ".join((found or "").split())[:512] or None
 
 
+def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
+    """The APNs the recording's detail page lists NOW, or None when the page cannot be
+    read. Chelan indexes a recording's APN some time after recording it: 2629393 was
+    crawled the day after it was recorded with no APN on its page, and the page has
+    listed APN 252104732030 since. Network: call it OUTSIDE any transaction holding
+    NTS_CANCEL_LOCK_KEY."""
+    from src.scrapers.templates.acclaimweb import parse_detail_apns
+
+    try:
+        html_text = _bounded_fetch(
+            f"{_CHELAN_RECORDER}/details/documentdetails/{transaction_item_id}/1/1/11",
+            _DETAIL_MAX_BYTES, _DETAIL_FETCH_S, {"User-Agent": _PDF_BROWSER_UA},
+        ).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 -- unreadable: nothing is re-read
+        _logger.warning("Chelan detail page %s unreadable for the APN re-read", transaction_item_id)
+        return None
+    return parse_detail_apns(html_text)
+
+
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
                               supersedes: str | None = None, independent: bool = False,
                               discontinued_by: str | None = None, not_discontinued: bool = False,
-                              situs: str | None = None, today=None) -> str:
+                              situs: str | None = None, live_apns: list[str] | None = None,
+                              today=None) -> str:
     """The operator has compared the staged read with the recorded image: write the
     notice they confirmed. Returns the nts_notices id. Caller commits.
 
@@ -1610,6 +1630,11 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     resolved by the caller before this takes the lock. When given it becomes the
     notice's property_address (address_source 'assessor_situs') and the printed address
     is kept as address_on_notice; without it the printed address stands ('notice').
+
+    ``live_apns`` is what the recording's detail page lists now
+    (:func:`chelan_live_recording_apns`, read by the caller before the lock). It is used
+    only when the crawl stored NO APN (an empty list, never an unknown one): the county
+    had not indexed it yet. The parcel must then be one of those, and they are stored.
     """
     import hashlib
     from decimal import Decimal
@@ -1625,6 +1650,8 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         raise ReviewError("--supersedes and --independent contradict each other")
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
     doc = _recorder_doc_for_review(db, doc_id)
+    if live_apns is not None and (doc.county, doc.state) != ("chelan", "WA"):
+        raise ReviewError("a re-read of the recording's APNs is for Chelan recordings only")
     prof = _profile(doc.county, doc.state)
     if doc.doc_code not in prof["nts_codes"]:
         raise ReviewError("this is a discontinuance, not a notice: use resolve-nod")
@@ -1633,7 +1660,11 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     today = today or datetime.now(UTC).date()
 
     parcel = (values.get("parcel") or "").strip()
-    if parcel not in (_recording_facts(doc)["recording_apns"] or []):
+    recording_apns = _recording_facts(doc)["recording_apns"]
+    reread = recording_apns == [] and bool(live_apns)
+    if reread:
+        recording_apns = list(dict.fromkeys(live_apns))
+    if parcel not in (recording_apns or []):
         raise ReviewError("the parcel is not one of this recording's own APNs")
     auction = values.get("auction_date")
     if auction is None:
@@ -1747,8 +1778,12 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     notes = [f"supersedes {supersedes}" if supersedes
              else "independent of other notices on its deed of trust" if independent else None,
              f"discontinued by {ending.instrument_number}" if ending is not None else None,
-             "not discontinued by the loan's discontinuance(s) on file" if not_discontinued else None]
+             "not discontinued by the loan's discontinuance(s) on file" if not_discontinued else None,
+             "APNs re-read from the recorder page at approval" if reread else None]
     doc.decision_note = "; ".join(n for n in notes if n) or None
+    if reread:
+        doc.fields = {**(doc.fields or {}), "recording_apns": recording_apns}
+        doc.recording_apn = recording_apns[0] if len(recording_apns) == 1 else None
     doc.fields = {**_recording_facts(doc), "approved": approved}  # no grantor, no OCR text
     return str(notice_id)
 

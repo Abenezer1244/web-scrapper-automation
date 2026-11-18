@@ -153,6 +153,14 @@ def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, lines
     assert chelan_live_recording_apns("1") == expected
 
 
+def test_a_line_outside_a_span_is_still_checked(monkeypatch):
+    page = _DETAIL.replace(_LEGAL_BLOCK, '<span class="" >APN 222014846080</span><br />'
+                           '<span class="" >LOT 7 AS DESCRIBED IN TRUSTEE&#39;S DEED</span><br />'
+                           'APN 252104732030<br />')
+    monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())
+    assert chelan_live_recording_apns("1") is None  # the parser stops at TRUSTEE: never partial
+
+
 def test_a_page_without_a_doclegal_block_is_unknown_unless_it_lists_nothing(monkeypatch):
     page = _DETAIL.replace("DocLegal:", "Other:")
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())

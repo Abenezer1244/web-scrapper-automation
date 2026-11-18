@@ -1587,8 +1587,8 @@ _CHELAN_APN_RE = re.compile(r"\d{12}")
 
 
 def _doc_legal_lines(html_text: str) -> list[str] | None:
-    """The lines of a recording detail page's DocLegal value (one <span> each), or None
-    when the page has no such block."""
+    """The text lines of a recording detail page's DocLegal value, or None when the page
+    has no such block."""
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html_text, "html.parser")
@@ -1597,7 +1597,11 @@ def _doc_legal_lines(html_text: str) -> list[str] | None:
     value = label.find_next_sibling("div", class_="listDocDetails") if label else None
     if value is None:
         return None
-    return [" ".join(span.get_text().split()) for span in value.find_all("span")]
+    # Every text line in the block, inside a <span> or not (Codex): a line outside a
+    # span would otherwise go unchecked.
+    for hidden in value.find_all(class_="expandDown"):
+        hidden.decompose()
+    return [" ".join(x.split()) for x in value.get_text("\n").split("\n") if x.strip()]
 
 
 def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:

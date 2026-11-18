@@ -78,7 +78,7 @@ def crawl(monkeypatch):
     douglas_recorder rows removed afterwards (the task writes through its own session)."""
     alerts: list[tuple[str, str]] = []
     monkeypatch.setattr(nts_crawler, "_alert_recorder",
-                        lambda what, detail, county="chelan": alerts.append((what, detail)))
+                        lambda what, detail, county="chelan", topic="": alerts.append((what, detail)))
 
     def run(docs):
         async def fake(self, date_from, date_to, descriptions, readable):
@@ -122,8 +122,9 @@ def test_a_discontinuance_in_the_window_cancels_its_notice(crawl):
 def test_a_discontinuance_never_cancels_through_its_deed_of_trust_link():
     from src.scrapers.sources import nts_douglas_recorder as rec
 
-    assert rec.discontinued([{"related": [("3227557", "DT"), ("3286111", None), ("99", "MOAG")]}]) \
-        == frozenset({"3286111"})
+    ended, inferred, unmatched = rec.discontinued(
+        [{"instrument": "3290000", "related": [("3227557", "DT"), ("3286111", None), ("99", "MOAG")]}])
+    assert (ended, inferred, unmatched) == (frozenset({"3286111"}), frozenset(), [])
 
 
 def test_a_blank_related_link_is_unreadable_not_absent():
@@ -137,16 +138,101 @@ def test_a_blank_related_link_is_unreadable_not_absent():
         rec.discontinued([p])
 
 
-@pytest.mark.parametrize("related", ["3227557 [DT]", "3286111 [NTS"])
-def test_a_discontinuance_that_names_no_notice_writes_nothing(crawl, related):
-    # Only a deed-of-trust link, or a label that does not read whole: which sale it ends
-    # is unknown, so no notice may go live this run (Codex).
+def test_a_discontinuance_link_that_does_not_read_whole_writes_nothing(crawl):
     run, alerts = crawl
     ndts = _variant(instrument="3290000", doc_type="NDTS - NOTICE OF DISCONTINUANCE", remarks="",
-                    related=related)
+                    related="3286111 [NTS")
     summary = run([_doc("NTS", _NTS, "638916"), _doc("NDTS", ndts, "640000", instrument="3290000")])
     assert _notices() == {}
     assert summary.get("error") and "nothing written" in alerts[0][0]
+
+
+def test_a_deed_of_trust_only_discontinuance_ends_the_earlier_notice_never_a_later_one():
+    """Live: discontinuance 3279193 (11/2025) links only the deed of trust that the live
+    notice 3286111 (11/2026) also names: a later foreclosure on the same loan."""
+    from datetime import date as d_
+
+    from src.scrapers.sources import nts_douglas_recorder as rec
+
+    def notice(inst, day):
+        return {"instrument": inst, "record_date": day, "related": [("3227557", "DT")], "apns": ["96600001800"]}
+
+    earlier, later = notice("3279000", d_(2025, 11, 1)), notice("3286111", d_(2026, 11, 6))
+    ndts = {"instrument": "3279193", "record_date": d_(2025, 11, 26),
+            "related": [("3227557", "DT"), ("3200000", "MOAG")], "apns": ["96600001800"]}
+    # Inferred (taken down, not cancelled for good); the later foreclosure stays live.
+    assert rec.discontinued([ndts], [earlier, later]) == (frozenset(), frozenset({"3279000"}), [])
+
+
+def test_a_deed_linked_discontinuance_also_ends_an_earlier_notice_on_its_parcel():
+    # Codex: an earlier notice whose [DT] link is missing still shares the parcel.
+    from datetime import date as d_
+
+    from src.scrapers.sources import nts_douglas_recorder as rec
+
+    no_dt = {"instrument": "3279000", "record_date": d_(2025, 11, 1), "related": [], "apns": ["966-000-01800"]}
+    ndts = {"instrument": "3279193", "record_date": d_(2025, 11, 26), "related": [("3227557", "DT")],
+            "apns": ["96600001800"]}
+    assert rec.discontinued([ndts], [no_dt])[1] == frozenset({"3279000"})   # hyphens normalised
+
+
+def test_two_loans_on_one_parcel_are_two_foreclosures():
+    from datetime import date as d_
+
+    from src.scrapers.sources import nts_douglas_recorder as rec
+
+    other_loan = {"instrument": "3279000", "record_date": d_(2025, 11, 1),
+                  "related": [("3111111", "DT")], "apns": ["96600001800"]}
+    ndts = {"instrument": "3279193", "record_date": d_(2025, 11, 26), "related": [("3227557", "DT")],
+            "apns": ["96600001800"]}
+    assert rec.discontinued([ndts], [other_loan]) == (frozenset(), frozenset(), ["3279193"])
+
+
+def test_a_discontinuance_with_neither_notice_nor_deed_link_falls_back_to_the_parcel():
+    from datetime import date as d_
+
+    from src.scrapers.sources import nts_douglas_recorder as rec
+
+    before = {"instrument": "3279000", "record_date": d_(2025, 11, 1), "related": [], "apns": ["96600001800"]}
+    other = {"instrument": "3279001", "record_date": d_(2025, 11, 1), "related": [], "apns": ["11111111111"]}
+    ndts = {"instrument": "3279305", "record_date": d_(2025, 12, 5), "related": [("3200000", "MOAG")],
+            "apns": ["96600001800"]}
+    assert rec.discontinued([ndts], [before, other]) == (frozenset(), frozenset({"3279000"}), [])
+
+
+def test_a_discontinuance_that_matches_nothing_is_reported_not_fatal(crawl):
+    run, alerts = crawl
+    ndts = _variant(instrument="3290000", doc_type="NDTS - NOTICE OF DISCONTINUANCE", remarks="",
+                    related="3100000 [DT]")
+    ndts = ndts.replace("96600001800", "12345678901")       # another parcel, another loan
+    summary = run([_doc("NTS", _NTS, "638916"), _doc("NDTS", ndts, "640000", instrument="3290000")])
+    assert _notices()["REC-3286111"].cancelled_at is None
+    assert summary["unmatched_discontinuances"] == ["3290000"]
+    assert any("matched no notice" in what for what, _ in alerts)
+
+
+def test_an_inferred_end_holds_across_runs_and_lifts_when_it_no_longer_applies(crawl):
+    run, _ = crawl
+    ndts = _variant(instrument="3290000", doc_type="NDTS - NOTICE OF DISCONTINUANCE", remarks="",
+                    related="3227557 [DT]")      # the notice's own deed of trust, no notice link
+    docs = [_doc("NTS", _NTS, "638916"), _doc("NDTS", ndts, "640000", instrument="3290000")]
+    summary = run(docs)
+    assert summary["inferred_ends"] == 1
+    for _ in range(2):                           # a second run keeps it down
+        got = _notices()["REC-3286111"]
+        assert got.is_active is False and got.cancelled_at is None
+        run(docs)
+    run([_doc("NTS", _NTS, "638916")])           # the discontinuance no longer applies
+    today = datetime.now(ZoneInfo("America/Los_Angeles")).date()
+    assert _notices()["REC-3286111"].is_active is (date(2027, 3, 19) >= today)
+
+
+def test_an_inferred_end_clears_a_lead_already_stamped_with_the_notice(crawl):
+    """The stamp-clearing statement runs for a reversible takedown too (shared helper)."""
+    import inspect
+
+    src = inspect.getsource(nts_crawler._cancel_notices)
+    assert src.index("UPDATE results SET auction_date = NULL") > src.index("permanent else")
 
 
 def test_a_detail_page_of_another_recording_writes_nothing(crawl):

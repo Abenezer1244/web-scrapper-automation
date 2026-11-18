@@ -78,22 +78,55 @@ _CANCEL_LINK_TYPES = {"NTS", "ANTS", None}
 _RELATED_RE = re.compile(r"(\d{5,10})(?:\s*\[([A-Z0-9]{1,12})\])?")
 
 
-def discontinued(ndts: list[dict[str, Any]]) -> frozenset[str]:
-    """The notice instruments the parsed discontinuances end.
+def _before(notice: dict[str, Any], ndts: dict[str, Any]) -> bool:
+    """The notice was recorded before the discontinuance (instruments run in order)."""
+    return (notice["record_date"], int(notice["instrument"])) < (ndts["record_date"], int(ndts["instrument"]))
 
-    Raises ValueError for a discontinuance with an unreadable link or none that can name
-    a notice: which sale it ends is then unknown, and no notice may be published while
-    one of them could be the cancelled one (Codex)."""
-    out: set[str] = set()
+
+def _apns(p: dict[str, Any]) -> set[str]:
+    return {a.replace("-", "") for a in p.get("apns") or []}
+
+
+def discontinued(ndts: list[dict[str, Any]], notices: list[dict[str, Any]] = ()
+                 ) -> tuple[frozenset[str], frozenset[str], list[str]]:
+    """(ended, inferred, unmatched) for the parsed discontinuances.
+
+    ``ended``: the notices a discontinuance links to ("[NTS]" or untyped): cancelled for
+    good. Live, some link only the deed of trust ("[DT]") or a modification ("[MOAG]");
+    for those, ``inferred`` holds the ``notices`` sharing its deed of trust OR its parcel
+    and RECORDED BEFORE it, taken down but not cancelled for good (a parcel can carry
+    several loans; Codex). Never a later notice: a deed of trust can be foreclosed on
+    again after a discontinuance (live: 3279193 of 11/2025 and the live notice 3286111 of
+    11/2026 share theirs). ``unmatched``: those whose inference found nothing in the
+    window (legitimate when the notice is older than the window; reported for review).
+
+    Raises ValueError for an unreadable link: what it names is then unknown (Codex)."""
+    ended: set[str] = set()
+    inferred: set[str] = set()
+    unmatched: list[str] = []
     for p in ndts:
         links = p.get("related", [])
         if any(kind == "UNREADABLE" for _, kind in links):
             raise ValueError(f"discontinuance {p.get('instrument')} has an unreadable related link")
-        ends = {inst for inst, kind in links if kind in _CANCEL_LINK_TYPES}
-        if not ends:
-            raise ValueError(f"discontinuance {p.get('instrument')} names no notice")
-        out |= ends
-    return frozenset(out)
+        named = {inst for inst, kind in links if kind in _CANCEL_LINK_TYPES}
+        if named:
+            ended |= named
+            continue
+        dts, apns = {inst for inst, kind in links if kind == "DT"}, _apns(p)
+
+        def _ends(n: dict[str, Any], dts: set[str] = dts, apns: set[str] = apns) -> bool:
+            n_dts = {inst for inst, kind in n.get("related", []) if kind == "DT"}
+            if dts & n_dts:
+                return True
+            # The parcel stands in only when the deeds of trust do not contradict it:
+            # two loans on one parcel are two foreclosures (Codex).
+            return bool(apns & _apns(n)) and not (dts and n_dts)
+
+        found = {n["instrument"] for n in notices if _before(n, p) and _ends(n)}
+        inferred |= found
+        if not found:
+            unmatched.append(p["instrument"])
+    return frozenset(ended), frozenset(inferred - ended), unmatched
 
 
 def ts_key(instrument: str) -> str:

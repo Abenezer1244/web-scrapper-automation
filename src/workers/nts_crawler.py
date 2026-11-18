@@ -1363,8 +1363,9 @@ def crawl_nts_douglas_recorder() -> dict:
                     or p["record_date"].strftime("%m/%d/%Y") != d["record_date"]):
                 raise RuntimeError(f"detail page {d['item_id']} is not the recording the grid listed")
             parsed.append((d["code"], p, f"{_DOUGLAS_RECORDER}/details/documentdetails/{d['item_id']}/1/1/11"))
-        # Raises when a discontinuance does not say which notice it ends.
-        cancelled = rec.discontinued([p for code, p, _ in parsed if code == "NDTS"])
+        # Raises when a discontinuance's link cannot be read.
+        ended, inferred, unmatched = rec.discontinued([p for code, p, _ in parsed if code == "NDTS"],
+                                                      [p for code, p, _ in parsed if code != "NDTS"])
     except Exception as exc:  # noqa: BLE001 -- reported, never a partial write
         _alert_recorder("crawl failed, nothing written", f"{type(exc).__name__}: {str(exc)[:200]}",
                         county="douglas")
@@ -1378,7 +1379,7 @@ def crawl_nts_douglas_recorder() -> dict:
         if code == "NDTS":
             continue
         summary["discovered"] += 1
-        row, why = rec.notice_to_row(p, url, today, cancelled)
+        row, why = rec.notice_to_row(p, url, today, ended | inferred)
         if row is None:
             held[why] = held.get(why, 0) + 1
             held_keys.append(rec.ts_key(p["instrument"]))
@@ -1388,19 +1389,26 @@ def crawl_nts_douglas_recorder() -> dict:
     with system_sync_session() as db:
         for row in rows:
             _upsert_notice(db, NtsNotice, row)
-        if cancelled:
+        if ended:
             # Every stored notice a discontinuance in the window names; never cleared.
-            summary["cancelled"] = _cancel_notices(db, rec.SOURCE, [rec.ts_key(i) for i in sorted(cancelled)])
-        if held_keys:
-            # A notice published before that no longer reads cleanly (its remarks were
-            # edited) is taken down, not left live; it returns if it parses again.
-            summary["withdrawn"] = _cancel_notices(db, rec.SOURCE, held_keys, permanent=False)
+            summary["cancelled"] = _cancel_notices(db, rec.SOURCE, [rec.ts_key(i) for i in sorted(ended)])
+        down = sorted({rec.ts_key(i) for i in inferred} | set(held_keys))
+        if down:
+            # Taken down, not cancelled for good: a notice a discontinuance only implies
+            # (same deed of trust or parcel), or one published before that no longer
+            # reads cleanly. Each returns if a later run reads it as live again.
+            summary["withdrawn"] = _cancel_notices(db, rec.SOURCE, down, permanent=False)
         db.commit()
         _record_crawl_heartbeat(db, rec.COUNTY)  # the whole window was read
     summary["upserted"], summary["held"] = len(rows), held
+    summary["inferred_ends"], summary["unmatched_discontinuances"] = len(inferred), unmatched
     if held:
         _alert_recorder("notices held for a person", ", ".join(f"{n} {k}" for k, n in sorted(held.items())),
-                        county="douglas")
+                        county="douglas", topic="held")
+    if unmatched:
+        # Legitimate when the notice it ends predates the window; a person checks.
+        _alert_recorder("discontinuances matched no notice in the window",
+                        "instruments " + ", ".join(unmatched), county="douglas", topic="unmatched")
     _logger.info("Douglas recorder NTS crawl: %s", summary)
     return summary
 
@@ -2489,14 +2497,18 @@ def _bounded_fetch(url: str, max_bytes: int, wall_s: float, headers: dict) -> by
             pass
 
 
-def _alert_recorder(what: str, detail: str, county: str = "chelan") -> None:
+def _alert_recorder(what: str, detail: str, county: str = "chelan", topic: str = "") -> None:
+    """``topic`` gives a recurring, informational alert its own cooldown bucket, so it can
+    never hold back a run-failure alert for the same county."""
     from src.workers.ops_alerts import send_ops_alert
 
     name = county.title()
     send_ops_alert(
-        kind="nts_recorder", key=f"nts_recorder:{county}",
+        kind="nts_recorder", key=f"nts_recorder:{county}" + (f":{topic}" if topic else ""),
         subject=f"{name} NTS recorder crawl: {what}",
         body=(f"The {name} County NTS recorder crawl: {what} ({detail}).\n\n"
-              "Staged notices await operator review; nothing reaches customers from here. "
-              "Check the crawler logs and nts_recorder_documents."),
+              + ("Douglas notices are written to nts_notices automatically from the recorder's typed "
+                 "remarks; check the crawler logs." if county == "douglas" else
+                 "Staged notices await operator review; nothing reaches customers from here. "
+                 "Check the crawler logs and nts_recorder_documents.")),
     )

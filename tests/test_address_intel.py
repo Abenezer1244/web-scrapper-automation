@@ -3,7 +3,7 @@
 Real parsing, no mocks. Pins the absentee/out-of-state semantics Codex specified:
 component compare, unit-only difference is NOT absentee, NULL when unknown.
 """
-from src.utils.address_intel import _normalize_street, compose_situs, compute_owner_flags
+from src.utils.address_intel import _compare_street, _normalize_street, compose_situs, compute_owner_flags
 
 
 class TestNormalizeStreet:
@@ -335,3 +335,41 @@ class TestSamePlaceWrittenDifferently:
         f = compute_owner_flags("22222 24TH AVE S C-22, DES MOINES, WA 98198",
                                 "22222 24TH AVE S #C-22, DES MOINES, WA 98198")
         assert f["absentee_owner"] is False
+
+
+class TestPunctuationAndSpacing:
+    """King leads 2026-11-17: same letters and digits, different punctuation/spacing."""
+
+    def test_real_shapes_are_the_same_place(self):
+        for prop, mail in (
+            ("5639 16TH AVE SW, SEATTLE WA 98106", "5639 16TH AVE. S.W., SEATTLE, WA 98106"),
+            ("5233 19TH AVE SW, SEATTLE WA 98106", "5233 19 TH AVE SW, SEATTLE, WA 98106"),
+            ("17050 Northup Way - Unit 35, Bellevue WA 98008", "17050 NORTHUP WAY UNIT 35, BELLEVUE, WA 98008"),
+            ("13570 BEL RED RD, BELLEVUE, WA 98005", "13570 BEL-RED RD, BELLEVUE, WA 98005"),
+            ("1508E SW WEBSTER ST, SEATTLE, WA 98106", "1508-E SW WEBSTER ST, SEATTLE, WA 98106"),
+            ("1301 SUNSET AVE SW, SEATTLE WA 98116", "1301 SUNSET AVE S W, SEATTLE, WA 98116"),
+            ("6410 CARNATION DUVALL RD NE, CARNATION, WA 98014", "6410 CARNATION-DUVALL RD NE, CARNATION, WA 98014"),
+        ):
+            assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
+
+    def test_house_number_ordinal_is_not_joined(self):
+        # "19 TH" only joins after the house number; a house "19" on "TH ST" is untouched.
+        assert _compare_street("19 TH ST") == "19 TH ST"
+
+    def test_hyphenated_unit_keeps_its_hyphen(self):
+        f = compute_owner_flags("22222 24TH AVE S C-22, DES MOINES, WA 98198",
+                                "22222 24TH AVE S #C-22, DES MOINES, WA 98198")
+        assert f["absentee_owner"] is False
+
+    def test_house_letter_hyphen_is_not_a_directional(self):
+        # "1508-E" is house 1508E; "1508 E" (East) must not merge with it.
+        f = compute_owner_flags("1508-E SW WEBSTER ST, SEATTLE, WA 98106", "1508 E SW WEBSTER ST, SEATTLE, WA 98106")
+        assert f["absentee_owner"] is True
+
+    def test_typo_is_still_different(self):
+        f = compute_owner_flags("504 29TH AVE S, SEATTLE WA 98144", "504 29THAVE S, SEATTLE, WA 98144")
+        assert f["absentee_owner"] is True
+
+    def test_different_ordinals_stay_different(self):
+        f = compute_owner_flags("5233 19TH AVE SW, SEATTLE WA 98106", "5233 18 TH AVE SW, SEATTLE, WA 98106")
+        assert f["absentee_owner"] is True

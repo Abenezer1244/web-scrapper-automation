@@ -151,8 +151,27 @@ _MARKED_UNIT_RE = re.compile(
 )
 
 
+# Punctuation/spacing variants of one street, measured on King leads 2026-11-17 (210
+# rows flagged absentee with identical letters and digits on both sides):
+# "1508-E SW WEBSTER" / "1508E", "BEL-RED RD" / "BEL RED RD", "AVE. S.W." / "AVE SW",
+# "19 TH AVE" / "19TH AVE", "WAY - UNIT 35" / "WAY UNIT 35".
+_HOUSE_HYPHEN_LETTER_RE = re.compile(r"^\s*(\d+)-([A-Z])\b", re.IGNORECASE)
+# Only a hyphen joining two words ("BEL-RED") or standing alone (" - UNIT"); a unit
+# id like "C-22" keeps its hyphen for _same_street_modulo_unit_spelling.
+_HYPHEN_RE = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])|\s+-\s+")
+# After _normalize_street: a compass pair split by a dot or space ("S W" -> "SW").
+_SPLIT_DIRECTIONAL_RE = re.compile(r"(?<!\S)([NS]) ([EW])(?!\S)")
+# An ordinal split from its number, never the house number ("19 TH" -> "19TH").
+_SPLIT_ORDINAL_RE = re.compile(r"(?<=\S )(\d+) (TH|ND|RD)(?!\S)")
+
+
 def _compare_street(street: str | None) -> str:
-    return _normalize_street(_DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _DESIGNATOR_HASH_RE.sub(r"\1 ", street or "")
+    s = _HOUSE_HYPHEN_LETTER_RE.sub(r"\1\2", s)
+    s = _HYPHEN_RE.sub(" ", s)
+    s = _normalize_street(s)
+    s = _SPLIT_DIRECTIONAL_RE.sub(r"\1\2", s)
+    return _SPLIT_ORDINAL_RE.sub(r"\1\2", s)
 
 
 def _marked_unit(street: str | None) -> str | None:

@@ -1583,7 +1583,7 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
 
 
 _MORE_PARCELS_RE = re.compile(
-    r"\b(?:ADDITIONAL|SEE|ATTACHED|EXHIBIT|CONT(?:INUED)?|PAGE|PG|ETC|OTHERS?|MORE|REMAINING)\b", re.I
+    r"\b(?:ADDITIONAL|SEE|ATTACHED|EXHIBIT|SCHEDULE|CONT(?:INUED)?|PAGE|PG|ETC|OTHERS?|MORE|REMAINING)\b", re.I
 )
 _APN_LIST_WORD = re.compile(r"(?:NO|NOS|AND|APNS?)\.?", re.I)
 _CHELAN_APN_RE = re.compile(r"\d{12}")

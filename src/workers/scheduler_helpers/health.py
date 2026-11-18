@@ -469,8 +469,9 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     through every other pair. A connector switched on used to wait for the rotation,
     a day or more (Benton tax_delinquent, 2026-11-14).
 
-    A 'down' connector is hidden too, so it shares those priority slots: the longest
-    unchecked first, one type each, the type paged down if its marker says so. One
+    A 'down' connector is hidden too, so it shares those priority slots: a random sample
+    of those not probed for CANARY_RECOVERY_INTERVAL, one type each, the type paged down
+    if its marker says so. One
     transient failure used to hide a working source until the rotation came back to it,
     30+ hours (Clallam tax_delinquent, 2026-11-16). Each group keeps a slot while the
     other has a backlog. A recovering connector sits out the rest of its tick and is
@@ -480,13 +481,14 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
     waiting = {c.id for c in pending}
     due = datetime.now(UTC) - CANARY_RECOVERY_INTERVAL
-    down = sorted((c for c in connectors if c.record_types and c.id not in waiting
-                   and c.health_status == "down" and c.last_checked <= due),
-                  key=lambda c: c.last_checked)
+    down = [c for c in connectors if c.record_types and c.id not in waiting
+            and c.health_status == "down" and c.last_checked <= due]
     slots = max(k - CANARY_ROUTINE_SLOTS, 0)
     n_first = min(len(pending), slots - min(len(down), 1) if slots > 1 else slots)
     first = [(c, random.choice(c.record_types)) for c in random.sample(pending, n_first)]
-    recovering = down[:slots - n_first]
+    # A random sample, as for pending: a probe that times out every tick never records a
+    # verdict, so an oldest-first order would put it first again and stop each run (Codex P2).
+    recovering = random.sample(down, min(len(down), slots - n_first))
     marked = _down_marked_types(recovering)
     first += [(c, random.choice(marked.get(c.id) or c.record_types)) for c in recovering]
     # Pending connectors stay out of the rotation, so a stuck backlog gets only the

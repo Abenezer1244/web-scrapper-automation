@@ -404,7 +404,6 @@ class TestPunctuationAndSpacing:
 
     def test_more_real_shapes(self):
         for prop, mail in (
-            ("1817 29TH AVE W, SEATTLE WA 98199", "1817 - 29TH AVENUE WEST, SEATTLE, WA 98199"),
             ("4606 247TH PL SE, SAMMAMISH, WA 98029", "4606 247 th Place SE, SAMMAMISH, WA 98029"),
         ):
             assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
@@ -469,6 +468,8 @@ class TestPunctuationAndSpacing:
             ("123 AVENUE N E, SEATTLE, WA 98101", "123 AVENUE NE, SEATTLE, WA 98101"),
             ("120-122 ND AVE, SEATTLE, WA 98101", "120-122ND AVE, SEATTLE, WA 98101"),
             ("123 A-B ST, SEATTLE, WA 98101", "123 A B ST, SEATTLE, WA 98101"),
+            ("123-AB MAIN ST, SEATTLE, WA 98101", "123 AB MAIN ST, SEATTLE, WA 98101"),
+            ("1817 29TH AVE W, SEATTLE, WA 98199", "1817 - 29TH AVENUE WEST, SEATTLE, WA 98199"),
             ("123 MAIN AVE N E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
             ("123 MAIN AVE N. E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
             ("123 - N MAIN ST, SEATTLE, WA 98101", "123N MAIN ST, SEATTLE, WA 98101"),

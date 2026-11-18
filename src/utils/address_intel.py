@@ -247,8 +247,9 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
                 # A dash between two house-like numbers is a range ("1508 - 1510A").
                 if _HOUSE_LIKE_RE.fullmatch(canon[k]) and _HOUSE_LIKE_RE.fullmatch(canon[k + 1]):
                     return False
-                # "123-A MAIN" is house 123A; "123 A MAIN" may be A Main (any letter).
-                if k == 0 and len(canon[1]) == 1:
+                # Never re-spell the break after the house number: "123-A MAIN" /
+                # "123-AB MAIN" may be the house id, "123 AB MAIN" AB Main St (Codex).
+                if k == 0:
                     return False
                 # "LOT-AB RD" / "LOT.AB RD" is a street name; "LOT AB" is a unit.
                 if canon[k] in _UNIT_WORD_SET:

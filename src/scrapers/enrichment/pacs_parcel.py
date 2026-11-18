@@ -320,8 +320,9 @@ def parse_accounts(html: str, parcel_key: str) -> list[str] | None:
 
 # A parcel costs one search plus one page per account. Capping the accounts bounds how
 # far one parcel can run past a pass's budget (the reserve assumes two requests); a
-# parcel listed under more than this stays ambiguous.
-_MAX_ACCOUNTS = 4
+# parcel listed under more than this stays ambiguous. Columbia has a parcel under 5
+# accounts (2010380021261, live 2026-11-17).
+_MAX_ACCOUNTS = 8
 
 
 def parse_detail(html: str, parcel_key: str) -> MailingAnswer:
@@ -391,7 +392,7 @@ def query_digits(value: object) -> str:
 def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
                  query: str | None = None, mode: dict | None = None, land_id: str | None = None,
                  parse=None, make=MailingAnswer, year: str | None = None,
-                 combine=None) -> tuple:
+                 combine=None, deadline: float | None = None) -> tuple:
     """Search POST, then detail GET, for one parcel. (answer, block_reason).
     `mode` is the form's search-mode field (pacs.search_type_field); `land_id` is
     PacsSite.land_id for this parcel's callers, or None. `parse(html, key)` reads the
@@ -416,6 +417,10 @@ def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_h
         # a partial set of accounts is never combined.
         answers = []
         for account in accounts:
+            # The pass's budget holds between accounts too: a parcel cut short is
+            # deferred whole, so the batch's answers commit before the time limit (Codex).
+            if deadline is not None and time.monotonic() > deadline:
+                return make(SOURCE_UNAVAILABLE), None
             time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
             if not still_held():
                 return make(SOURCE_UNAVAILABLE), None
@@ -552,7 +557,8 @@ def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, m
                 break
             answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
                                            query=queries[key], mode=mode, land_id=land_ids[key],
-                                           parse=parse, make=make, year=year, combine=combine)
+                                           parse=parse, make=make, year=year, combine=combine,
+                                           deadline=deadline)
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

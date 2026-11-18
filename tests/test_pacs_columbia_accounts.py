@@ -182,3 +182,66 @@ def test_accounts_that_disagree_on_who_or_where_hold_the_lead():
 ])
 def test_an_unknown_account_is_never_a_zero(answers):
     assert pacs_tax.combine_accounts(answers).outcome != "found"
+
+
+# ─── The county's "no statement" row (live 2026-11-17) ──────────────────────
+_NO_STMT = _read("columbia_pacs_detail_no_statement_2009380172100.html")
+
+
+def test_an_account_with_no_tax_billed_is_an_answer_not_unknown():
+    answer = pacs_tax.parse_tax(_NO_STMT, "2009380172100")
+    assert answer.outcome == "found" and answer.statements == []
+    assert answer.delinquent_amount == Decimal("0")
+
+
+def test_a_look_alike_row_with_money_on_it_stays_unparsed():
+    # The marker is blank year AND blank id AND every amount $0.00; anything else is drift.
+    owing = _NO_STMT.replace('<td class="statementTotalAmt">$0.00</td>',
+                             '<td class="statementTotalAmt">$12.00</td>', 1)
+    assert owing != _NO_STMT
+    assert pacs_tax.parse_tax(owing, "2009380172100").outcome == "unparsed"
+
+
+def test_a_no_statement_account_combines_with_a_billed_one():
+    empty = pacs_tax.parse_tax(_NO_STMT, "2009380172100")
+    billed = _answer({2024: "40.00"}, owner=empty.owner_name, situs=empty.property_address,
+                     mail=empty.mailing_address, as_of=empty.as_of)  # same day, same parcel
+    combined = pacs_tax.combine_accounts([billed, empty])
+    assert combined.outcome == "found" and combined.delinquent_amount == Decimal("40.00")
+
+
+def test_five_accounts_are_read_eight_is_the_bound():
+    assert pp._MAX_ACCOUNTS >= 5
+
+
+def test_a_statement_row_whose_class_drifted_is_never_hidden_by_a_zero_marker():
+    # Zero marker + an owing statement row under an unexpected class: unknown, not "paid".
+    drifted = _NO_STMT.replace(
+        '</tr><tr class="rowEnd" id="DetailTable0_totalsRow">',
+        '</tr><tr class="rowEndX"><td>2024</td><td>1</td><td>$5.00</td><td>$5.00</td>'
+        '<td>$0.00</td><td>$0.00</td><td>$0.00</td><td>$10.00</td></tr>'
+        '<tr class="rowEnd" id="DetailTable0_totalsRow">', 1)
+    assert drifted != _NO_STMT
+    assert pacs_tax.parse_tax(drifted, "2009380172100").outcome == "unparsed"
+
+
+def test_the_pass_deadline_holds_between_accounts(monkeypatch):
+    import time as _time
+
+    log = _serve(monkeypatch)
+    answer, _ = pp._resolve_one(None, _SITE, {}, _TWO, lambda: True, combine=pacs_tax.combine_accounts,
+                                parse=pacs_tax.parse_tax, make=pacs_tax.TaxAnswer,
+                                deadline=_time.monotonic() - 1)
+    assert answer.outcome == pp.SOURCE_UNAVAILABLE and log == []  # no account page fetched
+
+
+@pytest.mark.parametrize("cells", [7, 9, 1])
+def test_a_zero_marker_never_hides_a_row_of_any_other_shape(cells):
+    # Codex round 2: any unexpected row (here an owing one with 7, 9 or 1 cells, under
+    # an unknown class) makes the page unknown, never "nothing owed".
+    tds = "<td>2024</td>" + "".join("<td>$5.00</td>" for _ in range(cells - 1))
+    drifted = _NO_STMT.replace(
+        '</tr><tr class="rowEnd" id="DetailTable0_totalsRow">',
+        f'</tr><tr class="rowEndX">{tds}</tr><tr class="rowEnd" id="DetailTable0_totalsRow">', 1)
+    assert drifted != _NO_STMT
+    assert pacs_tax.parse_tax(drifted, "2009380172100").outcome == "unparsed"

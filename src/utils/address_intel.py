@@ -214,7 +214,7 @@ def _break_is_spacing(raw: list[str], canon: list[str], seps: list[str], i: int,
     """
     prev = canon[i - 1] if i > 0 else None
     nxt = canon[i + 2] if i + 2 < len(canon) else None
-    if (canon[i].isdigit() and len(canon[i]) <= 3
+    if (kind == " " and canon[i].isdigit() and len(canon[i]) <= 3
             and raw[i + 1] in ("TH", "ND") and _ordinal_ok(canon[i], raw[i + 1])
             and nxt in _STREET_TYPE_WORDS
             and all(s.isspace() for s in seps[:i])

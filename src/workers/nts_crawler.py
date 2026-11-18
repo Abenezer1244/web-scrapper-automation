@@ -1632,10 +1632,10 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
         if not head:
             continue
         rest = re.sub(r"(?<=\d)-(?=\d)", "", head.group(1))
-        for token in re.sub(r"[&/+,;:#]|\b(?:NO|NOS|AND|APNS?)\b\.?", " ", rest, flags=re.I).split():
-            if not _CHELAN_APN_RE.fullmatch(token):
-                return None
-            found.append(token)
+        tokens = re.sub(r"[&/+,;:#]|\b(?:NO|NOS|AND|APNS?)\b\.?", " ", rest, flags=re.I).split()
+        if not tokens or any(not _CHELAN_APN_RE.fullmatch(t) for t in tokens):
+            return None  # an APN line with no APN, or with anything else, is unread
+        found.extend(tokens)
     return apns if list(dict.fromkeys(found)) == apns else None
 
 

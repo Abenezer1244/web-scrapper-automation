@@ -464,12 +464,14 @@ Cause (read-only prod): Clallam tax canary 2026-11-16 20:18 UTC, PID 17038 porta
 table 3x within ~1 s (300 ms retry gap) -> connector 'down' (hidden from customers). Page reads fine
 now. 'down' gets no canary priority (only never-checked/'unknown' do), 5 random units/hour of ~68,
 so it sat 30+ h. Owner-approved one-off probe 2026-11-18 -> healthy (6 leads), RECOVERED sent.
-Codex consult: GO with safeguards below.
-- [ ] 1. `_canary_units`: down connectors share the priority slots (routine slots unchanged); pending
-      keeps >=1 slot when waiting and down keeps >=1 when any exist, either borrows unused; down picked
-      oldest last_checked first, one unit each, preferring the type whose Redis down marker is set
-      (one MGET, advisory: unreadable -> random type, time limit re-raised); siblings stay in rotation.
-- [ ] 2. Clallam `_portal_status`: wait 2 s then 5 s between retryable failures (was 300 ms).
-- [ ] Tests, Codex review.
-Not in scope (Codex High, pre-existing): one health flag per connector, so a sibling type probing
-healthy relists a connector whose other type is still broken. Needs per-type verdicts; owner call.
+- [x] 1. `_canary_units`: down connectors share the priority slots (pending keeps >=1 while any
+      down exist), random sample, the Redis-marked type (one MGET, 2 s bounded, advisory);
+      recovery probes run LAST in the tick; siblings stay in rotation. `_canary_check_impl`: a type
+      that failed this tick keeps its connector down, and a connector down at tick start stays
+      down until its last unit this tick has run.
+- [x] 2. Clallam `_portal_status`: waits 2 s then 5 s between retryable failures, never under POLITE_DELAY_MS.
+- [x] Tests (positive-controlled), ruff; Codex 8 review rounds, no Critical/High; every P2/P3 fixed
+      except the one below.
+Owner (2026-11-18): ship as is. Known limit (Codex P2, pre-existing): one health flag per connector,
+so recovering one marked type can relist a connector whose other marked type is still broken
+(that type still pages on its own). Per-type health would need a migration + listing change.

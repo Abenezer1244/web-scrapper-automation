@@ -355,7 +355,6 @@ class TestPunctuationAndSpacing:
             ("5233 19TH AVE SW, SEATTLE WA 98106", "5233 19 TH AVE SW, SEATTLE, WA 98106"),
             ("17050 Northup Way - Unit 35, Bellevue WA 98008", "17050 NORTHUP WAY UNIT 35, BELLEVUE, WA 98008"),
             ("13570 BEL RED RD, BELLEVUE, WA 98005", "13570 BEL-RED RD, BELLEVUE, WA 98005"),
-            ("1508E SW WEBSTER ST, SEATTLE, WA 98106", "1508-E SW WEBSTER ST, SEATTLE, WA 98106"),
             ("6410 CARNATION DUVALL RD NE, CARNATION, WA 98014", "6410 CARNATION-DUVALL RD NE, CARNATION, WA 98014"),
         ):
             assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
@@ -469,6 +468,8 @@ class TestPunctuationAndSpacing:
             ("123 MAIN AVE N E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
             ("123 MAIN AVE N. E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
             ("123 - N MAIN ST, SEATTLE, WA 98101", "123N MAIN ST, SEATTLE, WA 98101"),
+            ("123-N MAIN ST, SEATTLE, WA 98101", "123N MAIN ST, SEATTLE, WA 98101"),
+            ("1508-E SW WEBSTER ST, SEATTLE, WA 98106", "1508E SW WEBSTER ST, SEATTLE, WA 98106"),
         ):
             assert compute_owner_flags(a, b)["absentee_owner"] is True, a
             assert compute_owner_flags(b, a)["absentee_owner"] is True, a

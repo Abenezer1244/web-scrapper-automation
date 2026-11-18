@@ -213,9 +213,11 @@ def _break_is_spacing(raw: list[str], canon: list[str], i: int, kind: str) -> bo
         # at Main Ave N (Codex), so "EARL AV N W" keeps today's answer.
         return True
     if (i == 0 and canon[i].isdigit() and len(raw[i + 1]) == 1 and raw[i + 1].isalpha()
-            and kind == "-"
+            and raw[i + 1] not in _COMPASS and kind == "-"
             and any(t not in _TRAILING_OPTIONAL_TOKENS for t in canon[i + 2:])):
-        return True  # 8337-A 12TH AVE: the hyphen proves a house letter
+        # 8337-A 12TH AVE: the hyphen proves a house letter. Never N/S/E/W: "123-N MAIN"
+        # may be North Main (Codex), so "1508-E" keeps today's answer.
+        return True
     return False
 
 

@@ -303,12 +303,12 @@ class TestSamePlaceWrittenDifferently:
 
     def test_spaced_house_letter_is_not_matched(self):
         # "123 B MAIN ST" may be B Main Street (Codex), so a spaced letter keeps today's
-        # answer; the hyphenated "2651-B" form is matched instead.
+        # answer, and so does the hyphenated "2651-B".
         for a, b in (("2651B NW 57TH ST", "2651 B NW 57TH ST"), ("123B MAIN ST", "123 B MAIN ST")):
             assert compute_owner_flags(f"{a}, SEATTLE, WA 98107", f"{b}, SEATTLE, WA 98107")["absentee_owner"] is True
             assert compute_owner_flags(f"{b}, SEATTLE, WA 98107", f"{a}, SEATTLE, WA 98107")["absentee_owner"] is True
         f = compute_owner_flags("2651B NW 57TH ST, SEATTLE, WA 98107", "2651-B NW 57TH ST, SEATTLE, WA 98107")
-        assert f["absentee_owner"] is False
+        assert f["absentee_owner"] is True
 
     # Collisions Codex flagged: these must stay different places.
     def test_lettered_street_is_not_a_unit(self):
@@ -430,9 +430,11 @@ class TestPunctuationAndSpacing:
         f = compute_owner_flags("1508 - 1510A MAIN ST, SEATTLE, WA 98101", "1508 1510A MAIN ST, SEATTLE, WA 98101")
         assert f["absentee_owner"] is True
 
-    def test_spaced_house_letter_matches(self):
-        f = compute_owner_flags("8337A 12TH AVE NW, SEATTLE, WA 98117", "8337-A 12TH AVE NW, SEATTLE, WA 98117")
-        assert f["absentee_owner"] is False
+    def test_house_letter_spellings_keep_todays_answer(self):
+        # No house-letter rule at all (Codex): "123-A-LINE RD" may be A-Line Road.
+        for x, y in (("8337A 12TH AVE NW", "8337-A 12TH AVE NW"), ("123-A-LINE RD", "123A LINE RD")):
+            assert compute_owner_flags(f"{x}, SEATTLE, WA 98117", f"{y}, SEATTLE, WA 98117")["absentee_owner"] is True, x
+            assert compute_owner_flags(f"{y}, SEATTLE, WA 98117", f"{x}, SEATTLE, WA 98117")["absentee_owner"] is True, x
 
     def test_unit_after_spaced_dash(self):
         f = compute_owner_flags("14703 NE 35th St - Unit D-33, Bellevue WA 98007", "14703 NE 35TH ST, BELLEVUE, WA 98007")

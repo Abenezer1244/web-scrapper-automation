@@ -187,7 +187,11 @@ def _chunks(street: str) -> tuple[list[str], list[str], list[str]]:
 
 
 def _sep_kind(sep: str) -> str:
-    return "-" if "-" in sep else ("." if "." in sep else " ")
+    """Exact separator only: '.' and '-' are proof only when they stand alone ("S.W.",
+    "8337-A"); "N. E" or "123 - N" are mixed and prove nothing (Codex)."""
+    if sep.isspace():
+        return " "
+    return sep if sep in (".", "-") else "mixed:" + "".join(sep.split())
 
 
 def _break_is_spacing(raw: list[str], canon: list[str], i: int, kind: str) -> bool:

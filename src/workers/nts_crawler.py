@@ -1654,7 +1654,8 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
             if _APN_LIST_WORD.fullmatch(token):
                 continue
             if token == "LINEBREAK":
-                nxt = next((t for t in after[i + 1:] if not _APN_LIST_WORD.fullmatch(t)), "")
+                nxt = next((t for t in after[i + 1:]
+                            if t != "LINEBREAK" and not _APN_LIST_WORD.fullmatch(t)), "")
                 if nxt[:1].isdigit():
                     continue  # the next line carries on this APN list ("AND 252104...") (Codex)
                 break

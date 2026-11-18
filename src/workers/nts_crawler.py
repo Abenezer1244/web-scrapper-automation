@@ -1601,7 +1601,11 @@ def _doc_legal_lines(html_text: str) -> list[str] | None:
     # span would otherwise go unchecked.
     for hidden in value.find_all(class_="expandDown"):
         hidden.decompose()
-    return [" ".join(x.split()) for x in value.get_text("\n").split("\n") if x.strip()]
+    # Lines are the page's own <br> breaks, not text nodes: a number split across
+    # inline tags reads as the one number it renders as (Codex).
+    for br in value.find_all("br"):
+        br.replace_with("\n")
+    return [" ".join(x.split()) for x in value.get_text("").split("\n") if x.strip()]
 
 
 def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
@@ -1633,23 +1637,38 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     # joined only by spaces or punctuation, 9+ digits in all) must be whole 12-digit
     # APNs. Shorter numbers are lots, blocks, plats and section-township-range. The
     # APNs found must be exactly the parser's; otherwise unknown, never a shorter list.
-    found: list[str] = []
+    # One string for the whole block: a line ending in "-" continues on the next line
+    # (a number split by a break); every other line break is a word, so a lot or plat
+    # number on its own line never runs into an APN.
+    block = ""
     for line in lines:
-        line = re.sub(r"(?<=\d)-(?=\d)", "", line)
-        head = re.match(r"\s*APNS?\b(.*)", line, re.I | re.S)
-        if head:
-            tokens = re.sub(r"[&/+,;:#]|\b(?:NO|NOS|AND|APNS?)\b\.?", " ", head.group(1), flags=re.I).split()
-            if not tokens or any(not _CHELAN_APN_RE.fullmatch(t) for t in tokens):
-                return None  # an APN line with no APN, or with anything else, is unread
-            found.extend(tokens)
-            continue
-        for run in re.finditer(r"\d+(?:[^\w]+\d+)*", line):
-            groups = re.findall(r"\d+", run.group(0))
-            if sum(len(g) for g in groups) < 9:
+        block += line if block.endswith("-") else (" LINEBREAK " if block else "") + line
+    block = re.sub(r"(?<=\d)-\s*(?=\d)", "", block)
+    found: list[str] = []
+    # Every APN label, wherever it sits, must be followed by whole 12-digit APNs.
+    for label in re.finditer(r"\bAPNS?\b", block, re.I):
+        after = re.sub(r"[&/+,;:#]", " ", block[label.end():]).split()
+        listed = []
+        for token in after:
+            if re.fullmatch(r"(?:NO|NOS|AND|APNS?)\.?", token, re.I):
                 continue
-            if any(not _CHELAN_APN_RE.fullmatch(g) for g in groups):
+            if not token.isdigit():
+                break
+            if not _CHELAN_APN_RE.fullmatch(token):
                 return None
-            found.extend(groups)
+            listed.append(token)
+        if not listed:
+            return None  # a label with no readable APN after it
+        found.extend(listed)
+    # Any number of APN size anywhere (digit groups joined only by spaces or
+    # punctuation, 9+ digits in all) must be whole 12-digit APNs.
+    for run in re.finditer(r"\d+(?:[^\w]+\d+)*", block):
+        groups = re.findall(r"\d+", run.group(0))
+        if sum(len(g) for g in groups) < 9:
+            continue
+        if any(not _CHELAN_APN_RE.fullmatch(g) for g in groups):
+            return None
+        found.extend(groups)
     return apns if list(dict.fromkeys(found)) == apns else None
 
 

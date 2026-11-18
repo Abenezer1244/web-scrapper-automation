@@ -135,7 +135,7 @@ def _page(*lines: str) -> str:
     (["APN 222014846080 &amp;252104 732030", "LOT 7"], None),          # glued separator
     (["APN 2521&nbsp;0473&nbsp;2030"], None),
     (["APN 222014846080", "APN NO. 252104 732030", "LOT 7"], None),    # label word, split APN
-    (["APN 222014846080 PTN"], None),                                  # anything else on an APN line
+    (["APN 222014846080 PTN"], ["222014846080"]),                      # "portion of": a word after the APN
     # The shared parser stops at "TRUSTEE" and sees one APN; the block shows two. They
     # disagree, so the answer is unknown rather than the partial list (Codex).
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE'S DEED", "APN 252104732030"], None),
@@ -147,11 +147,15 @@ def _page(*lines: str) -> str:
      None),                                                             # an APN on any line counts
     (["APN 222014846080", "REC 2521 0473 2030"], None),                # spaced APN-size number
     (["APN 222014846080", "SP 2019-008 LOT 7 SEC 12 TWP 23 RGE 20 12-23-20"], ["222014846080"]),
+    (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE&#39;S DEED", "ADDITIONAL APN 2521-",
+      "0473-2030"], None),                                              # APN split across a break
+    (["APN 222014846080", "LOT 7 <span>2521</span><span>04732030</span>"], None),  # inline tags
+    (["APN", "222014846080"], None),                                    # label and number apart
 ], ids=["real", "2629393", "two-on-a-line", "two-lines", "colon-comma", "hash", "dashed",
         "nine-digit", "spaced-second", "spaced-only", "amp-split", "glued-amp", "nbsp",
         "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn",
         "empty-apn-line", "bare-label", "additional-apn", "spaced-elsewhere",
-        "short-numbers"])
+        "short-numbers", "split-across-break", "inline-tags", "label-apart"])
 def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, lines, expected):
     page = _page(*lines)
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())

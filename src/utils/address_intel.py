@@ -191,9 +191,9 @@ def _break_is_spacing(raw: list[str], canon: list[str], i: int, dash: bool) -> b
     left, right = canon[i], canon[i + 1]
     prev = canon[i - 1] if i > 0 else None
     nxt = canon[i + 2] if i + 2 < len(canon) else None
-    if (left.isalpha() and right.isalpha() and len(left) >= 2 and len(right) >= 2
-            and left not in _UNIT_WORD_SET and left not in _COMPASS):
-        return True  # BEL|RED, CARNATION|DUVALL
+    # No word|word rule: "RIDGE WOOD" vs "RIDGEWOOD" may be two streets (Codex). A
+    # hyphen-vs-space pair ("BEL-RED" / "BEL RED") is a break on BOTH sides and is
+    # judged in _same_street_modulo_punctuation instead.
     if (i > 0 and left.isdigit() and raw[i + 1] in ("ST", "ND", "RD", "TH")
             and _ordinal_ok(left, raw[i + 1]) and nxt in _STREET_TYPE_WORDS):
         return True  # 19|TH AVE; never the house number, never "23 ROAD"
@@ -227,14 +227,19 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
     ba, bb = breaks(ca, sa), breaks(cb, sb)
     for pos in set(ba) | set(bb):
         if pos in ba and pos in bb:
-            (ia, dash_a), (_, dash_b) = ba[pos], bb[pos]
-            # A dash between two house-like numbers is a range ("1508 - 1510A").
-            if (dash_a != dash_b and _HOUSE_LIKE_RE.fullmatch(ca[ia])
-                    and _HOUSE_LIKE_RE.fullmatch(ca[ia + 1])):
-                return False
-            # "1508-E" is house 1508E; "1508 E" is 1508 East.
-            if dash_a != dash_b and ia == 0 and ca[1] in _COMPASS:
-                return False
+            (ia, dash_a), (ib, dash_b) = ba[pos], bb[pos]
+            if dash_a == dash_b:
+                continue
+            for canon, k in ((ca, ia), (cb, ib)):  # both sides, so order never matters
+                # A dash between two house-like numbers is a range ("1508 - 1510A").
+                if _HOUSE_LIKE_RE.fullmatch(canon[k]) and _HOUSE_LIKE_RE.fullmatch(canon[k + 1]):
+                    return False
+                # "1508-E" is house 1508E; "1508 E" is 1508 East.
+                if k == 0 and canon[1] in _COMPASS:
+                    return False
+                # "LOT-AB RD" is a street name; "LOT AB" is a unit (Codex).
+                if canon[k] in _UNIT_WORD_SET:
+                    return False
             continue
         raw, canon, (idx, dash) = (ra, ca, ba[pos]) if pos in ba else (rb, cb, bb[pos])
         if not _break_is_spacing(raw, canon, idx, dash):

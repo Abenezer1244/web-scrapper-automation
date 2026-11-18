@@ -437,3 +437,18 @@ class TestPunctuationAndSpacing:
     def test_unit_after_spaced_dash(self):
         f = compute_owner_flags("14703 NE 35th St - Unit D-33, Bellevue WA 98007", "14703 NE 35TH ST, BELLEVUE, WA 98007")
         assert f["absentee_owner"] is False
+
+    def test_range_guard_is_order_independent(self):
+        a, b = "1508-A - 1510 MAIN ST, SEATTLE, WA 98101", "1508A 1510 MAIN ST, SEATTLE, WA 98101"
+        assert compute_owner_flags(a, b)["absentee_owner"] is True
+        assert compute_owner_flags(b, a)["absentee_owner"] is True
+
+    def test_hyphenated_name_vs_unit_designator(self):
+        for w in ("LOT", "BLD"):
+            a, b = f"123 {w}-AB RD, SEATTLE, WA 98101", f"123 {w} AB RD, SEATTLE, WA 98101"
+            assert compute_owner_flags(a, b)["absentee_owner"] is True, w
+            assert compute_owner_flags(b, a)["absentee_owner"] is True, w
+
+    def test_missing_space_between_words_stays_different(self):
+        for a, b in (("123 RIDGE WOOD RD", "123 RIDGEWOOD RD"), ("15328 SE MAY VALLEY RD", "15328 SE MAYVALLEY RD")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98101", f"{b}, SEATTLE, WA 98101")["absentee_owner"] is True, a

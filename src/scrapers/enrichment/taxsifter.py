@@ -418,15 +418,25 @@ def parse_parcel_assessor(html: str, parcel_key: str):
 
 
 _TAX_AS_OF = re.compile(r"Data\s+current\s+as\s+of:?\s*(\d{1,2}/\d{1,2}/\d{4})", re.I)
-_STATEMENT = re.compile(r"^\s*(\d{4})-(\d{1,20})\s*$")
+# "2026-<parcel>" or "2026-<parcel>-2" (real property; a parcel can carry several
+# statements a year) and "2024-<parcel>-C1" (compensating tax).
+_STATEMENT = re.compile(r"^\s*(19[0-9]{2}|20[0-9]{2})-([0-9]{1,20})(-C[1-9][0-9]{0,2}|-[1-9][0-9]?)?\s*$")
+# Statement kinds on the land. Compensating tax (RCW 84.34.108) is owed when land leaves
+# a current-use classification; Ferry shows it as its own "Compensation" row (live
+# 2026-11-17: 141 of 9,195 parcels went unparsed until this kind and numbered statements
+# were known). It is due 30 days after the county's notice, a date this page does not
+# show, so a compensation row is checked (it must be ours and readable) but NEVER counted
+# as past due: counting it on the April 30 rule could call an unexpired bill delinquent
+# (Codex). Delinquency comes from real-property statements only.
+_LAND_KINDS = {"REAL PROPERTY": "", "COMPENSATION": "-C"}  # kind -> its suffix prefix
 _MONEY = re.compile(r"^\$([0-9,]+\.[0-9]{2})$")
 
 
 def parse_parcel_treasurer(html: str, parcel_key: str):
     """pacs_tax.TaxAnswer for a Treasurer.aspx page, which must name exactly our parcel.
 
-    Read: the "5 Year Tax History" statements (one ``YYYY-<parcel>`` row each, its
-    Balance Due), the "Data current as of" date, and the owner block. Balance Due is
+    Read: the "5 Year Tax History" statements (``YYYY-<parcel>`` real property and
+    ``YYYY-<parcel>-C<n>`` compensating tax rows, each with its Balance Due), the "Data current as of" date, and the owner block. Balance Due is
     taxes + assessments + fees still unpaid; TaxSifter does not show accrued interest
     or penalty on this table, so both stay 0 and the amount is a floor, never inflated.
     Unknown is never zero: no as-of date, no history table or no statement row for
@@ -458,6 +468,7 @@ def parse_parcel_treasurer(html: str, parcel_key: str):
     if as_of is None or table is None:
         return TaxAnswer(UNPARSED)
     statements: list[Statement] = []
+    seen: set[tuple[str, str, str]] = set()
     for row in table.find_all("tr", recursive=False):
         cells = row.find_all("td", recursive=False)
         if row.find("th", recursive=False) is not None and not cells:
@@ -475,13 +486,22 @@ def parse_parcel_treasurer(html: str, parcel_key: str):
             continue  # a parcel's real-property tax only; personal property is not the land
         stmt = _STATEMENT.match(cells[1].get_text(" "))
         money = _MONEY.match(" ".join(cells[5].get_text(" ").split()))
-        # Every real-property statement must be ours and readable: skipping a broken
-        # owing row while a paid one parses would report a false zero (Codex).
-        if (kind != "REAL PROPERTY" or stmt is None or money is None
+        # Every land statement must be ours, of its kind's shape, and readable: skipping a
+        # broken owing row while a paid one parses would report a false zero (Codex).
+        if (kind not in _LAND_KINDS or stmt is None or money is None
+                or (stmt.group(3) or "").startswith("-C") != (_LAND_KINDS[kind] == "-C")
                 or normalize_pacs_parcel(stmt.group(2)) != parcel_key):
             return TaxAnswer(UNPARSED)
+        if kind == "COMPENSATION":
+            continue                                   # read and verified, never counted
+        statement_id = f"{stmt.group(1)}-{stmt.group(2)}{stmt.group(3) or ''}"
+        identity = (stmt.group(1), parcel_key, stmt.group(3) or "")  # zero-padding-proof
+        if identity in seen:
+            return TaxAnswer(UNPARSED)                 # a statement listed twice
+        seen.add(identity)
         statements.append(Statement(
-            year=int(stmt.group(1)), statement_id=f"{stmt.group(1)}-{stmt.group(2)}",
+            year=int(stmt.group(1)),
+            statement_id=statement_id,
             amount_due=Decimal(money.group(1).replace(",", "")),
             penalty=Decimal("0"), interest=Decimal("0")))
     if not statements:

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from bs4 import BeautifulSoup
 from sqlalchemy import text
 
 from src.config import settings
@@ -218,3 +219,74 @@ def test_a_block_defers_the_parcel_and_cools_the_source(portal):
 
 def test_an_unknown_county_is_never_asked():
     assert taxsifter.resolve_tax("king", ["1"])["1"].outcome == "source_unavailable"
+
+
+COMP = "44006510019005"
+
+
+def _comp() -> str:
+    return _page(f"treasurer_{COMP}_compensation.html")
+
+
+def test_a_compensating_tax_statement_is_read_as_land_tax():
+    """Real page (redacted): a 2025 'Compensation' row (2025-<parcel>-C1) beside the
+    real-property rows. It used to make the whole page unparsed (141 Ferry parcels)."""
+    ans = taxsifter.parse_parcel_treasurer(_comp(), normalize_pacs_parcel(COMP))
+    assert ans.outcome == "found"
+    ids = {s.statement_id for s in ans.statements}
+    assert f"2025-{COMP}" in ids and f"2026-{COMP}" in ids
+    assert f"2025-{COMP}-C1" not in ids  # verified, but never a counted statement
+    assert ans.delinquent_amount == Decimal("0")  # this parcel has paid everything
+
+
+def test_owed_compensating_tax_is_never_called_past_due():
+    """DERIVED: the real page with its Compensation row's Balance Due set to $201.26.
+    Its due date (30 days after notice) is not on the page, so it is not counted."""
+    soup = BeautifulSoup(_comp(), "html.parser")
+    link = soup.find("a", string=re.compile(rf"^\s*2025-{COMP}-C1\s*$"))
+    cell = link.find_parent("tr").find_all("td", recursive=False)[5]
+    cell.clear()
+    cell.append("$201.26")
+    ans = taxsifter.parse_parcel_treasurer(str(soup), normalize_pacs_parcel(COMP))
+    assert ans.outcome == "found"
+    assert ans.delinquent_amount == Decimal("0") and ans.oldest_delinquent_year is None
+
+
+@pytest.mark.parametrize("kind, statement", [
+    ("Compensation", f"2025-{COMP}"),          # compensation without its -C suffix
+    ("Real Property", f"2025-{COMP}-C1"),      # real property with a -C suffix
+    ("Timber Excise", f"2025-{COMP}"),         # a kind this reader does not know
+    ("Real Property", f"2025-{COMP}-0"),       # a zero statement number
+    ("Compensation", f"2025-{COMP}-C0"),
+    ("Real Property", f"0000-{COMP}"),         # no real year
+], ids=["comp no suffix", "real with suffix", "unknown kind", "zero suffix", "zero comp",
+        "year 0000"])
+def test_a_statement_whose_kind_and_number_disagree_is_unparsed(kind, statement):
+    soup = BeautifulSoup(_comp(), "html.parser")
+    link = soup.find("a", string=re.compile(rf"^\s*2025-{COMP}-C1\s*$"))
+    cells = link.find_parent("tr").find_all("td", recursive=False)
+    cells[0].clear()
+    cells[0].append(kind)
+    link.clear()
+    link.append(statement)
+    assert taxsifter.parse_parcel_treasurer(str(soup), normalize_pacs_parcel(COMP)).outcome == "unparsed"
+
+
+def test_numbered_real_property_statements_are_all_read():
+    """Real page (redacted): a parcel billed on two statements a year (-1, -2)."""
+    pid = "23608240001000"
+    html = _page(f"treasurer_{pid}_split_statements.html")
+    ans = taxsifter.parse_parcel_treasurer(html, normalize_pacs_parcel(pid))
+    assert ans.outcome == "found"
+    assert {f"2026-{pid}-1", f"2026-{pid}-2", f"2021-{pid}-2"} <= {s.statement_id for s in ans.statements}
+    assert ans.delinquent_amount == Decimal("185.77") and ans.oldest_delinquent_year == 2026
+
+
+def test_a_statement_listed_twice_is_unparsed_not_summed_twice():
+    pid = "23608240001000"
+    soup = BeautifulSoup(_page(f"treasurer_{pid}_split_statements.html"), "html.parser")
+    history = soup.find("h1", string=re.compile("5 Year Tax History")).find_next("table")
+    link = history.find("a", string=re.compile(rf"^\s*2026-{pid}-1\s*$"))
+    link.clear()
+    link.append(f"2026-{pid}-2")                 # now 2026-...-2 appears twice
+    assert taxsifter.parse_parcel_treasurer(str(soup), normalize_pacs_parcel(pid)).outcome == "unparsed"

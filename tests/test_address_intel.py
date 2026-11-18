@@ -403,3 +403,12 @@ class TestPunctuationAndSpacing:
             ("6515 EARL AVE NW, SEATTLE, WA 98117", "6515 EARL AV N W, SEATTLE, WA 98117"),
         ):
             assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
+
+    def test_every_strippable_designator_blocks_the_hyphen_split(self):
+        for word in ("BLD", "BLDG", "LOT", "TRLR", "DEPT", "SPC"):
+            f = compute_owner_flags(f"123 {word}-AB RD, SEATTLE, WA 98101", f"123 {word}-AC RD, SEATTLE, WA 98101")
+            assert f["absentee_owner"] is True, word
+
+    def test_road_number_with_directional_is_not_an_ordinal(self):
+        f = compute_owner_flags("123 23 ROAD WEST, SEATTLE, WA 98101", "123 23RD W, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True

@@ -162,11 +162,14 @@ _HOUSE_HYPHEN_LETTER_RE = re.compile(r"^\s*(\d+)-([A-Z])\b", re.IGNORECASE)
 # designator ("LOT-AB RD" must not turn into a strippable "LOT AB"), and single-letter
 # unit ids like "A-B" / "C-22" keep their hyphen for _same_street_modulo_unit_spelling.
 _WORD_HYPHEN_RE = re.compile(r"\b([A-Za-z]{2,})-(?=[A-Za-z]{2,}\b)")
-_UNIT_WORD_SET = frozenset(_UNIT_WORDS.split("|"))
+# Every designator _UNIT_STRIP_RE strips, so no hyphen split can create one (Codex).
+_UNIT_WORD_SET = frozenset(re.findall(r"[A-Z]+", _UNIT_STRIP_RE.pattern.split(r")\b")[0]))
 # A free-standing " - " ("WAY - UNIT 35", "1817 - 29TH AVE"), except between two bare
 # numbers, which is a house-number range ("1508 - 1510").
 _SPACED_DASH_RE = re.compile(r"(\S+)\s+-\s+(?=(\S+))")
 _ORDINALS = {"1": "ST", "2": "ND", "3": "RD"}
+# A street-type word, not a directional: "23 RD W" is 23 Road West, never "23RD W".
+_STREET_SUFFIXES = frozenset(_SUFFIX.values())
 
 
 def _ordinal_ok(num: str, suffix: str) -> bool:
@@ -195,7 +198,7 @@ def _join_split_tokens(tokens: list[str]) -> list[str]:
             i += 2
             continue
         if (i > 0 and t.isdigit() and nxt in ("ST", "ND", "RD", "TH")
-                and _ordinal_ok(t, nxt) and after in _TRAILING_OPTIONAL_TOKENS):
+                and _ordinal_ok(t, nxt) and after in _STREET_SUFFIXES):
             out.append(t + nxt)
             i += 2
             continue

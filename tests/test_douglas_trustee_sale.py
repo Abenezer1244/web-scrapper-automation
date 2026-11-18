@@ -43,10 +43,8 @@ def test_connector_points_at_the_douglas_reader_and_is_inactive():
     assert "'{_HEALTH_STATUS}',\n            false" in _MIG.read_text(encoding="utf-8")
 
 
-def test_douglas_notices_reach_the_matcher_and_the_beat():
-    # Switched on by the owner 2026-11-18 (the connector itself is seeded inactive and
-    # turned on in production after the first crawl is checked).
-    assert "douglas" in NTS_MATCH_COUNTIES
+def test_douglas_notices_are_crawled_but_not_matched_until_the_first_crawl_is_checked():
+    assert "douglas" not in NTS_MATCH_COUNTIES
     from src.workers.scheduler import app
 
     entry = app.conf.beat_schedule["crawl-nts-douglas-recorder"]
@@ -216,23 +214,26 @@ def test_an_inferred_end_holds_across_runs_and_lifts_when_it_no_longer_applies(c
     ndts = _variant(instrument="3290000", doc_type="NDTS - NOTICE OF DISCONTINUANCE", remarks="",
                     related="3227557 [DT]")      # the notice's own deed of trust, no notice link
     docs = [_doc("NTS", _NTS, "638916"), _doc("NDTS", ndts, "640000", instrument="3290000")]
+    run([_doc("NTS", _NTS, "638916")])           # published first
+    assert "REC-3286111" in _notices()
     summary = run(docs)
     assert summary["inferred_ends"] == 1
-    for _ in range(2):                           # a second run keeps it down
-        got = _notices()["REC-3286111"]
-        assert got.is_active is False and got.cancelled_at is None
+    for _ in range(2):                           # withdrawn, and kept out by the next run
+        assert "REC-3286111" not in _notices()   # no row: neither matcher pass can attach it
         run(docs)
     run([_doc("NTS", _NTS, "638916")])           # the discontinuance no longer applies
     today = datetime.now(ZoneInfo("America/Los_Angeles")).date()
     assert _notices()["REC-3286111"].is_active is (date(2027, 3, 19) >= today)
 
 
-def test_an_inferred_end_clears_a_lead_already_stamped_with_the_notice(crawl):
-    """The stamp-clearing statement runs for a reversible takedown too (shared helper)."""
+def test_a_withdrawal_clears_lead_stamps_before_removing_the_row():
+    """Leads stamped with the notice are cleared first (the same statement a cancellation
+    runs), then the row goes; a cancelled row is never deleted."""
     import inspect
 
     src = inspect.getsource(nts_crawler._cancel_notices)
-    assert src.index("UPDATE results SET auction_date = NULL") > src.index("permanent else")
+    assert src.index("UPDATE results SET auction_date = NULL") < src.index("DELETE FROM nts_notices")
+    assert "AND cancelled_at IS NULL" in src[src.index("DELETE FROM nts_notices"):]
 
 
 def test_a_detail_page_of_another_recording_writes_nothing(crawl):
@@ -250,14 +251,23 @@ def test_a_held_notice_is_not_stored_and_alerts(crawl):
     assert alerts and "held" in alerts[0][0]
 
 
-def test_a_published_notice_that_now_reads_as_held_is_taken_down_not_cancelled(crawl):
+def test_a_published_notice_that_now_reads_as_held_is_withdrawn_not_cancelled(crawl):
     run, _ = crawl
     run([_doc("NTS", _NTS, "638916")])
     edited = _variant(instrument="3286111", remarks="SALE POSTPONED, SEE TRUSTEE")
     summary = run([_doc("NTS", edited, "638916")])
-    got = _notices()["REC-3286111"]
-    assert got.is_active is False and got.cancelled_at is None   # comes back if it parses again
-    assert summary["held"] == {"no_date": 1}
+    assert "REC-3286111" not in _notices()          # comes back if it parses again
+    assert summary["held"] == {"no_date": 1} and summary["withdrawn"] == 1
+
+
+def test_a_cancelled_notice_stays_on_record_when_it_later_reads_as_held(crawl):
+    run, _ = crawl
+    ndts = _variant(instrument="3290000", doc_type="NDTS - NOTICE OF DISCONTINUANCE", remarks="",
+                    related="3286111 [NTS]")
+    run([_doc("NTS", _NTS, "638916"), _doc("NDTS", ndts, "640000", instrument="3290000")])
+    edited = _variant(instrument="3286111", remarks="SALE POSTPONED, SEE TRUSTEE")
+    run([_doc("NTS", edited, "638916"), _doc("NDTS", ndts, "640000", instrument="3290000")])
+    assert _notices()["REC-3286111"].cancelled_at is not None
 
 
 def test_a_page_that_does_not_parse_writes_nothing(crawl):

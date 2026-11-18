@@ -1379,11 +1379,13 @@ def crawl_nts_douglas_recorder() -> dict:
         if code == "NDTS":
             continue
         summary["discovered"] += 1
-        row, why = rec.notice_to_row(p, url, today, ended | inferred)
+        row, why = rec.notice_to_row(p, url, today, ended)
         if row is None:
             held[why] = held.get(why, 0) + 1
             held_keys.append(rec.ts_key(p["instrument"]))
             continue
+        if p["instrument"] in inferred:
+            continue  # withdrawn below: never stored while a discontinuance implies it ended
         row["fetched_at"] = datetime.now(UTC)  # the past-sale matcher pass reads it
         rows.append(row)
     with system_sync_session() as db:
@@ -1394,9 +1396,10 @@ def crawl_nts_douglas_recorder() -> dict:
             summary["cancelled"] = _cancel_notices(db, rec.SOURCE, [rec.ts_key(i) for i in sorted(ended)])
         down = sorted({rec.ts_key(i) for i in inferred} | set(held_keys))
         if down:
-            # Taken down, not cancelled for good: a notice a discontinuance only implies
+            # Withdrawn, not cancelled for good: a notice a discontinuance only implies
             # (same deed of trust or parcel), or one published before that no longer
-            # reads cleanly. Each returns if a later run reads it as live again.
+            # reads cleanly. Its row is removed (no matcher pass can attach it, past
+            # sale or not; Codex) and comes back if a later run reads it as live again.
             summary["withdrawn"] = _cancel_notices(db, rec.SOURCE, down, permanent=False)
         db.commit()
         _record_crawl_heartbeat(db, rec.COUNTY)  # the whole window was read
@@ -1420,20 +1423,22 @@ def _cancel_notices(db, source: str, keys: list[str], *, permanent: bool = True)
     """The sales these notices announced are off (a recorded discontinuance, or a
     later notice that replaces them): cancelled_at set once and never cleared, inactive,
     and leads already stamped with them cleared so the matcher can attach a live notice
-    (Codex P1). ``permanent=False`` only takes them down (inactive, stamps cleared, no
-    cancelled_at), for a notice that can no longer be read with confidence. Exclusive
-    against the matcher/finalizer's shared NTS_CANCEL_LOCK_KEY (re-entrant within one
-    transaction). Returns the notices changed. Caller commits."""
+    (Codex P1). ``permanent=False`` WITHDRAWS them instead (stamps cleared, rows deleted,
+    no cancelled_at), for a notice that cannot be published with confidence today; the
+    crawl re-creates it if it later reads as live. A deleted row cannot be re-attached
+    by either matcher pass, which an inactive one could once its sale date passed
+    (Codex). Exclusive against the matcher/finalizer's shared NTS_CANCEL_LOCK_KEY
+    (re-entrant within one transaction). Returns the notices changed. Caller commits."""
     from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
 
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
-    res = db.execute(
-        _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
-                 "WHERE source = :source AND ts_number = ANY(:keys)") if permanent else
-        _sa_text("UPDATE nts_notices SET is_active = false "
-                 "WHERE source = :source AND ts_number = ANY(:keys) AND is_active"),
-        {"source": source, "keys": keys},
-    )
+    res = None
+    if permanent:
+        res = db.execute(
+            _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
+                     "WHERE source = :source AND ts_number = ANY(:keys)"),
+            {"source": source, "keys": keys},
+        )
     # A later statement, so its snapshot sees an attachment that committed while we waited.
     db.execute(
         _sa_text("""
@@ -1447,6 +1452,13 @@ def _cancel_notices(db, source: str, keys: list[str], *, permanent: bool = True)
         """),
         {"source": source, "keys": keys},
     )
+    if not permanent:
+        # Never a cancelled row: a recorded discontinuance's cancellation stays on record.
+        res = db.execute(
+            _sa_text("DELETE FROM nts_notices WHERE source = :source AND ts_number = ANY(:keys) "
+                     "AND cancelled_at IS NULL"),
+            {"source": source, "keys": keys},
+        )
     return res.rowcount or 0
 
 

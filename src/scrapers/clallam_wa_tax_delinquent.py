@@ -336,7 +336,8 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
                                 pid, attempt, attempts, type(exc).__name__)
                 if attempt == attempts:
                     raise
-                await asyncio.sleep(_RETRY_WAITS_S[min(attempt, len(_RETRY_WAITS_S)) - 1])
+                wait = _RETRY_WAITS_S[min(attempt, len(_RETRY_WAITS_S)) - 1]
+                await asyncio.sleep(max(wait, settings.POLITE_DELAY_MS / 1000))  # never under the pacing
         raise AssertionError("unreachable")
 
     async def __aenter__(self) -> "ClallamWATaxDelinquentScraper":

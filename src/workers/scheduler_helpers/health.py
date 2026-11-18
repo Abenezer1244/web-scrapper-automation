@@ -452,6 +452,9 @@ CANARY_UNITS_PER_TICK = 5
 # Slots per tick kept for the random rotation, whatever the priority backlog (Codex P1:
 # a connector whose probe never records a verdict must not crowd out every other probe).
 CANARY_ROUTINE_SLOTS = 2
+# A down connector re-probed this recently waits a tick, so a source that stays down
+# does not hold a priority slot every hour and its other types get rotation turns (Codex P2).
+CANARY_RECOVERY_INTERVAL = timedelta(minutes=90)
 # Its "history" windows are forward auction horizons and zero upcoming auctions is
 # legitimate, so an empty probe never downgrades it; it has its own stale-source path.
 _NO_ZERO_OUTPUT_DOWNGRADE = frozenset({"trustee_sale"})
@@ -470,13 +473,15 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     unchecked first, one type each, the type paged down if its marker says so. One
     transient failure used to hide a working source until the rotation came back to it,
     30+ hours (Clallam tax_delinquent, 2026-11-16). Each group keeps a slot while the
-    other has a backlog; its other types rotate on later ticks."""
+    other has a backlog. A recovering connector sits out the rest of its tick and is
+    due again after CANARY_RECOVERY_INTERVAL; its other types rotate in between."""
     import random
 
     pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
     waiting = {c.id for c in pending}
-    down = sorted((c for c in connectors
-                   if c.record_types and c.id not in waiting and c.health_status == "down"),
+    due = datetime.now(UTC) - CANARY_RECOVERY_INTERVAL
+    down = sorted((c for c in connectors if c.record_types and c.id not in waiting
+                   and c.health_status == "down" and c.last_checked <= due),
                   key=lambda c: c.last_checked)
     slots = max(k - CANARY_ROUTINE_SLOTS, 0)
     n_first = min(len(pending), slots - min(len(down), 1) if slots > 1 else slots)

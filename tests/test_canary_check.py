@@ -359,7 +359,7 @@ def test_a_priority_backlog_never_takes_the_routine_slots():
     assert len({c.id for c, _ in units if c in stuck}) == health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
 
 
-def _down(n, record_types=("probate",), hours_ago=1):
+def _down(n, record_types=("probate",), hours_ago=2):
     row = _row(n, record_types, status="down")
     row.id = f"down-{uuid.uuid4().hex}"  # its own Redis marker keys
     row.last_checked = datetime.now(UTC) - timedelta(hours=hours_ago)
@@ -414,6 +414,16 @@ def test_a_down_connectors_other_types_stay_in_the_rotation():
     assert [c for c, _ in units[:3]] == older[::-1]
     mine = [rt for c, rt in units if c is waiting_turn]   # the rotation slots are all it
     assert len(mine) == len(set(mine)) == health.CANARY_ROUTINE_SLOTS
+
+
+def test_a_down_connector_just_probed_waits_and_its_types_rotate():
+    """Codex P2: a source that stays down must not take a priority slot every hour,
+    leaving its other types unwatched."""
+    recent = _down("r", ("probate", "pre_foreclosure", "divorce"), hours_ago=0.5)
+    units = health._canary_units([recent], k=100)   # recovering would probe one type alone
+    assert sorted(rt for _, rt in units) == ["divorce", "pre_foreclosure", "probate"]
+    due = _down("d", ("probate", "pre_foreclosure", "divorce"))
+    assert len(health._canary_units([due], k=100)) == 1
 
 
 def test_a_recovering_connector_is_probed_once_in_its_tick():

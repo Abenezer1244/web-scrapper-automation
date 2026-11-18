@@ -470,7 +470,7 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     unchecked first, one type each, the type paged down if its marker says so. One
     transient failure used to hide a working source until the rotation came back to it,
     30+ hours (Clallam tax_delinquent, 2026-11-16). Each group keeps a slot while the
-    other has a backlog; its other types stay in the rotation."""
+    other has a backlog; its other types rotate on later ticks."""
     import random
 
     pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
@@ -485,10 +485,11 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     marked = _down_marked_types(recovering)
     first += [(c, random.choice(marked.get(c.id) or c.record_types)) for c in recovering]
     # Pending connectors stay out of the rotation, so a stuck backlog gets only the
-    # priority slots; their other types rotate in once a probe certifies them.
-    chosen = {(c.id, rt) for c, rt in first}
-    rest = [(c, rt) for c in connectors if c.id not in waiting
-            for rt in (c.record_types or []) if (c.id, rt) not in chosen]
+    # priority slots; their other types rotate in once a probe certifies them. A
+    # recovering connector sits out the rest of this tick: a sibling probed after it
+    # would write the one shared status over its still-broken type (Codex P2).
+    skip = waiting | {c.id for c in recovering}
+    rest = [(c, rt) for c in connectors if c.id not in skip for rt in (c.record_types or [])]
     units = first + random.sample(rest, min(k - len(first), len(rest)))
     # Slots the rotation cannot fill go to the rest of the pending pairs.
     chosen = {(c.id, rt) for c, rt in units}

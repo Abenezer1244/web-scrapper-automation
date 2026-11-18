@@ -408,9 +408,20 @@ def test_new_and_down_connectors_share_the_priority_slots_longest_unchecked_firs
 
 
 def test_a_down_connectors_other_types_stay_in_the_rotation():
+    waiting_turn = _down("w", ("probate", "pre_foreclosure", "divorce"), hours_ago=1)
+    older = [_down(f"o{i}", hours_ago=10 + i) for i in range(3)]   # take the recovery slots
+    units = health._canary_units([waiting_turn, *older])
+    assert [c for c, _ in units[:3]] == older[::-1]
+    mine = [rt for c, rt in units if c is waiting_turn]   # the rotation slots are all it
+    assert len(mine) == len(set(mine)) == health.CANARY_ROUTINE_SLOTS
+
+
+def test_a_recovering_connector_is_probed_once_in_its_tick():
+    """Codex P2: a sibling probed after it would overwrite the shared status."""
     down = _down("d", ("probate", "pre_foreclosure", "divorce"))
-    units = health._canary_units([down], k=100)
-    assert sorted(rt for _, rt in units) == ["divorce", "pre_foreclosure", "probate"]
+    for _ in range(20):
+        units = health._canary_units([down, *(_row(i) for i in range(3))])
+        assert sum(c is down for c, _ in units) == 1
 
 
 def test_no_pair_is_probed_twice_in_a_tick():

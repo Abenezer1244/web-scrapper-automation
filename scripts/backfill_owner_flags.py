@@ -111,7 +111,7 @@ _SELECT_ABSENTEE = text(
     """
     SELECT id, property_address, mailing_address, property_city, property_state, property_zip
     FROM results
-    WHERE absentee_owner IS TRUE AND id > :after
+    WHERE absentee_owner = :cur AND id > :after
       AND property_address IS NOT NULL AND mailing_address IS NOT NULL
     ORDER BY id
     LIMIT :lim
@@ -120,7 +120,7 @@ _SELECT_ABSENTEE = text(
 _UPDATE_ABSENTEE = text(
     """
     UPDATE results SET absentee_owner = :absentee
-    WHERE id = :id AND absentee_owner IS TRUE
+    WHERE id = :id AND absentee_owner = :cur
       AND property_address IS NOT DISTINCT FROM :pa AND mailing_address IS NOT DISTINCT FROM :ma
       AND property_city IS NOT DISTINCT FROM :pc AND property_state IS NOT DISTINCT FROM :ps
       AND property_zip IS NOT DISTINCT FROM :pz
@@ -128,41 +128,45 @@ _UPDATE_ABSENTEE = text(
 )
 
 
-def recompute_absentee(commit: bool, batch: int) -> None:
+def recompute_absentee(commit: bool, batch: int, cur: bool = True) -> None:
+    """Re-evaluate every row whose absentee_owner is `cur`; write only rows that change.
+
+    cur=False (2026-11-17) re-checks rows an earlier, looser rule cleared: Codex judged
+    the spaced house letter ("2651 B" vs "2651B") ambiguous, so those go back to True.
+    """
     after = "00000000-0000-0000-0000-000000000000"
-    scanned = to_false = to_none = written = skipped = 0
+    scanned = written = skipped = 0
+    changed: dict[object, int] = {}
     shown = 0
     with system_sync_session() as db:
         while True:
-            rows = db.execute(_SELECT_ABSENTEE, {"after": after, "lim": batch}).fetchall()
+            rows = db.execute(_SELECT_ABSENTEE, {"after": after, "lim": batch, "cur": cur}).fetchall()
             if not rows:
                 break
             for rid, pa, ma, pc, ps, pz in rows:
                 scanned += 1
                 new = compute_owner_flags(pa, ma, property_city=pc, property_state=ps,
                                           property_zip=pz)["absentee_owner"]
-                if new is True:
+                if new is cur:
                     continue
-                if new is False:
-                    to_false += 1
-                else:
-                    to_none += 1
+                changed[new] = changed.get(new, 0) + 1
                 if shown < 40:  # sample for operator review in the run log
-                    print(f"  {rid}: True -> {new}  [{pa!r} vs {ma!r}]", flush=True)
+                    print(f"  {rid}: {cur} -> {new}  [{pa!r} vs {ma!r}]", flush=True)
                     shown += 1
                 if commit:
-                    n = db.execute(_UPDATE_ABSENTEE, {"id": rid, "absentee": new, "pa": pa, "ma": ma,
-                                                      "pc": pc, "ps": ps, "pz": pz}).rowcount
+                    n = db.execute(_UPDATE_ABSENTEE, {"id": rid, "absentee": new, "cur": cur,
+                                                      "pa": pa, "ma": ma, "pc": pc, "ps": ps,
+                                                      "pz": pz}).rowcount
                     written += n
                     skipped += 1 - n
             after = str(rows[-1][0])
             if commit:
                 db.commit()
-            print(f"  scanned={scanned} true->false={to_false} true->none={to_none}", flush=True)
+            print(f"  scanned={scanned} changed={changed}", flush=True)
     print("\n=== absentee recompute ===")
-    print(f"scanned:       {scanned}")
-    print(f"True -> False: {to_false}")
-    print(f"True -> None:  {to_none}")
+    print(f"scanned rows with absentee={cur}: {scanned}")
+    for new, n in changed.items():
+        print(f"{cur} -> {new}: {n}")
     if commit:
         print(f"written: {written}  skipped (row changed meanwhile): {skipped}")
     else:
@@ -181,9 +185,14 @@ def main() -> None:
         "--recompute-absentee", action="store_true",
         help="re-evaluate every absentee=TRUE row with the structured situs parts; writes absentee_owner only",
     )
+    ap.add_argument(
+        "--recompute-not-absentee", action="store_true",
+        help="re-evaluate every absentee=FALSE row the same way (rows a looser rule cleared)",
+    )
     args = ap.parse_args()
-    if args.recompute_absentee:
-        recompute_absentee(args.commit, max(100, min(args.batch, 5000)))
+    if args.recompute_absentee or args.recompute_not_absentee:
+        recompute_absentee(args.commit, max(100, min(args.batch, 5000)),
+                           cur=not args.recompute_not_absentee)
         return
     if args.recompute_suffixless:
         recompute_suffixless(args.commit)

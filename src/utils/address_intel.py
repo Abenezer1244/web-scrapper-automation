@@ -266,8 +266,9 @@ def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_s
     the other side marks that exact unit id, so "123 E AVENUE A" never loses its "A".
 
       * bare vs marked unit: "22222 24TH AVE S C22" vs "22222 24TH AVE S #C22"
-      * split house letter: "2651B NW 57TH ST" vs "2651 B NW 57TH ST", only when a
-        real street word follows (not "2651 B ST", which may be B Street).
+    A SPACED house letter ("2651 B NW 57TH ST" vs "2651B") is deliberately not matched:
+    "123 B MAIN ST" may be B Main Street (Codex, 2026-11-17). Only the hyphenated form
+    ("8337-A") is, in _same_street_modulo_punctuation.
     The caller still needs a matching ZIP / city before it returns same-place.
     """
     tp, tm = p_street.split(" "), m_street.split(" ")
@@ -275,18 +276,6 @@ def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_s
         if len(long_t) == len(short_t) + 1 and long_t[:-1] == short_t:
             if _marked_unit(short_raw) == long_t[-1].replace("-", ""):
                 return True
-    for a, b in ((tp, tm), (tm, tp)):
-        if (
-            len(b) == len(a) + 1
-            and re.fullmatch(r"\d+[A-Z]", a[0])
-            and b[0].isdigit()
-            # N/S/E/W excluded: "123 N MAIN ST" is North Main, not house 123N (Codex).
-            and re.fullmatch(r"[A-DF-MO-RT-VX-Z]", b[1])
-            and a[0] == b[0] + b[1]
-            and a[1:] == b[2:]
-            and any(t not in _TRAILING_OPTIONAL_TOKENS for t in a[1:])
-        ):
-            return True
     return False
 
 

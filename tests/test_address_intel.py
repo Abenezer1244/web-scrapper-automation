@@ -301,9 +301,13 @@ class TestSamePlaceWrittenDifferently:
         ):
             assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
 
-    def test_split_house_letter(self):
-        f = compute_owner_flags("2651B NW 57TH ST, SEATTLE, WA 98107",
-                                "2651 B NW 57TH ST, SEATTLE, WA 98107")
+    def test_spaced_house_letter_is_not_matched(self):
+        # "123 B MAIN ST" may be B Main Street (Codex), so a spaced letter keeps today's
+        # answer; the hyphenated "2651-B" form is matched instead.
+        for a, b in (("2651B NW 57TH ST", "2651 B NW 57TH ST"), ("123B MAIN ST", "123 B MAIN ST")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98107", f"{b}, SEATTLE, WA 98107")["absentee_owner"] is True
+            assert compute_owner_flags(f"{b}, SEATTLE, WA 98107", f"{a}, SEATTLE, WA 98107")["absentee_owner"] is True
+        f = compute_owner_flags("2651B NW 57TH ST, SEATTLE, WA 98107", "2651-B NW 57TH ST, SEATTLE, WA 98107")
         assert f["absentee_owner"] is False
 
     # Collisions Codex flagged: these must stay different places.

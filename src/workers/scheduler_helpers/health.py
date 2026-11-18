@@ -579,10 +579,17 @@ def _canary_check_impl() -> None:
     committed_alerts: list[tuple[str, str, str, str]] = []
     # DOWN alert key -> its type's marker, promoted to paged once that page went out.
     down_markers: dict[str, str] = {}
+    # Connectors a type failed on this tick: a sibling probed later (a recovery probe runs
+    # last) must not write the one shared status back to listed over it (Codex P2).
+    failed: set = set()
     try:
         for connector, record_type in units:
             unit_alerts: list[tuple[str, str, str, str]] = []
             mark = _probe_unit(connector, record_type, unit_alerts)
+            if connector.health_status == "down":
+                failed.add(connector.id)
+            elif connector.id in failed:
+                connector.health_status = "down"
             connector.last_checked = datetime.now(UTC)
             if _record_unit(connector):
                 committed_alerts.extend(unit_alerts)
@@ -745,8 +752,12 @@ def _redis(timeout_s: float | None = None):
 
     from src.config import settings
 
-    bound = {} if timeout_s is None else {"socket_timeout": timeout_s, "socket_connect_timeout": timeout_s}
-    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs(), **bound)
+    client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    if timeout_s is not None:
+        # After parsing: URL query options would otherwise win over from_url kwargs (Codex P2).
+        client.connection_pool.connection_kwargs.update(
+            socket_timeout=timeout_s, socket_connect_timeout=timeout_s)
+    return client
 
 
 def _text(value) -> str | None:

@@ -439,13 +439,30 @@ def test_a_sibling_probed_in_the_same_tick_runs_before_the_recovery_probe():
         assert units[-1][0] is down
 
 
-def test_a_hung_redis_read_is_bounded():
+def test_a_hung_redis_read_is_bounded_whatever_the_url_says(monkeypatch):
+    from src.config import settings
+
+    url = settings.REDIS_URL
+    monkeypatch.setattr(settings, "REDIS_URL", f"{url}{'&' if '?' in url else '?'}socket_timeout=60")
     r = health._redis(timeout_s=2)
     try:
         kw = r.connection_pool.connection_kwargs
         assert kw["socket_timeout"] == 2 and kw["socket_connect_timeout"] == 2
+        r.ping()
     finally:
         r.close()
+
+
+def test_a_type_that_failed_this_tick_keeps_its_connector_down(connector, monkeypatch):
+    """Codex P2: the recovery probe runs last, so its success used to relist a connector
+    whose other type had just failed in the same tick."""
+    c = connector(record_types=("probate", "pre_foreclosure"), status="down")
+    _portal(monkeypatch, now=lambda rt: RuntimeError("x") if rt == "probate" else ["r"], history=[])
+    _run_only(monkeypatch, [(c, "probate"), (c, "pre_foreclosure")])
+
+    health._canary_check_impl()
+
+    assert _status(c) == "down"
 
 
 def test_no_pair_is_probed_twice_in_a_tick():

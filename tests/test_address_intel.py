@@ -3,7 +3,12 @@
 Real parsing, no mocks. Pins the absentee/out-of-state semantics Codex specified:
 component compare, unit-only difference is NOT absentee, NULL when unknown.
 """
-from src.utils.address_intel import _compare_street, _normalize_street, compose_situs, compute_owner_flags
+from src.utils.address_intel import (
+    _compare_street,
+    _normalize_street,
+    compose_situs,
+    compute_owner_flags,
+)
 
 
 class TestNormalizeStreet:

@@ -73,6 +73,56 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-16 — Clallam integrity: no-address leads leaked unbilled; hold, late billing, 45-row backfill
+
+**Built / Shipped:** branch `fix/clallam-cross-scraper-data-integrity` (PR pending owner merge). Plan and
+dry-run report: `tasks/todo.md` ("Clallam cross-scraper integrity").
+- `7831916c` Phase 1: at delivery, every non-code-violation run holds its no-address survivors (and their
+  same-run siblings) as `delivery_excluded_reason = no_address` (`plan_cap.mark_no_address_rows`).
+  `NO_ADDRESS` joins `EXCLUSION_REASONS`, so a held row is never a lead, a bill, a cap slot or an export
+  row; run breakdown and the No-address list keep it. Owner/property recovery still work held rows.
+- `bb4e9353` Phase 2: `cv_late_delivery.py` also delivers and bills a no_address-held row once a sweep
+  gives it an address and it still holds its claim (`grant_records`, proof `policy = no_address`). Own
+  switch `NO_ADDRESS_LATE_DELIVERY_ENABLED`. Tax recency cap applies. Mailing-only rows are never sent
+  to skip trace (contacts `not_requested`). Both switches off: no new charges, but delivered rows still
+  get contacts, dialer and notice.
+- `3ba92b69`, `0a24f187` Phase 3: `scripts/backfill_hold_unbilled_no_address.py` stamps the 45 past
+  unbilled leads (owner: bill them) so the tick bills each once. Dry run by default; `--expect` guard.
+
+**Tried / Decided:**
+- Clallam's "15 already delivered" on both pre-foreclosure and death certificate was a coincidence: 0
+  shared instruments. Death's 15 came from the probate run 11 minutes earlier.
+- EagleWeb probate contains DEATH and TOD recordings by design; death_certificate is a subset. Owner: keep
+  both, disclose the overlap. Dedup stays once per property (parcel|address), no county or type.
+- Owner chose "promote and bill" over "hide": a held row that gains an address is billed, not lost.
+- Phase 2 reuses the code-violation late-delivery pipeline (locks, grant, proof, notice, contacts,
+  dialer) instead of a new module; each hold has its own branch and kill switch.
+
+**Failed / Blocked:**
+- Local regression runs looked hung for hours (70 min in one test). Cause: the test env used
+  `localhost` for Postgres, ~2 s per connect on this Windows box. `127.0.0.1` fixed it; ~2,000 tests pass.
+- Rows with no claim (NULL dedup_hash, released weak claim) cannot be promoted: nothing to bill once.
+- Two Cowlitz runs (gaps 13 and 8) leaked the same way but carry no recovery timestamp, so the rows
+  cannot be identified; left alone.
+
+**Caught & fixed:**
+- Codex Phase 2 round 1 NO-GO (High): late delivery ignored the tax recency cap, so a capped tax row
+  could be charged and stay invisible. Fixed in discovery and under the lock; round 2 GO.
+- Codex consult: CV proof keeps `code_violation_v1`; both-switches-off must still finish delivered rows.
+
+**Pending / Handoff:**
+- Owner: merge + deploy; then `backfill_hold_unbilled_no_address.py` dry run, then `--apply --expect 45`.
+- Frontend copy: No-address tab wording; probate / death certificate overlap note.
+- Separate anomaly: King tax run 68d83263 (Starter account) billed 0 of 10,344 (16,549 live leads now).
+
+**Facts learned:**
+- Lead = property OR mailing address. Sweeps fill addresses on finished runs, so any rule decided "at
+  delivery" must be frozen with the run or it drifts.
+- `mailing_recovery_last_at` / `property_recovery_last_at` vs `jobs.billing_applied_at` tell whether an
+  address existed when the run was billed.
+
+---
+
 ## 2026-11-15 — Cowlitz County: repaired recorder, death certificates, auction leads, tax (branch, unmerged)
 
 **Built / Shipped:** branch `feat/cowlitz-wa-seven-record-types` (not pushed). Plan, matrix and review:

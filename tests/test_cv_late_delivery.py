@@ -203,7 +203,8 @@ async def test_a_claim_taken_after_discovery_is_caught_under_the_lock(db, busine
     job = await _job(db, business_user, cfg)
     rid = await _held_row(db, business_user, job)
     with system_sync_session() as s:
-        [found] = s.execute(text(late._CANDIDATES_SQL), {"batch": 10, "per_account": 10}).mappings().all()
+        [found] = s.execute(text(late._CANDIDATES_SQL),
+                  {"batch": 10, "per_account": 10, **late._rule_params()}).mappings().all()
         s.rollback()
     later = await _job(db, business_user, cfg)
     newer = await _row(db, later, business_user.id, seattle())
@@ -213,7 +214,7 @@ async def test_a_claim_taken_after_discovery_is_caught_under_the_lock(db, busine
     used = await _used(db, business_user)
 
     with system_sync_session() as s:
-        assert late._deliver_one(s, found, build_snapshot([])) == "stale"
+        assert late._deliver_one(s, found, build_snapshot([]), late._rule_params()) == "stale"
     assert (await _state(db, rid))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED
     assert await _used(db, business_user) == used
 
@@ -361,7 +362,8 @@ async def test_the_kill_switch_delivers_and_bills_nothing(db, business_user, mon
 
     stats = _tick()
 
-    assert stats["skipped"] == "CV_LATE_DELIVERY_ENABLED is off" and stats["candidates"] == 0
+    # The no-address switch is still on, so the tick runs; it never picks a code violation.
+    assert stats["candidates"] == 0 and stats["delivered"] == 0
     assert (await _state(db, rid))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED
 
 

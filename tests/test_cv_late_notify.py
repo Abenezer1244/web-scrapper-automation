@@ -137,12 +137,13 @@ async def test_two_notify_passes_at_once_announce_once(db, business_user):
     for i in range(4):
         await _held_row(db, business_user, job, property_address=f"{i} RACE ST")
     with system_sync_session() as s:   # deliver without notifying, so both passes see pending rows
-        rows = s.execute(text(late._CANDIDATES_SQL), {"batch": 10, "per_account": 10}).mappings().all()
+        rows = s.execute(text(late._CANDIDATES_SQL),
+                  {"batch": 10, "per_account": 10, **late._rule_params()}).mappings().all()
         s.rollback()
     from src.db.session import rls_sync_session
 
     with rls_sync_session(business_user.id) as s:
-        assert all(late._deliver_one(s, r, build_snapshot([])) == "delivered" for r in rows)
+        assert all(late._deliver_one(s, r, build_snapshot([]), late._rule_params()) == "delivered" for r in rows)
     gate, out = threading.Barrier(2), []
 
     def run():

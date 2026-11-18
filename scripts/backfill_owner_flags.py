@@ -59,8 +59,16 @@ _UPDATE = text(
         absentee_owner = :absentee_owner,
         out_of_state_owner = :out_of_state_owner
     WHERE id = :id
+      AND property_address IS NOT DISTINCT FROM :pa
+      AND mailing_address IS NOT DISTINCT FROM :ma
+      AND absentee_owner IS NOT DISTINCT FROM :cur_absentee
+      AND owner_state IS NOT DISTINCT FROM :cur_owner_state
+      AND property_state IS NOT DISTINCT FROM :cur_property_state
+      AND out_of_state_owner IS NOT DISTINCT FROM :cur_out_of_state
     """
-)
+)  # guarded: a row a worker changed after it was read is skipped, never clobbered (Codex)
+_NULL_FLAGS = {"cur_absentee": None, "cur_owner_state": None, "cur_property_state": None,
+               "cur_out_of_state": None}
 
 
 # Targeted recompute (2026-09-02): rows already flagged absentee_owner=TRUE whose
@@ -70,7 +78,7 @@ _UPDATE = text(
 # window above never revisits them, so this mode re-evaluates exactly that set.
 _SELECT_SUFFIXLESS = text(
     """
-    SELECT id, property_address, mailing_address
+    SELECT id, property_address, mailing_address, owner_state, property_state, out_of_state_owner
     FROM results
     WHERE absentee_owner IS TRUE
       AND property_address IS NOT NULL
@@ -86,7 +94,7 @@ def recompute_suffixless(commit: bool) -> None:
     scanned = 0
     with system_sync_session() as db:
         rows = db.execute(_SELECT_SUFFIXLESS).fetchall()
-        for rid, prop, mail in rows:
+        for rid, prop, mail, cur_os, cur_ps, cur_oos in rows:
             scanned += 1
             flags = compute_owner_flags(prop, mail)
             if flags["absentee_owner"] is True:
@@ -94,7 +102,10 @@ def recompute_suffixless(commit: bool) -> None:
             print(f"  {rid}: absentee True -> {flags['absentee_owner']}  [{prop!r} vs {mail!r}]", flush=True)
             changed += 1
             if commit:
-                db.execute(_UPDATE, {"id": rid, **flags})
+                db.execute(_UPDATE, {"id": rid, **flags, "pa": prop, "ma": mail,
+                                     "cur_absentee": True, "cur_owner_state": cur_os,
+                                     "cur_property_state": cur_ps,
+                                     "cur_out_of_state": cur_oos})
         if commit:
             db.commit()
     print("\n=== suffixless absentee recompute ===")
@@ -234,7 +245,9 @@ def main() -> None:
                         if not has_any:
                             chunk_left_null += 1  # stays in the NULL window — skip past it
                         elif args.commit:
-                            db.execute(_UPDATE, {"id": rid, **flags})
+                            # Selected from the all-NULL window, so all four were NULL.
+                            db.execute(_UPDATE, {"id": rid, **flags, "pa": prop, "ma": mail,
+                                                 **_NULL_FLAGS})
                             committed += 1
                     if args.commit:
                         db.commit()

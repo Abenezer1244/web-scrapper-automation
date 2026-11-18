@@ -162,8 +162,19 @@ _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 _ROAD_NUMBER_RE = re.compile(r"\bNO\.?\s*(?=\d)", re.IGNORECASE)
 
 
+_STREET_TYPE_ALT = "|".join(sorted(set(_SUFFIX) | set(_SUFFIX.values()), key=len, reverse=True))
+# A "unit" followed by a street-type word is part of the name ("OLD LOT 5 RD"), so in
+# comparisons it is glued and kept, never stripped with the rest of the street (Codex).
+_NAMED_UNIT_RE = re.compile(
+    rf"\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\s*#?\s*([A-Z0-9-]{{1,6}})"
+    rf"(?=\s+(?:{_STREET_TYPE_ALT})\b)",
+    re.IGNORECASE,
+)
+
+
 def _compare_street(street: str | None) -> str:
     s = _DIGIT_DOT_RE.sub("_", _DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _NAMED_UNIT_RE.sub(r"\1_\2", s)
     s = _ROAD_NUMBER_RE.sub("NO_", s)
     # No trailing " -" cleanup: "MAIN ST - LOT A RD" may be a street name (Codex).
     return _normalize_street(s)

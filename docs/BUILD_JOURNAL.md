@@ -19,6 +19,20 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-17 — Asotin nwmarket crawl runs twice a day (branch `fix/nwmarket-twice-daily`)
+
+**Built / Shipped:** `crawl-nts-nwmarket-asotin` now runs at 10:00 and 22:00 UTC
+(`src/workers/scheduler.py`), with a schedule test in `tests/test_nts_nwmarket.py`.
+**Tried / Decided:** nwmarket.com answered 503 (maintenance) at the 10:00 run on 11-16 and 11-17,
+and the 11-17 owner check still saw 503. With one run a day, each failed run costs a day of Asotin
+probate and NTS. A second run halves that. Adverts already read are remembered in Redis, so the
+evening run fetches only new ones. Codex: GO. Medium: the crawl holds one of two worker slots for
+up to 45 minutes, which is accepted because nothing else long runs at 22:00. Low: during an outage,
+barren alerts can fire twice a day (12 h apart, beyond the 6 h cooldown).
+**Pending / Handoff:** NTS found at 22:00 waits for the next 11:00 matcher; probate is ingested
+during the crawl itself. The Asotin lis pendens connector was switched on in prod the same day
+(owner).
+
 ## 2026-11-17 — Asotin lis pendens through the CAPTCHA-gated recorder (branch `feat/asotin-helion-recorder`)
 
 **Built / Shipped:**

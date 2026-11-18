@@ -155,13 +155,16 @@ def _page(*lines: str) -> str:
     (["APN 222014846080", "252104732030", "LOT 7"], ["222014846080", "252104732030"]),
     (["APN 222014846080", "AND 252104", "732030"], None),               # "AND" then pieces
     (["APN 222014846080", "AND 252104732030"], ["222014846080", "252104732030"]),
+    (["APN 222014846080", "AND", "252104", "732030"], None),            # breaks and AND, then pieces
+    (["APN 222014846080", "AND", "", "252104732030"], ["222014846080", "252104732030"]),
 ], ids=["real", "2629393", "two-on-a-line", "two-lines", "colon-comma", "hash", "dashed",
         "nine-digit", "spaced-second", "spaced-only", "amp-split", "glued-amp", "nbsp",
         "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn",
         "empty-apn-line", "bare-label", "additional-apn", "spaced-elsewhere",
         "short-numbers", "split-across-break", "inline-tags", "label-apart",
         "bare-line-pieces", "bare-line-apn",
-        "and-pieces", "and-next-line"])
+        "and-pieces", "and-next-line",
+        "and-own-line-pieces", "and-own-line-apn"])
 def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, lines, expected):
     page = _page(*lines)
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())

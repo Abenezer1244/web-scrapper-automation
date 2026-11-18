@@ -155,23 +155,64 @@ _MARKED_UNIT_RE = re.compile(
 # rows flagged absentee with identical letters and digits on both sides):
 # "1508-E SW WEBSTER" / "1508E", "BEL-RED RD" / "BEL RED RD", "AVE. S.W." / "AVE SW",
 # "19 TH AVE" / "19TH AVE", "WAY - UNIT 35" / "WAY UNIT 35".
+# Every rule is positional and narrow (Codex review): a different street must never be
+# merged by a spacing rule.
 _HOUSE_HYPHEN_LETTER_RE = re.compile(r"^\s*(\d+)-([A-Z])\b", re.IGNORECASE)
-# Only a hyphen joining two words ("BEL-RED") or standing alone (" - UNIT"); a unit
-# id like "C-22" keeps its hyphen for _same_street_modulo_unit_spelling.
-_HYPHEN_RE = re.compile(r"(?<=[A-Za-z])-(?=[A-Za-z])|\s+-\s+")
-# After _normalize_street: a compass pair split by a dot or space ("S W" -> "SW").
-_SPLIT_DIRECTIONAL_RE = re.compile(r"(?<!\S)([NS]) ([EW])(?!\S)")
-# An ordinal split from its number, never the house number ("19 TH" -> "19TH").
-_SPLIT_ORDINAL_RE = re.compile(r"(?<=\S )(\d+) (TH|ND|RD)(?!\S)")
+# Word-word hyphen, both words 2+ letters ("BEL-RED"); kept when the left word is a unit
+# designator ("LOT-AB RD" must not turn into a strippable "LOT AB"), and single-letter
+# unit ids like "A-B" / "C-22" keep their hyphen for _same_street_modulo_unit_spelling.
+_WORD_HYPHEN_RE = re.compile(r"\b([A-Za-z]{2,})-(?=[A-Za-z]{2,}\b)")
+_UNIT_WORD_SET = frozenset(_UNIT_WORDS.split("|"))
+# A free-standing " - " ("WAY - UNIT 35", "1817 - 29TH AVE"), except between two bare
+# numbers, which is a house-number range ("1508 - 1510").
+_SPACED_DASH_RE = re.compile(r"(\S+)\s+-\s+(?=(\S+))")
+_ORDINALS = {"1": "ST", "2": "ND", "3": "RD"}
+
+
+def _ordinal_ok(num: str, suffix: str) -> bool:
+    if num[-2:] in ("11", "12", "13"):
+        return suffix == "TH"
+    return suffix == _ORDINALS.get(num[-1], "TH")
+
+
+def _join_split_tokens(tokens: list[str]) -> list[str]:
+    """'S W' -> 'SW' and '19 TH' -> '19TH', only where the position proves it.
+
+    Compass pair: only when nothing follows (post-directional, "AVE S W") or a real
+    street name follows ("S W WEBSTER"); "N E ST" is North E Street and stays split.
+    Ordinal: never the house number, the suffix must fit the number, and a street
+    suffix must follow ("19 TH AVE"), so "23 RD" alone (23 Road) stays as it is.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        after = tokens[i + 2] if i + 2 < len(tokens) else None
+        if (t in ("N", "S") and nxt in ("E", "W")
+                and (after is None or after not in _TRAILING_OPTIONAL_TOKENS)):
+            out.append(t + nxt)
+            i += 2
+            continue
+        if (i > 0 and t.isdigit() and nxt in ("ST", "ND", "RD", "TH")
+                and _ordinal_ok(t, nxt) and after in _TRAILING_OPTIONAL_TOKENS):
+            out.append(t + nxt)
+            i += 2
+            continue
+        out.append(t)
+        i += 1
+    return out
 
 
 def _compare_street(street: str | None) -> str:
     s = _DESIGNATOR_HASH_RE.sub(r"\1 ", street or "")
     s = _HOUSE_HYPHEN_LETTER_RE.sub(r"\1\2", s)
-    s = _HYPHEN_RE.sub(" ", s)
+    s = _WORD_HYPHEN_RE.sub(
+        lambda m: m.group(0) if m.group(1).upper() in _UNIT_WORD_SET else m.group(1) + " ", s)
+    s = _SPACED_DASH_RE.sub(
+        lambda m: m.group(0) if m.group(1).isdigit() and m.group(2).isdigit() else m.group(1) + " ", s)
     s = _normalize_street(s)
-    s = _SPLIT_DIRECTIONAL_RE.sub(r"\1\2", s)
-    return _SPLIT_ORDINAL_RE.sub(r"\1\2", s)
+    return " ".join(_join_split_tokens(s.split(" "))) if s else s
 
 
 def _marked_unit(street: str | None) -> str | None:

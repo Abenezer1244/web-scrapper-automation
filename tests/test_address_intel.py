@@ -373,3 +373,33 @@ class TestPunctuationAndSpacing:
     def test_different_ordinals_stay_different(self):
         f = compute_owner_flags("5233 19TH AVE SW, SEATTLE WA 98106", "5233 18 TH AVE SW, SEATTLE, WA 98106")
         assert f["absentee_owner"] is True
+
+    # Codex review (FAIL on the first version): these must stay different places.
+    def test_north_e_street_is_not_ne(self):
+        for a in ("123 N E ST, SEATTLE, WA 98101", "123 NORTH E ST, SEATTLE, WA 98101"):
+            assert compute_owner_flags(a, "123 NE ST, SEATTLE, WA 98101")["absentee_owner"] is True, a
+
+    def test_hyphenated_street_name_is_not_a_unit(self):
+        f = compute_owner_flags("123 LOT-AB RD, SEATTLE, WA 98101", "123 LOT-AC RD, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_road_number_is_not_an_ordinal(self):
+        f = compute_owner_flags("123 23 ROAD, SEATTLE, WA 98101", "123 23RD, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_letter_letter_unit_still_matches(self):
+        f = compute_owner_flags("123 MAIN ST A-B, SEATTLE, WA 98101", "123 MAIN ST #A-B, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is False
+
+    def test_spaced_house_range_keeps_its_dash(self):
+        f = compute_owner_flags("1508 - 1510 MAIN ST, SEATTLE, WA 98101", "1508 1510 MAIN ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_more_real_shapes(self):
+        for prop, mail in (
+            ("1817 29TH AVE W, SEATTLE WA 98199", "1817 - 29TH AVENUE WEST, SEATTLE, WA 98199"),
+            ("22218 SE 272ND PL, MAPLE VALLEY, WA 98038", "22218 S.E. 272ND PL., MAPLE VALLEY, WA 98038"),
+            ("4606 247TH PL SE, SAMMAMISH, WA 98029", "4606 247 th Place SE, SAMMAMISH, WA 98029"),
+            ("6515 EARL AVE NW, SEATTLE, WA 98117", "6515 EARL AV N W, SEATTLE, WA 98117"),
+        ):
+            assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop

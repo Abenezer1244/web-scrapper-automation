@@ -439,6 +439,24 @@ def test_a_sibling_probed_in_the_same_tick_runs_before_the_recovery_probe():
         assert units[-1][0] is down
 
 
+def test_a_down_connector_stays_hidden_until_its_recovery_probe_has_run(connector, monkeypatch):
+    """Codex P2: a sibling probed first relisted it, and a tick stopped before the recovery
+    probe left it listed with the broken type unchecked."""
+    c = connector(record_types=("probate", "pre_foreclosure"), status="down")
+    seen: list = []
+
+    async def fetch(_cls, _f, _t, record_type=None):
+        seen.append((record_type, _status(c)))
+        return ["r"]
+    monkeypatch.setattr(health, "_canary_scrape", fetch)
+    _run_only(monkeypatch, [(c, "pre_foreclosure"), (c, "probate")])
+
+    health._canary_check_impl()
+
+    assert seen == [("pre_foreclosure", "down"), ("probate", "down")]   # still hidden mid-tick
+    assert _status(c) == "healthy"
+
+
 def test_a_hung_redis_read_is_bounded_whatever_the_url_says(monkeypatch):
     from src.config import settings
 

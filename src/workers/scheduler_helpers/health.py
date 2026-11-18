@@ -579,16 +579,20 @@ def _canary_check_impl() -> None:
     committed_alerts: list[tuple[str, str, str, str]] = []
     # DOWN alert key -> its type's marker, promoted to paged once that page went out.
     down_markers: dict[str, str] = {}
-    # Connectors a type failed on this tick: a sibling probed later (a recovery probe runs
-    # last) must not write the one shared status back to listed over it (Codex P2).
+    # One status per connector (Codex P2s). A type that failed this tick keeps its connector
+    # down whatever a sibling probed after it finds, and a connector down at the start stays
+    # down until the last of its units this tick (its recovery probe runs last) has run, so
+    # an interrupted tick never relists it on a sibling's word alone.
+    was_down = {c.id for c, _ in units if c.health_status == "down"}
+    last_unit = {c.id: i for i, (c, _) in enumerate(units)}
     failed: set = set()
     try:
-        for connector, record_type in units:
+        for i, (connector, record_type) in enumerate(units):
             unit_alerts: list[tuple[str, str, str, str]] = []
             mark = _probe_unit(connector, record_type, unit_alerts)
             if connector.health_status == "down":
                 failed.add(connector.id)
-            elif connector.id in failed:
+            elif connector.id in failed or (connector.id in was_down and i < last_unit[connector.id]):
                 connector.health_status = "down"
             connector.last_checked = datetime.now(UTC)
             if _record_unit(connector):

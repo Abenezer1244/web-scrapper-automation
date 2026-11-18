@@ -197,7 +197,8 @@ def _break_is_spacing(raw: list[str], canon: list[str], i: int, dash: bool) -> b
     if (i > 0 and left.isdigit() and raw[i + 1] in ("ST", "ND", "RD", "TH")
             and _ordinal_ok(left, raw[i + 1]) and nxt in _STREET_TYPE_WORDS):
         return True  # 19|TH AVE; never the house number, never "23 ROAD"
-    if left in ("N", "S") and right in ("E", "W"):
+    # RAW single letters only: "N WEST LAKE" is North West Lake, not NW Lake (Codex).
+    if raw[i] in ("N", "S") and raw[i + 1] in ("E", "W"):
         # Post-directional after a street type (AVE S.W.), or a pre-directional before
         # a real name (S.E. 272ND). "N E ST" / "123 N E" may be North E Street.
         return prev in _STREET_TYPE_WORDS or (

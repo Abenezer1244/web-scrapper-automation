@@ -452,3 +452,8 @@ class TestPunctuationAndSpacing:
     def test_missing_space_between_words_stays_different(self):
         for a, b in (("123 RIDGE WOOD RD", "123 RIDGEWOOD RD"), ("15328 SE MAY VALLEY RD", "15328 SE MAYVALLEY RD")):
             assert compute_owner_flags(f"{a}, SEATTLE, WA 98101", f"{b}, SEATTLE, WA 98101")["absentee_owner"] is True, a
+
+    def test_spelled_out_direction_is_not_half_a_compass_pair(self):
+        a, b = "123 N WEST LAKE RD, SEATTLE, WA 98101", "123 NW LAKE RD, SEATTLE, WA 98101"
+        assert compute_owner_flags(a, b)["absentee_owner"] is True
+        assert compute_owner_flags(b, a)["absentee_owner"] is True

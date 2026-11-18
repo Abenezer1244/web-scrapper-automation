@@ -332,3 +332,74 @@ def test_the_pdf_url_is_taken_from_the_request_not_a_download_event():
     assert 'context.route("**/PDF10/**"' in src and "await route.abort()" in src
     assert 'context.unroute("**/PDF10/**"' in src
     assert "read_recorder_pdf" in src     # the capped, same-origin refetch is unchanged
+
+
+def test_the_review_cli_reviews_a_cowlitz_notice_in_cowlitz(tmp_path, capsys, monkeypatch):
+    """scripts/nts_review.py was written for Chelan: it looked every parcel up in Chelan
+    and linked Chelan's image. A Cowlitz notice is looked up in Cowlitz, through the
+    batch path Cowlitz pre-foreclosure enrichment uses, and links the Laserfiche viewer."""
+    import importlib.util
+    import uuid
+    from pathlib import Path
+
+    from sqlalchemy import text
+
+    import src.scrapers.enrichment.county_gis as cg
+    from src.utils.crypto import blind_index
+
+    spec = importlib.util.spec_from_file_location(
+        "nts_review", Path(__file__).resolve().parents[1] / "scripts" / "nts_review.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    looked_up: list[tuple[list[str], str]] = []
+
+    def _county(parcel_ids, cfg, unreached=None):
+        looked_up.append((list(parcel_ids), cfg["endpoint"]))
+        return {p: {"property_address": "123 MAIN ST, KELSO, WA 98626", "mailing_address": None,
+                    "matched": True} for p in parcel_ids}
+
+    monkeypatch.setattr(cg.settings, "GIS_ENRICHMENT_ENABLED", True, raising=False)
+    monkeypatch.setattr(cg, "_batch_query_county", _county)
+    monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda *a, **k: {})
+
+    with sync_engine.connect() as conn:
+        outer = conn.begin()
+
+        @contextmanager
+        def _session():
+            s = Session(bind=conn, join_transaction_mode="create_savepoint")
+            try:
+                yield s
+            finally:
+                s.close()
+
+        try:
+            with _session() as s:
+                doc_id = _stage(s, tmp_path)
+                s.commit()
+            email = f"op-{uuid.uuid4().hex[:8]}@example.test"
+            conn.execute(text("INSERT INTO users (id, email, password_hash, email_hmac, is_admin, mfa_enabled) "
+                              "VALUES (gen_random_uuid(), :e, 'x', :h, true, true)"),
+                         {"e": email, "h": blind_index(email)})
+
+            def run(*argv):
+                cli.main(["--operator-email", email, *argv], auth_factory=_session, session_factory=_session)
+
+            run("list")
+            assert f"{doc_id}  cowlitz " in capsys.readouterr().out
+            run("show", "--doc", doc_id)
+            out = capsys.readouterr().out
+            assert "cowlitz, WA  3799745" in out
+            assert "cowlitzinfo.net/WLAudPublic/DocView.aspx?id=38772571" in out
+            run("approve", "--doc", doc_id, "--sale-date", _SALE.isoformat(), "--parcel", "61896",
+                "--grantor", "DOE, JANE", "--not-discontinued")
+            assert "property address: 123 MAIN ST, KELSO, WA 98626" in capsys.readouterr().out
+            assert looked_up == [(["61896"], cg._KNOWN_GIS_ENDPOINTS["cowlitz_WA"]["endpoint"])]
+            with _session() as s:
+                n = s.execute(select(NtsNotice).where(NtsNotice.source == "cowlitz_recorder",
+                                                      NtsNotice.ts_number == "REC-3799745")).scalar_one()
+                assert (n.county, n.parcel, n.property_address) == ("cowlitz", "61896",
+                                                                           "123 MAIN ST, KELSO, WA 98626")
+        finally:
+            outer.rollback()

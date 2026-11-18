@@ -45,9 +45,11 @@ def _stage_with_no_apn(db, tmp_path, item: str, instrument: str) -> str:
 
 
 def test_the_live_page_is_read_and_an_unreadable_one_gives_nothing(monkeypatch):
+    clean = _page("APN 222014846080", "LOT 7")
+
     def _fetch(url, *_a, **_k):
         if "/documentdetails/1/" in url:
-            return _DETAIL.encode()
+            return clean.encode()
         raise OSError("unreachable")
 
     monkeypatch.setattr(crawler, "_bounded_fetch", _fetch)
@@ -88,7 +90,7 @@ def test_the_cli_re_reads_the_page_when_no_apn_was_stored(c, db, tmp_path, capsy
 
     def _fetch(url, *_a, **_k):
         fetched.append(url)
-        return _DETAIL.encode()
+        return _page("APN 222014846080", "LOT 7").encode()
 
     monkeypatch.setattr(crawler, "_bounded_fetch", _fetch)
     doc_id = _stage_with_no_apn(db, tmp_path, "9930003", "2630003")
@@ -121,7 +123,7 @@ def _page(*lines: str) -> str:
 
 
 @pytest.mark.parametrize("lines,expected", [
-    (["APN 222014846080", "SP 2019-008 LOT 7"], ["222014846080"]),         # the real shape
+    (["APN 222014846080", "SP 2019-008 LOT 7"], None),  # a plat number: unknown         # the real shape
     (["APN 252104732030", "NORTH ENTIAT LOT 2 BLK 2"], ["252104732030"]),  # 2629393
     (["APN 222014846080 252104732030"], ["222014846080", "252104732030"]),
     (["APN 222014846080", "APN 252104732030", "LOT 7"], ["222014846080", "252104732030"]),
@@ -139,14 +141,16 @@ def _page(*lines: str) -> str:
     # The shared parser stops at "TRUSTEE" and sees one APN; the block shows two. They
     # disagree, so the answer is unknown rather than the partial list (Codex).
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE'S DEED", "APN 252104732030"], None),
-    (["APN 222014846080", "SEC 12 TWP 23 RGE 20", "12-23-20"], ["222014846080"]),
-    (["SP 2019-008 LOT 7"], []),                                       # no APN line: none listed
+    (["APN 222014846080", "SEC 12 TWP 23 RGE 20", "12-23-20"], None),
+    (["SP 2019-008 LOT 7"], None),                                    # plat numbers: unknown
+    (["NORTH ENTIAT LOT 2 BLK 2"], []),                               # no APN, no number: none listed
+    (["APN 222014846080", "AND (252104", "732030)"], None),           # Codex: parenthesised pieces                                       # no APN line: none listed
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE'S DEED", "APN NO. #"], None),
     (["APN"], None),                                                    # an empty APN line
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE&#39;S DEED", "ADDITIONAL APN 252104732030"],
      None),                                                             # an APN on any line counts
     (["APN 222014846080", "REC 2521 0473 2030"], None),                # spaced APN-size number
-    (["APN 222014846080", "SP 2019-008 LOT 7 SEC 12 TWP 23 RGE 20 12-23-20"], ["222014846080"]),
+    (["APN 222014846080", "SP 2019-008 LOT 7 SEC 12 TWP 23 RGE 20 12-23-20"], None),
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE&#39;S DEED", "ADDITIONAL APN 2521-",
       "0473-2030"], None),                                              # APN split across a break
     (["APN 222014846080", "LOT 7 <span>2521</span><span>04732030</span>"], None),  # inline tags
@@ -159,7 +163,7 @@ def _page(*lines: str) -> str:
     (["APN 222014846080", "AND", "", "252104732030"], ["222014846080", "252104732030"]),
 ], ids=["real", "2629393", "two-on-a-line", "two-lines", "colon-comma", "hash", "dashed",
         "nine-digit", "spaced-second", "spaced-only", "amp-split", "glued-amp", "nbsp",
-        "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn",
+        "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn", "no-numbers", "paren-pieces",
         "empty-apn-line", "bare-label", "additional-apn", "spaced-elsewhere",
         "short-numbers", "split-across-break", "inline-tags", "label-apart",
         "bare-line-pieces", "bare-line-apn",

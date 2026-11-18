@@ -1631,51 +1631,25 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     lines = _doc_legal_lines(html_text)
     if lines is None:  # no DocLegal block to check against
         return apns if not apns else None
-    # Trusted only when it is the whole, clean answer (Codex). The block comes from the
-    # page structure, not from where a word happens to appear, and every line of it is
-    # read: a line that starts with APN must hold nothing but whole 12-digit Chelan APNs
-    # (separators, NO. and # aside), and on ANY line a number of APN size (digit groups
-    # joined only by spaces or punctuation, 9+ digits in all) must be whole 12-digit
-    # APNs. Shorter numbers are lots, blocks, plats and section-township-range. The
-    # APNs found must be exactly the parser's; otherwise unknown, never a shorter list.
-    # One string for the whole block: a line ending in "-" continues on the next line
-    # (a number split by a break); every other line break is a word, so a lot or plat
-    # number on its own line never runs into an APN.
-    block = ""
-    for line in lines:
-        block += line if block.endswith("-") else (" LINEBREAK " if block else "") + line
-    block = re.sub(r"(?<=\d)-\s*(?=\d)", "", block)
+    # Trusted only when it is the whole, clean answer, judged without guessing where an
+    # APN sits on the page (Codex found a new layout for every heuristic): in the
+    # DocLegal block every number of 3+ digits (dash-joined) must be a whole 12-digit
+    # Chelan APN, and every APN label must be followed by one. A split APN always
+    # leaves such a piece, so it can never yield a shorter list. The cost: a legal that
+    # also carries plat or volume numbers ("SP 2019-008") is unknown here, which only
+    # matters when the crawl stored no APN and an operator then rejects or waits.
+    block = re.sub(r"(?<=\d)-\s*(?=\d)", "", " ".join(lines))
     found: list[str] = []
-    # Every APN label, wherever it sits, must be followed by whole 12-digit APNs.
-    for label in re.finditer(r"\bAPNS?\b", block, re.I):
-        after = re.sub(r"[&/+,;:#]", " ", block[label.end():]).split()
-        listed = []
-        for i, token in enumerate(after):
-            if _APN_LIST_WORD.fullmatch(token):
-                continue
-            if token == "LINEBREAK":
-                nxt = next((t for t in after[i + 1:]
-                            if t != "LINEBREAK" and not _APN_LIST_WORD.fullmatch(t)), "")
-                if nxt[:1].isdigit():
-                    continue  # the next line carries on this APN list ("AND 252104...") (Codex)
-                break
-            if not token.isdigit():
-                break
-            if not _CHELAN_APN_RE.fullmatch(token):
-                return None
-            listed.append(token)
-        if not listed:
-            return None  # a label with no readable APN after it
-        found.extend(listed)
-    # Any number of APN size anywhere (digit groups joined only by spaces or
-    # punctuation, 9+ digits in all) must be whole 12-digit APNs.
-    for run in re.finditer(r"\d+(?:[^\w]+\d+)*", block):
-        groups = re.findall(r"\d+", run.group(0))
-        if sum(len(g) for g in groups) < 9:
-            continue
-        if any(not _CHELAN_APN_RE.fullmatch(g) for g in groups):
+    for number in re.findall(r"\d+", block):
+        if _CHELAN_APN_RE.fullmatch(number):
+            found.append(number)
+        elif len(number) >= 3:
             return None
-        found.extend(groups)
+    for label in re.finditer(r"\bAPNS?\b", block, re.I):
+        after = re.sub(r"[&/+,;:#()]", " ", block[label.end():]).split()
+        first = next((t for t in after if not _APN_LIST_WORD.fullmatch(t)), "")
+        if not _CHELAN_APN_RE.fullmatch(first):
+            return None  # a label whose APN is not the next thing on the page
     return apns if list(dict.fromkeys(found)) == apns else None
 
 

@@ -118,6 +118,14 @@ def test_the_crawl_task_is_registered_and_scheduled():
     assert "src.workers.nts_crawler.crawl_nts_nwmarket_asotin" in tasks
 
 
+def test_the_crawl_runs_twice_a_day_so_one_failed_run_costs_half_a_day():
+    import src.workers.scheduler  # noqa: F401 — import installs the beat schedule
+    from src.workers import app
+
+    sched = app.conf.beat_schedule["crawl-nts-nwmarket-asotin"]["schedule"]
+    assert sched.hour == {10, 22} and sched.minute == {0}
+
+
 def test_a_readable_non_sale_pdf_is_a_read_not_an_extraction_failure():
     # Real 2026-11-12 WSU bid notice: enough text to be a real read, no trustee sale.
     from src.workers.nts_crawler import _NWM_MIN_TEXT_CHARS
@@ -126,3 +134,96 @@ def test_a_readable_non_sale_pdf_is_a_read_not_an_extraction_failure():
     assert len(text) >= _NWM_MIN_TEXT_CHARS
     assert nts_pdf.split_notice_blocks(text) == []
     assert not nwm.is_asotin_property(text)
+
+
+# --- the sitemap fetch retries transient failures (prod 2026-11-16: one DNS blip lost the day)
+
+class _Resp:
+    def __init__(self, status):
+        self.status_code = status
+
+
+def _answers(*items):
+    it = iter(items)
+
+    def fetch():
+        a = next(it)
+        if isinstance(a, BaseException):
+            raise a
+        return a
+    return fetch
+
+
+def test_a_dns_failure_is_retried_and_the_answer_used():
+    from src.workers.nts_crawler import _get_with_retry
+
+    waits: list[float] = []
+    ok = _Resp(200)
+    resp, attempts, last = _get_with_retry(
+        _answers(ValueError("Target host could not be resolved"), _Resp(503), ok), waits=(0, 15, 45), sleep=waits.append)
+    assert (resp, attempts, last) == (ok, 3, None)
+    assert waits == [15, 45]
+
+
+def test_network_errors_and_429_are_retried_until_exhausted():
+    import requests
+
+    from src.workers.nts_crawler import _get_with_retry
+
+    resp, attempts, last = _get_with_retry(
+        _answers(requests.ConnectionError("reset"), _Resp(429), requests.Timeout("slow")),
+        waits=(0, 1, 1), sleep=lambda _s: None)
+    assert resp is None and attempts == 3 and isinstance(last, requests.Timeout)
+
+
+def test_a_refused_target_or_a_4xx_is_never_retried():
+    from src.workers.nts_crawler import _get_with_retry
+
+    calls: list[int] = []
+
+    def refused():
+        calls.append(1)
+        raise ValueError("Target is not allowed")              # an SSRF refusal
+    with pytest.raises(ValueError, match="not allowed"):
+        _get_with_retry(refused, waits=(0, 1, 1), sleep=lambda _s: None)
+    assert calls == [1]
+    gone = _Resp(404)
+    assert _get_with_retry(_answers(gone), waits=(0, 1, 1), sleep=lambda _s: None) == (gone, 1, None)
+
+
+def test_a_celery_time_limit_is_never_swallowed():
+    from src.workers.nts_crawler import _get_with_retry
+
+    class SoftTimeLimitExceeded(Exception):
+        pass
+    with pytest.raises(SoftTimeLimitExceeded):
+        _get_with_retry(_answers(SoftTimeLimitExceeded()), waits=(0, 1), sleep=lambda _s: None)
+
+
+def test_the_other_dns_failure_is_retried_but_an_ssl_error_is_not():
+    import requests
+
+    from src.workers.nts_crawler import _get_with_retry
+
+    ok = _Resp(200)
+    assert _get_with_retry(_answers(ValueError("Target host did not resolve"), ok),
+                           waits=(0, 1), sleep=lambda _s: None) == (ok, 2, None)
+    with pytest.raises(requests.exceptions.SSLError):
+        _get_with_retry(_answers(requests.exceptions.SSLError("bad cert"), ok),
+                        waits=(0, 1), sleep=lambda _s: None)
+
+
+def test_no_retry_starts_past_the_deadline_and_a_discarded_answer_is_closed():
+    from src.workers.nts_crawler import _get_with_retry
+
+    closed: list[int] = []
+
+    class Busy(_Resp):
+        def close(self):
+            closed.append(self.status_code)
+
+    resp, attempts, last = _get_with_retry(
+        _answers(Busy(503), _Resp(200)), waits=(0, 15), sleep=lambda _s: None,
+        deadline=100.0, clock=lambda: 90.0)              # 90 + 15 >= 100: no second try
+    assert (resp, attempts, str(last)) == (None, 1, "HTTP 503")
+    assert closed == [503]

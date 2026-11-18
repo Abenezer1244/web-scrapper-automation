@@ -74,8 +74,12 @@ def normalize_pacs_parcel(value: object) -> str | None:
     stored. Hyphens, spaces and dots are formatting ("0530084-000100000" and
     "0530084000100000" are the same Clallam parcel); leading zeros are stripped on
     BOTH sides of every comparison so a zero-padded recorder id still matches.
+
+    A trailing "-OUT" is Columbia's "outside city limits" mark ("1080090180000-OUT" on
+    the portal is "1080090180000" on the statewide list; checked live 2026-11-16).
     """
-    raw = re.sub(r"[\s.\-]", "", str(value or ""))
+    raw = re.sub(r"-OUT$", "", str(value or "").strip(), flags=re.I)
+    raw = re.sub(r"[\s.\-]", "", raw)
     if not raw.isdigit():
         return None
     return raw.lstrip("0") or None

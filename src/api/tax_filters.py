@@ -66,6 +66,9 @@ TAX_CAP_EXEMPT_SOURCES = frozenset({
     # (RCW 84.64.050), so every one fails the cap by definition; each is re-checked as
     # still unpaid on the county portal at scrape time. Owner decision 2026-11-12.
     "clallam_county_tax_foreclosure_certificate",
+    # Cowlitz — the same kind of list (taxes from 2023 or earlier, RCW 84.64): the cap
+    # would hide every row. Owner decision 2026-11-15 (build from the 13-parcel list).
+    "cowlitz_county_tax_foreclosure",
 })
 
 # Bind-parameter name for the raw-SQL twin (tax_cap_sql). Callers bind this to

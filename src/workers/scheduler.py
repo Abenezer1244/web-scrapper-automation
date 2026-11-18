@@ -336,9 +336,19 @@ app.conf.beat_schedule = {
     "crawl-nts-nwmarket-asotin": {
         # NTS (Asotin): Lewiston Tribune legal notices on nwmarket.com, one PDF per
         # notice, discovered from the sitemap at the robots.txt 20 s crawl delay. Up to
-        # ~45 min, so it starts early enough to finish before the 11:00 matcher.
+        # ~45 min, so it starts early enough to finish before the 11:00 matcher. A second
+        # run at 22:00 means one failed run (nwmarket was down for maintenance on 2026-11-16
+        # and 11-17) costs half a day, not a day. Adverts already read are remembered in
+        # Redis, so the second run only fetches what is new; probate is ingested in-crawl.
         "task": "src.workers.nts_crawler.crawl_nts_nwmarket_asotin",
-        "schedule": crontab(hour=10, minute=0),  # 10:00 UTC daily
+        "schedule": crontab(hour="10,22", minute=0),  # 10:00 and 22:00 UTC daily
+    },
+    "crawl-nts-cowlitz-recorder": {
+        # NTS (Cowlitz): recorded notices are CCITT scans read from the Laserfiche viewer;
+        # each new one is OCR'd into staging for an operator to approve
+        # (scripts/nts_review.py). Daily; scheduled 50 min before Chelan's 09:50 OCR run.
+        "task": "src.workers.nts_crawler.crawl_nts_cowlitz_recorder",
+        "schedule": crontab(hour=9, minute=0),  # 09:00 UTC daily
     },
     "crawl-nts-chelan-recorder": {
         # NTS (Chelan): recorded notices are scans; each new one is OCR'd into staging for

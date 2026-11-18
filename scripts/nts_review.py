@@ -16,6 +16,12 @@ Commands
             an approved notice; --independent when it shares a deed of trust but is a new sale.
             A discontinuance on file that cites only this notice's loan must be answered:
             --discontinued-by <its instrument> or --not-discontinued.
+            The parcel's current site address is looked up and becomes the property
+            address; --address (what the notice printed) is kept beside it. A printed
+            address can be years out of date. --keep-notice-address uses the printed one.
+  refresh-address  --doc of an approved notice: give it the parcel's current site
+            address, keeping the printed one. Refused once it has gone out as a
+            trustee-sale lead (its address is part of that lead's identity).
   resolve-nod  a discontinuance the crawl could not apply on its own (it cites a loan, or
             links nothing): --cancels <instrument> for each approved notice it ends
             (repeatable), or --no-effect.
@@ -46,6 +52,8 @@ from src.workers.nts_crawler import (  # noqa: E402
     REJECT_REASONS,
     ReviewError,
     approve_recorder_document,
+    lookup_parcel_situs,
+    refresh_notice_address,
     reject_recorder_document,
     resolve_discontinuance,
 )
@@ -125,12 +133,39 @@ def cmd_approve(db, op, args) -> None:
         "principal_owing": _amount(args.amount), "principal_owing_basis": args.amount_basis,
         "trustee": args.trustee, "beneficiary": args.beneficiary,
     }
+    # Before approval takes its lock: a network lookup must not hold it (Codex).
+    situs = lookup_parcel_situs("chelan", "WA", args.parcel) if not args.keep_notice_address else None
     notice = approve_recorder_document(db, args.doc, reviewer=op, values=values,
                                        supersedes=args.supersedes, independent=args.independent,
                                        discontinued_by=args.discontinued_by,
-                                       not_discontinued=args.not_discontinued)
+                                       not_discontinued=args.not_discontinued, situs=situs)
     db.commit()
     print(f"approved: notice {notice}")
+    _print_address(args.address, situs)
+
+
+def _print_address(printed: str | None, situs: str | None) -> None:
+    if situs:
+        print(f"property address: {situs} (the parcel's current site address)")
+        if printed and " ".join(printed.split()).upper() != situs.upper():
+            print(f"the notice printed: {printed} (kept as the address on the notice)")
+    else:
+        print(f"property address: {printed or '(none)'} (as printed; no site address found "
+              f"for the parcel, or --keep-notice-address)")
+
+
+def cmd_refresh_address(db, op, args) -> None:
+    d = db.get(Doc, args.doc)
+    if d is None:
+        raise SystemExit("no staged document with that id")
+    parcel = ((d.fields or {}).get("approved") or {}).get("parcel")
+    if not parcel:
+        raise SystemExit("this document has no approved parcel")
+    db.rollback()  # end the read before the network lookup; refresh takes the lock itself
+    situs = lookup_parcel_situs("chelan", "WA", parcel)
+    old, new = refresh_notice_address(db, args.doc, reviewer=op, situs=situs)
+    db.commit()
+    print(f"address: {old} -> {new}")
 
 
 def cmd_reject(db, op, args) -> None:
@@ -148,7 +183,7 @@ def cmd_resolve_nod(db, op, args) -> None:
 
 
 _COMMANDS = {"list": cmd_list, "show": cmd_show, "approve": cmd_approve, "reject": cmd_reject,
-             "resolve-nod": cmd_resolve_nod}
+             "resolve-nod": cmd_resolve_nod, "refresh-address": cmd_refresh_address}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -168,6 +203,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--not-discontinued", action="store_true")
     p.add_argument("--amount-basis", choices=("principal", "sum_owing"))
     p.add_argument("--independent", action="store_true")
+    p.add_argument("--keep-notice-address", action="store_true",
+                   help="use the printed address even when the parcel has a current site address")
+    sub.add_parser("refresh-address").add_argument("--doc", required=True)
     p = sub.add_parser("resolve-nod")
     p.add_argument("--doc", required=True)
     p.add_argument("--cancels", action="append")

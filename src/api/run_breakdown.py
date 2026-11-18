@@ -13,7 +13,9 @@ Per SAVED row of the job, first match wins (``PARTITION_CASE``):
                      else is true: a withheld row is in no other bucket, so no
                      customer-visible number can describe it. Stored on its own;
                      customer_view folds it into dropped_before_save for display.
-  no_address         no usable property or mailing address, whatever else is true
+  no_address         no usable property or mailing address, whatever else is true, or
+                     held because it had none when the run delivered (a sweep may have
+                     found one since; it is not this run's lead until a charge delivers it)
   same_run_merged    combined into another row of this same run
   already_delivered  an earlier run of the account holds the claim (results_category)
   not_qualified      not a duplicate, a code violation held back because its verified
@@ -45,6 +47,7 @@ from sqlalchemy import text
 from src.api.lead_actionability import (
     actionable_sql,
     address_actionable_sql,
+    no_address_held_sql,
     not_privacy_suppressed_sql,
     not_qualified_excluded_sql,
     quota_excluded_sql,
@@ -78,7 +81,8 @@ def partition_case(alias: str) -> str:
     return (
         "CASE"
         f" WHEN NOT {not_privacy_suppressed_sql(alias)} THEN 'privacy_withheld'"
-        f" WHEN NOT {address_actionable_sql(alias)} THEN 'no_address'"
+        f" WHEN NOT {address_actionable_sql(alias)} OR {no_address_held_sql(alias)}"
+        " THEN 'no_address'"
         f" WHEN {alias}.is_duplicate IS TRUE AND {alias}.duplicate_reason = 'same_run'"
         "  THEN 'same_run_merged'"
         f" WHEN {already_delivered_sql(alias)} THEN 'already_delivered'"

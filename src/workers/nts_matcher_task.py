@@ -54,7 +54,8 @@ _RECENT_DAYS = 180
 # classifieds, Asotin=Lewiston Tribune on nwmarket.com). Matching is scoped PER COUNTY —
 # a notice only ever matches a lead in the SAME county — so a same street+zip in a
 # different county can never cross-match (the address key isn't county-unique).
-NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark", "asotin", "benton", "chelan")
+# Cowlitz and Chelan: recorded notices, each approved by an operator against its image.
+NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark", "asotin", "benton", "chelan", "cowlitz")
 
 # Transaction-scoped advisory lock between a recorded-Discontinuance cancellation
 # (exclusive, nts_crawler.crawl_nts_benton_recorder) and every writer that stamps a

@@ -281,6 +281,50 @@ def parse_results(html: str, parcel_key: str, land_id: str | None = None
     return FOUND, prop_id, parcel_key if exact else normalize_pacs_parcel(land_id)
 
 
+def parse_accounts(html: str, parcel_key: str) -> list[str] | None:
+    """The property ids of a parcel the county lists under SEVERAL accounts, or None.
+
+    Only a page that says it is the whole result set, every row of which is readable,
+    with two or more rows naming exactly our parcel (no row merely extending it) and a
+    distinct property id on each. Anything else stays ``ambiguous``.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table", id=re.compile(r"resultsTable"))
+    if table is None:
+        return None
+    heads = [th.get_text(" ", strip=True) for th in table.find_all("th")]
+    geo_col = next((i for i, h in enumerate(heads) if _GEO_HEADER_RE.search(h)), None)
+    if geo_col is None:
+        return None
+    ids: list[str] = []
+    data_rows = 0
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) <= geo_col:
+            if len(tds) > 1:
+                return None  # a short data row we cannot read
+            continue
+        data_rows += 1
+        if normalize_pacs_parcel(tds[geo_col].get_text(" ", strip=True)) != parcel_key:
+            return None  # another parcel, or one extending ours, on the page
+        link = tr.find("a", href=re.compile(r"prop_id=\d+", re.I))
+        m = re.search(r"prop_id=(\d{1,12})", link["href"], re.I) if link else None
+        if not m:
+            return None
+        ids.append(m.group(1))
+    if (not 2 <= len(ids) <= _MAX_ACCOUNTS or len(set(ids)) != len(ids)
+            or not _grid_is_complete(soup, data_rows)):
+        return None
+    return ids
+
+
+# A parcel costs one search plus one page per account. Capping the accounts bounds how
+# far one parcel can run past a pass's budget (the reserve assumes two requests); a
+# parcel listed under more than this stays ambiguous. Columbia has a parcel under 5
+# accounts (2010380021261, live 2026-11-17).
+_MAX_ACCOUNTS = 8
+
+
 def parse_detail(html: str, parcel_key: str) -> MailingAnswer:
     """One Property.aspx page -> its answer about ``parcel_key`` (already normalised)."""
     page = parse_pacs_detail_html(html)
@@ -340,13 +384,15 @@ def _request(do, still_held) -> tuple[requests.Response | None, str | None]:
 def query_digits(value: object) -> str:
     """What is SENT to the portal: the caller's parcel with separators removed and
     leading zeros KEPT. The county's search may be fixed-width (Clallam's Geo IDs
-    start with 0); only the comparison key strips zeros (Codex P2)."""
-    return re.sub(r"[\s.\-]", "", str(value or ""))
+    start with 0); only the comparison key strips zeros (Codex P2). A trailing "-OUT"
+    (see pacs.normalize_pacs_parcel) is not part of the searched id."""
+    return re.sub(r"[\s.\-]", "", re.sub(r"-OUT$", "", str(value or "").strip(), flags=re.I))
 
 
 def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
                  query: str | None = None, mode: dict | None = None, land_id: str | None = None,
-                 parse=None, make=MailingAnswer, year: str | None = None) -> tuple:
+                 parse=None, make=MailingAnswer, year: str | None = None,
+                 combine=None, deadline: float | None = None) -> tuple:
     """Search POST, then detail GET, for one parcel. (answer, block_reason).
     `mode` is the form's search-mode field (pacs.search_type_field); `land_id` is
     PacsSite.land_id for this parcel's callers, or None. `parse(html, key)` reads the
@@ -361,6 +407,31 @@ def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_h
     if blocked or resp is None:
         return make(REQUEST_FAILED), blocked
     outcome, prop_id, matched_key = parse_results(resp.text, parcel_key, land_id)
+    accounts = (parse_accounts(resp.text, parcel_key)
+                if outcome == AMBIGUOUS and combine is not None else None)
+    if accounts:
+        # One parcel under several accounts: read every account's page and let
+        # `combine` judge the parcel (tax pass only). Each page must name our parcel
+        # AND the account asked for, so one page served twice is never counted twice
+        # (Codex). Any failure, block or lost lease is the whole parcel's answer:
+        # a partial set of accounts is never combined.
+        answers = []
+        for account in accounts:
+            # The pass's budget holds between accounts too: a parcel cut short is
+            # deferred whole, so the batch's answers commit before the time limit (Codex).
+            if deadline is not None and time.monotonic() > deadline:
+                return make(SOURCE_UNAVAILABLE), None
+            time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
+            if not still_held():
+                return make(SOURCE_UNAVAILABLE), None
+            url = pacs_detail_url(site.search_url, account, year)
+            page, blocked = _request(lambda u=url: _http_get(session, u), still_held)
+            if blocked or page is None:
+                return make(REQUEST_FAILED), blocked
+            if parse_pacs_detail_html(page.text)["prop_ids"] != [account]:
+                return make(PARCEL_MISMATCH), None
+            answers.append(parse(page.text, parcel_key))
+        return combine(answers), None
     if outcome != FOUND:
         return make(outcome), None
     time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
@@ -392,10 +463,12 @@ def resolve_tax(county: str, parcel_ids: list[str], *, time_budget_s: float = CA
     block cooldown, identity chain and layout-drift breaker)."""
     from src.scrapers.enrichment import pacs_tax
 
-    return _run_pass(county, parcel_ids, time_budget_s, pacs_tax.parse_tax, pacs_tax.TaxAnswer)
+    return _run_pass(county, parcel_ids, time_budget_s, pacs_tax.parse_tax, pacs_tax.TaxAnswer,
+                     combine=pacs_tax.combine_accounts)
 
 
-def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, make) -> dict:
+def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, make,
+              combine=None) -> dict:
     """One paced, lease-guarded pass over a county's parcels; see resolve_mailing."""
     from src.scrapers.enrichment.source_admission import SourceAdmission
     from src.scrapers.enrichment.source_health import (
@@ -484,7 +557,8 @@ def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, m
                 break
             answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
                                            query=queries[key], mode=mode, land_id=land_ids[key],
-                                           parse=parse, make=make, year=year)
+                                           parse=parse, make=make, year=year, combine=combine,
+                                           deadline=deadline)
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

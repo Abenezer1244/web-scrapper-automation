@@ -69,3 +69,26 @@ def test_only_a_recording_naming_no_parcel_may_be_looked_up_by_name(outcome, eli
     res = SimpleNamespace(party_name="DOE, JANE", property_address=None,
                           enrichment_data={"recording_apn_lookup": outcome})
     assert name_lookup_eligible(res) is eligible
+
+
+def test_attachment_links_benton_names_otherwise_are_read():
+    """2026-021430's attachment is named "Deed" (live 2026-11-17)."""
+    from src.scrapers.templates.eagleweb import _recorded_document_url
+
+    host = "erecording.co.benton.wa.us"
+    base = f"https://{host}/recorder/eagleweb/viewAttachment.jsp?"
+    assert _recorded_document_url(host, base + "docName=Deed&id=DOC1824S5607.A0&parent=DOC1824S5607") == (
+        f"https://{host}/recorder/eagleweb/downloads/Deed.pdf?id=DOC1824S5607.A0&parent=DOC1824S5607")
+    # Only the first attachment is the recording (".A1" may be a supplemental PDF).
+    assert _recorded_document_url(host, base + "docName=2026_024579&id=DOC1823S2554.A1&parent=DOC1823S2554") is None
+    # Another host, or characters that could change the URL, are never fetched.
+    assert _recorded_document_url(host, base.replace(host, "evil.example") + "docName=Deed&id=DOC1.A0&parent=DOC1") is None
+    assert _recorded_document_url(host, base + "docName=../x&id=DOC1.A0&parent=DOC1") is None
+    assert _recorded_document_url(host, base + "docName=Deed&id=DOC1.A0%26x%3D1&parent=DOC1") is None
+    assert _recorded_document_url(host, None) is None
+
+
+def test_a_malformed_attachment_link_is_rejected_not_raised():
+    from src.scrapers.templates.eagleweb import _recorded_document_url
+
+    assert _recorded_document_url("erecording.co.benton.wa.us", "https://[bad/recorder?docName=Deed&id=DOC1.A0&parent=DOC1") is None

@@ -109,7 +109,8 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
     deploy, parcel echo, tests) -> fixed/answered -> **GO**.
   - **Deploy precondition (Codex):** zero PENDING/QUEUED/running Douglas jobs, and Douglas dispatch held (connector
     inactive or schedules paused) until every old worker has stopped; then re-enable.
-- [x] **Phase 3: death_certificate** (commit 3bb24e41; Codex NO-GO -> fixed -> GO). Migration 164 appends the type to the
+- [x] **Phase 3: death_certificate** (commit 3bb24e41; Codex NO-GO -> fixed -> GO). Migration 170 (was 164; renumbered
+  after merging main in 59f2a53d, ids fixed in 356e6e5d) appends the type to the
   (active) Douglas connector, so DEPLOYING = OFFERING it. Douglas DC rows: decedent is the person party on 20/21; one
   is "STATE OF WASHINGTON" -> "<NAME> ESTATE OF" (Douglas-only `strip_inverted_estate_caption`; the shared helper is
   unchanged because changing it would re-key other counties' delivered name+date leads). 6/21 carry an 11-digit parcel.
@@ -117,15 +118,31 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
   - [x] unpaged grid lists one recording twice (identical but GUID; 10/19/2026) -> every run over that day failed. Collapsed.
   - [x] one-day window ran ZERO searches when `#RecordDate` was not yet on the page -> false zero "done". Always searched once.
   - [x] kendo single-picker fill stepped 7 days per one-date search (Codex). Steps a day.
-  - Live: 10/19-11/04 read all 17 days, 0 DCs = matches the recorder's own doc-type search (0). A positive live read
-    (05/25-06/05, 3 DCs) did NOT complete: the portal stalled (TransientScrapeError, retried by the worker). Open.
+  - Live: 10/19-11/04 read all 17 days, 0 DCs = matches the recorder's own doc-type search (0). Positive live read
+    05/25-06/05 (2026-11-17): 3 records = the 3 the recorder lists, all naming a person (no agency, no "ESTATE OF"),
+    no in-scrape address (held at delivery until the post-save lookups find one).
   - Open (pre-existing, not fixed): a first page that never shows a date field raises a PERMANENT
     ScraperExecutionError ("could not locate date inputs") on a slow portal; arguably transient.
-- [ ] **Phase 4: trustee_sale — BLOCKED on coordination.** A parallel Cowlitz session is generalising the same OCR
-  pipeline (commits "feat(nts-ocr): read Laserfiche (Cowlitz)", "stage recorded trustee-sale notices for operator review",
-  not on main). Build Douglas on top of that once merged, not in parallel.
-  (original plan) via the Chelan OCR pipeline (`nts_recorder_documents`, recorder crawler, operator review)
-  generalised to Douglas NTS (33/yr). Check image access is free first. Owner decision (same as Chelan's).
+- [x] **Phase 4: trustee_sale** (commits 356e6e5d, 22e74053; connector INACTIVE, not in the matcher). No OCR needed:
+  Douglas SELLS its recording images (PDF endpoint "Error 5001", AddToCart block), but each recording's FREE detail page
+  (in-session only; bare HTTP 401) carries the sale in the recorder's typed Remarks, plus grantor, related deed of trust
+  and the 11-digit APN. `nts_douglas_recorder` (parser, lawful-sale-day rule, explicit sale construction, held reasons,
+  discontinuance resolution), `DouglasAcclaimWebScraper.collect_by_doc_type` (one doc-type search per code; the portal's
+  own form post must carry the requested type and dates; every row the requested type; cap on the reported total),
+  `crawl_nts_douglas_recorder` (all-or-nothing, Pacific dates, 365-day window, heartbeat only after a complete write),
+  beat 09:30 UTC, migration 171. NOCONT is the RCW 84.34 current-use continuance (no remarks, 2-10 APNs): ignored.
+  - Live end-to-end crawl into the test DB (2026-11-17): 33 NTS + 16 NDTS read; 27 notices stored (12 active, 11
+    inactive, 4 cancelled), 6 held (2 no_date, 3 no_sale_language, 1 several_parcels), 2 inferred ends, 3 unmatched
+    discontinuances (3279193, 3280146, 3282060: their notices predate the window). A first run hit a portal timeout and
+    wrote nothing (alerted) as designed.
+  - Discontinuances: 5 of 16 link only the deed of trust / a modification. They end notices recorded BEFORE them on the
+    same deed of trust, or the same parcel unless the deeds differ, reversibly. 3279193 (11/2025) shares its deed of
+    trust with the LIVE notice 3286111 (11/2026, sale 3/19/2027), which stays live.
+  - Codex: design consult; NO-GO x3 -> all fixed -> **GO for the inactive rollout**.
+  - **Activation (owner):** after deploy let the crawl run; check the held/unmatched alerts and the stored notices; then
+    set the trustee_sale connector active AND add "douglas" to `NTS_MATCH_COUNTIES` (code change + deploy). Codex's
+    remaining activation item (two loans on one parcel) is fixed and tested; re-confirm on prod data.
+  - Recorder banner (live): "Released through date: 09/16/2026"; later recordings are indexed but not yet "released".
 - [ ] **Phase 5: tax_delinquent — needs owner decision (freshness).** Verified 2026-11-15:
   - Treasurer "2026 Notice and Summons" (Superior Court 26-2-00337-09, filed 9/17/2026; scanned, 11 pages). Exhibit A
     rows carry: 11-digit parcel, legal, street address, vested owner + mailing, taxpayer + mailing, certificate tax years,
@@ -154,20 +171,26 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
     analysis; harder to prove); (c) hold.
   Original options: between (a) OCR of the annual Notice and Summons (foreclosure-stage only),
   (b) a Public Records Request for the Treasurer's year-round delinquent file, (c) per-parcel TaxSifter balances.
-- Blocked (no code): **code_violation** (no case-level source), **divorce** (no recorder type in use; court index is
-  case-only/paid). **death_certificate** certificates themselves are restricted; recorder DC is the feed.
+  - 2026-11-17: owner asked to proceed; NOT built pending an explicit pick, because operator review means ongoing owner
+    time (the county re-stamps the PDF as parcels redeem; OCR cannot segment struck rows, so an operator would also
+    type them) for ~16 leads a year. A Ferry-style per-parcel TaxSifter tax crawl exists (`taxsifter.resolve_tax`) but
+    has a 14-day source-date gate that Douglas's June-dated TaxSifter fails.
+- Blocked (no code): **code_violation** (county SmartGov is complaint intake only; recorder VIOLATION = 0 in 12 months;
+  cities' sites have no case data). **divorce** (recorder DIVORCE = 0 in 12 months; the court index is case-level only
+  and GR 31(g)(4) bars commercial solicitation from bulk court records — the same blocker Ferry recorded; counsel
+  needed). **death_certificate** certificates themselves are restricted (RCW 70.58A); recorder DC is the feed.
 
-## Seven-category matrix (Phase 1)
+## Seven-category matrix (2026-11-17)
 
 | Category | Source | Access | 12-mo volume | Status |
 |---|---|---|---|---|
-| probate | Recorder LACKPRO/DC/AFFIDE/WILL (+TOD opt-in) | public | ~74 + 70 TOD | Existing; defects G1, G3; baseline unmeasured |
-| pre_foreclosure | Recorder NTS/LP | public | 36 | Existing; defects G1, G2; baseline unmeasured |
-| trustee_sale | Recorder NTS (sale date in image) | index public; images unchecked | 33 | Not implemented (Phase 4) |
-| tax_delinquent | Treasurer summons PDF / FTP file / TaxSifter | PDF public; FTP via PRR | unknown | Not implemented, owner decision |
+| probate | Recorder LACKPRO/DC/AFFIDE/WILL/LT/HEIRSHIP (+TOD opt-in) | public index | ~74 + 70 TOD | Existing, repaired (Phase 2); implemented, awaiting deploy |
+| pre_foreclosure | Recorder NTS / LP (RELEASE LP excluded) | public index | 36 | Existing, repaired (parcel restored, TaxSifter gate); awaiting deploy |
+| trustee_sale | Recorder NTS detail pages (typed Remarks) | free detail page, in-session | 33 | Implemented, verified live end to end; connector INACTIVE (activation steps above) |
+| tax_delinquent | Treasurer 2026 summons (scanned, REDEEMED stamps) | public PDF | ~16 | Not implemented: owner decision (operator review vs hold) |
 | code_violation | none found | - | 0 | Blocked by source access |
-| divorce | Odyssey index / JIS-Link | case index / paid | 0 recorded | Blocked by source access |
-| death_certificate | Recorder DC | public | 21 | Not implemented (Phase 3) |
+| divorce | court index (GR 31(g)(4)) | case index only | 0 recorded | Blocked by legal/data restrictions |
+| death_certificate | Recorder DEATH CERTIFICATE | public index | 21 | Implemented, verified live (3/3); offered on deploy (migration 170) |
 
 ## Review (2026-11-16, interim)
 - Full suite on 3bb24e41, fresh test DB (bl-douglas-pg recreated, alembic 164): 8,970 passed, 53 skipped, 1 failed +
@@ -176,3 +199,16 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
 - A run on a DB left dirty by two stopped runs gave 317 FK-violation failures: environment, not code. Recreate the DB
   after any aborted full run.
 - Released: nothing (no push, no deploy). Phase 2 + 3 committed locally; tax WIP on `wip/douglas-tax-ocr-unsafe`.
+
+## Review (2026-11-17)
+- Merged origin/main (Cowlitz #652, Ferry #655, OCR JPEG #658, Asotin LP #661): migrations now 170 (death_certificate)
+  and 171 (trustee_sale connector, inactive); single alembic head 171.
+- Tests: 349 (merge) + 377 + 324 related passed; Douglas trustee tests 60/60; ruff clean.
+- Playwright QA (local: branch API on the isolated test DB, bridgeleads-web origin/master on localhost:3000, a seeded
+  business user and a prod-shaped Douglas connector): Douglas shows "3 types" = Probate, Pre-Foreclosure, Death
+  Certificate; auction leads (inactive), tax, code violation, divorce absent; no horizontal overflow at 320/375/390/430/
+  768/1024/1440/1920 px; no page errors. Dark mode NOT exercised: the app ignores the OS colour scheme (own toggle).
+  Not exercised locally: job runs, results, exports (need a worker and live scrapes).
+- Next.js dev server printed a known-vulnerability upgrade notice for bridgeleads-web's Next 16.4.3 (not acted on).
+- Deploy order: migrations 170 + 171; Phase 2 precondition (no queued/running Douglas job; hold Douglas dispatch until
+  old workers stop); trustee_sale stays inactive until the activation steps above.

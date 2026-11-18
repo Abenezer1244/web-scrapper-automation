@@ -448,12 +448,13 @@ def _amount_type(record: Any, enr: dict) -> str:
 
 def _minimum_bid(record: Any, enr: dict) -> str:
     """A tax foreclosure listing's minimum bid as a plain dollar figure, '' when none or
-    not a clean amount. Tax rows only. SQL-fed rows (segments, batch) carry no
-    enrichment_data and project it as foreclosure_minimum_bid."""
-    if _get(record, "record_type") not in (None, "tax_delinquent"):
-        return ""
+    not a clean amount. SQL-fed rows (segments, batch) project it, read from their tax
+    row, so it is taken as given even when another record type represents the
+    property; read from enrichment it counts on a tax row only."""
     raw = _get(record, "foreclosure_minimum_bid")
     if raw in (None, ""):
+        if _get(record, "record_type") not in (None, "tax_delinquent"):
+            return ""
         raw = enr.get("foreclosure_minimum_bid")
     try:
         d = Decimal(str(raw)).quantize(Decimal("0.01"))
@@ -867,7 +868,7 @@ _OVERLAP_V1_COLUMNS: list[str] = [
 # group's source row; the rest belong to the representative row, like filed_date.
 # default_amount_type (migration 128) came later: appended at the very end of both
 # files, so neither the overlap columns nor the batch extras move.
-OVERLAP_LEAD_COLUMNS: list[str] = _OVERLAP_V1_COLUMNS + ["default_amount_type"]
+OVERLAP_LEAD_COLUMNS: list[str] = _OVERLAP_V1_COLUMNS + ["default_amount_type", "foreclosure_minimum_bid"]
 BATCH_LEAD_COLUMNS: list[str] = _OVERLAP_V1_COLUMNS + [
     "assessed_value", "instrument_number",
     "code_violation_type", "code_violation_status",
@@ -877,7 +878,7 @@ BATCH_LEAD_COLUMNS: list[str] = _OVERLAP_V1_COLUMNS + [
     "freshness_days", "contactability_score",
     "absentee_owner", "out_of_state_owner", "owner_state",
     "trustee", "ts_number", "current_owner", "title_status", "parcel_source",
-    "default_amount_type",
+    "default_amount_type", "foreclosure_minimum_bid",
 ]
 
 

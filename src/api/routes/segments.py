@@ -217,6 +217,10 @@ WITH candidates AS (
            -- combined CSV does not promise them.)
            r.doc_type, r.heirs, r.legal_description,
            r.delinquent_amount, r.delinquent_bill_year,
+           -- A tax listing's minimum bid: never a balance (lead_export._minimum_bid).
+           -- Tax rows only: another type's enrichment never supplies one (Codex).
+           CASE WHEN sc.record_type = 'tax_delinquent'
+                THEN r.enrichment_data->>'foreclosure_minimum_bid' END AS foreclosure_minimum_bid,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            -- Owner lookup state, for owner_name_pending (src/utils/owner_pending.py).
            r.enrichment_data->>'owner_lookup_outcome' AS owner_lookup_outcome,
@@ -276,6 +280,12 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.record_type,
        rk.owner_lookup_outcome, rk.owner_recovery_outcome, rk.owner_recovery_attempts,
        rk.delinquent_amount, rk.delinquent_bill_year,
+       -- From the property's own newest tax row, whichever row represents it: for a
+       -- bid-only listing (Cowlitz) it is the lead's only tax amount (Codex High).
+       (SELECT c2.foreclosure_minimum_bid FROM candidates c2
+         WHERE c2.property_key = rk.property_key AND c2.foreclosure_minimum_bid IS NOT NULL
+         ORDER BY c2.job_created_at DESC NULLS LAST, c2.id DESC
+         LIMIT 1) AS foreclosure_minimum_bid,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
@@ -326,6 +336,10 @@ WITH candidates AS (
            -- combined CSV does not promise them.)
            r.doc_type, r.heirs, r.legal_description,
            r.delinquent_amount, r.delinquent_bill_year,
+           -- A tax listing's minimum bid: never a balance (lead_export._minimum_bid).
+           -- Tax rows only: another type's enrichment never supplies one (Codex).
+           CASE WHEN sc.record_type = 'tax_delinquent'
+                THEN r.enrichment_data->>'foreclosure_minimum_bid' END AS foreclosure_minimum_bid,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            -- Owner lookup state, for owner_name_pending (src/utils/owner_pending.py).
            r.enrichment_data->>'owner_lookup_outcome' AS owner_lookup_outcome,
@@ -409,6 +423,12 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.record_type,
        rk.owner_lookup_outcome, rk.owner_recovery_outcome, rk.owner_recovery_attempts,
        rk.delinquent_amount, rk.delinquent_bill_year,
+       -- From the property's own newest tax row, whichever row represents it: for a
+       -- bid-only listing (Cowlitz) it is the lead's only tax amount (Codex High).
+       (SELECT c2.foreclosure_minimum_bid FROM candidates c2
+         WHERE c2.bucket = rk.bucket AND c2.foreclosure_minimum_bid IS NOT NULL
+         ORDER BY c2.job_created_at DESC NULLS LAST, c2.id DESC
+         LIMIT 1) AS foreclosure_minimum_bid,
        a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
@@ -445,6 +465,10 @@ WITH candidates AS (
            -- combined CSV does not promise them.)
            r.doc_type, r.heirs, r.legal_description,
            r.delinquent_amount, r.delinquent_bill_year,
+           -- A tax listing's minimum bid: never a balance (lead_export._minimum_bid).
+           -- Tax rows only: another type's enrichment never supplies one (Codex).
+           CASE WHEN sc.record_type = 'tax_delinquent'
+                THEN r.enrichment_data->>'foreclosure_minimum_bid' END AS foreclosure_minimum_bid,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            -- Owner lookup state, for owner_name_pending (src/utils/owner_pending.py).
            r.enrichment_data->>'owner_lookup_outcome' AS owner_lookup_outcome,
@@ -501,6 +525,12 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.record_type,
        rk.owner_lookup_outcome, rk.owner_recovery_outcome, rk.owner_recovery_attempts,
        rk.delinquent_amount, rk.delinquent_bill_year,
+       -- From the property's own newest tax row, whichever row represents it: for a
+       -- bid-only listing (Cowlitz) it is the lead's only tax amount (Codex High).
+       (SELECT c2.foreclosure_minimum_bid FROM candidates c2
+         WHERE c2.property_key = rk.property_key AND c2.foreclosure_minimum_bid IS NOT NULL
+         ORDER BY c2.job_created_at DESC NULLS LAST, c2.id DESC
+         LIMIT 1) AS foreclosure_minimum_bid,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key

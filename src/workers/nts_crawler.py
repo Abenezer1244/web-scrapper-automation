@@ -1582,6 +1582,9 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     return " ".join((found or "").split())[:512] or None
 
 
+_MORE_PARCELS_RE = re.compile(
+    r"\b(?:ADDITIONAL|SEE|ATTACHED|EXHIBIT|CONT(?:INUED)?|PAGE|PG|ETC|OTHERS?|MORE|REMAINING)\b", re.I
+)
 _APN_LIST_WORD = re.compile(r"(?:NO|NOS|AND|APNS?)\.?", re.I)
 _CHELAN_APN_RE = re.compile(r"\d{12}")
 
@@ -1639,6 +1642,10 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     # also carries plat or volume numbers ("SP 2019-008") is unknown here, which only
     # matters when the crawl stored no APN and an operator then rejects or waits.
     block = re.sub(r"(?<=\d)-\s*(?=\d)", "", " ".join(lines))
+    # Chelan's recording guide lets the first page list the parcels that fit and refer
+    # elsewhere for the rest (Codex): a pointer to more parcels makes the list unknown.
+    if _MORE_PARCELS_RE.search(block):
+        return None
     found: list[str] = []
     for number in re.findall(r"\d+", block):
         if _CHELAN_APN_RE.fullmatch(number):

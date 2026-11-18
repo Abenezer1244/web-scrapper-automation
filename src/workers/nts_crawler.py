@@ -1582,6 +1582,7 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     return " ".join((found or "").split())[:512] or None
 
 
+_APN_LIST_WORD = re.compile(r"(?:NO|NOS|AND|APNS?)\.?", re.I)
 _CHELAN_APN_RE = re.compile(r"\d{12}")
 
 
@@ -1650,10 +1651,13 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
         after = re.sub(r"[&/+,;:#]", " ", block[label.end():]).split()
         listed = []
         for i, token in enumerate(after):
-            if re.fullmatch(r"(?:NO|NOS|AND|APNS?)\.?", token, re.I):
+            if _APN_LIST_WORD.fullmatch(token):
                 continue
-            if token == "LINEBREAK" and i + 1 < len(after) and after[i + 1][:1].isdigit():
-                continue  # a number on the next line still belongs to this APN list (Codex)
+            if token == "LINEBREAK":
+                nxt = next((t for t in after[i + 1:] if not _APN_LIST_WORD.fullmatch(t)), "")
+                if nxt[:1].isdigit():
+                    continue  # the next line carries on this APN list ("AND 252104...") (Codex)
+                break
             if not token.isdigit():
                 break
             if not _CHELAN_APN_RE.fullmatch(token):

@@ -464,21 +464,61 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     customers until a probe decides it, so one type of each such connector goes first:
     a random sample of them, capped so CANARY_ROUTINE_SLOTS stay for the random rotation
     through every other pair. A connector switched on used to wait for the rotation,
-    a day or more (Benton tax_delinquent, 2026-11-14)."""
+    a day or more (Benton tax_delinquent, 2026-11-14).
+
+    A 'down' connector is hidden too, so it shares those priority slots: the longest
+    unchecked first, one type each, the type paged down if its marker says so. One
+    transient failure used to hide a working source until the rotation came back to it,
+    30+ hours (Clallam tax_delinquent, 2026-11-16). Each group keeps a slot while the
+    other has a backlog; its other types stay in the rotation."""
     import random
 
     pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
-    first = [(c, random.choice(c.record_types))
-             for c in random.sample(pending, min(len(pending), max(k - CANARY_ROUTINE_SLOTS, 0)))]
+    waiting = {c.id for c in pending}
+    down = sorted((c for c in connectors
+                   if c.record_types and c.id not in waiting and c.health_status == "down"),
+                  key=lambda c: c.last_checked)
+    slots = max(k - CANARY_ROUTINE_SLOTS, 0)
+    n_first = min(len(pending), slots - min(len(down), 1) if slots > 1 else slots)
+    first = [(c, random.choice(c.record_types)) for c in random.sample(pending, n_first)]
+    recovering = down[:slots - n_first]
+    marked = _down_marked_types(recovering)
+    first += [(c, random.choice(marked.get(c.id) or c.record_types)) for c in recovering]
     # Pending connectors stay out of the rotation, so a stuck backlog gets only the
     # priority slots; their other types rotate in once a probe certifies them.
-    waiting = {c.id for c in pending}
-    rest = [(c, rt) for c in connectors if c.id not in waiting for rt in (c.record_types or [])]
+    chosen = {(c.id, rt) for c, rt in first}
+    rest = [(c, rt) for c in connectors if c.id not in waiting
+            for rt in (c.record_types or []) if (c.id, rt) not in chosen]
     units = first + random.sample(rest, min(k - len(first), len(rest)))
     # Slots the rotation cannot fill go to the rest of the pending pairs.
     chosen = {(c.id, rt) for c, rt in units}
     spare = [(c, rt) for c in pending for rt in c.record_types if (c.id, rt) not in chosen]
     return units + random.sample(spare, min(k - len(units), len(spare)))
+
+
+def _down_marked_types(connectors) -> dict:
+    """{connector id: [types paged down]} from their Redis markers, in one read.
+    Advisory only: unreadable -> {}, and the caller probes any type."""
+    pairs = [(c.id, rt) for c in connectors for rt in c.record_types]
+    if not pairs:
+        return {}
+    try:
+        r = _redis()
+        try:
+            values = r.mget([f"{_BAD_PREFIX}{cid}:{rt}" for cid, rt in pairs])
+        finally:
+            r.close()
+    except Exception as exc:  # noqa: BLE001 -- the canary must not depend on Redis
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
+        _logger.warning("Canary: down markers unreadable (%s); probing any type", type(exc).__name__)
+        return {}
+    marked: dict = {}
+    for (cid, rt), value in zip(pairs, values, strict=True):
+        if _text(value) in ("canary", _DOWN_UNSENT):
+            marked.setdefault(cid, []).append(rt)
+    return marked
 
 
 def _canary_check_impl() -> None:

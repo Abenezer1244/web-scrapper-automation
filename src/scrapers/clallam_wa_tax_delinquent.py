@@ -17,6 +17,7 @@ This is the foreclosure stage of delinquency, not the county's whole delinquent 
 (Clallam publishes no such roll). Verified 2026-11-12: 25 parcels on the 9/4 list,
 8 on the 11/6 list; a dropped parcel's page reads "There is currently No Amount Due".
 """
+import asyncio
 import re
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -45,6 +46,9 @@ for _url in (_LANDING_URL, _PORTAL):
 
 # A certificate older than this is not the current list (the county files one a year).
 _MAX_CERT_AGE_DAYS = 400
+# Waits between portal retries. Three tries 300 ms apart all met the same busy page and
+# took the connector down (2026-11-16); a busy page needs seconds to clear. Last one repeats.
+_RETRY_WAITS_S = (2.0, 5.0)
 # The portal prints today's date on a live page; older means a cached or stale page.
 _MAX_STATUS_AGE_DAYS = 3
 
@@ -332,7 +336,7 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
                                 pid, attempt, attempts, type(exc).__name__)
                 if attempt == attempts:
                     raise
-                await self.polite_delay()
+                await asyncio.sleep(_RETRY_WAITS_S[min(attempt, len(_RETRY_WAITS_S)) - 1])
         raise AssertionError("unreachable")
 
     async def __aenter__(self) -> "ClallamWATaxDelinquentScraper":

@@ -197,7 +197,21 @@ def _scraper(monkeypatch, retries: int = 3):
     from src.config import settings
     monkeypatch.setattr(settings, "POLITE_DELAY_MS", 0)
     monkeypatch.setattr(settings, "MAX_RETRIES", retries)
+    monkeypatch.setattr(m, "_RETRY_WAITS_S", (0.0,))
     return m, m.ClallamWATaxDelinquentScraper()
+
+
+def test_a_busy_portal_page_gets_seconds_to_clear_between_tries(monkeypatch):
+    """Three tries 300 ms apart all met the same busy page (canary down, 2026-11-16)."""
+    import asyncio
+    import time
+    m, s = _scraper(monkeypatch)
+    monkeypatch.setattr(m, "_RETRY_WAITS_S", (0.2, 0.4))
+    calls: list[str] = []
+    monkeypatch.setattr(m, "safe_get", _serve([_BUSY, _BUSY, _portal()], calls))
+    started = time.monotonic()
+    assert asyncio.run(s._portal_status("17038", 2026)) == parse_portal_status(_portal())
+    assert len(calls) == 3 and time.monotonic() - started >= 0.6
 
 
 def test_one_unreadable_portal_page_is_retried_and_logged_without_page_text(monkeypatch, caplog):

@@ -359,6 +359,60 @@ def test_a_priority_backlog_never_takes_the_routine_slots():
     assert len({c.id for c, _ in units if c in stuck}) == health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
 
 
+def _down(n, record_types=("probate",), hours_ago=1):
+    row = _row(n, record_types, status="down")
+    row.id = f"down-{uuid.uuid4().hex}"  # its own Redis marker keys
+    row.last_checked = datetime.now(UTC) - timedelta(hours=hours_ago)
+    return row
+
+
+def test_a_down_connector_is_probed_again_on_the_next_tick():
+    """Clallam tax_delinquent: one unreadable page took it down, hidden 30+ h waiting for the rotation."""
+    routine = [_row(i) for i in range(60)]
+    down = _down("d")
+    for _ in range(20):
+        assert (down, "probate") in health._canary_units([*routine, down])
+
+
+def test_the_type_paged_down_is_the_one_probed_again(redis_client):
+    down = _down("d", ("probate", "tax_delinquent"))
+    redis_client.set(health._bad_key(down, "tax_delinquent"), "canary")
+    try:
+        for _ in range(20):
+            units = health._canary_units([*(_row(i) for i in range(60)), down])
+            assert (down, "tax_delinquent") in units
+    finally:
+        redis_client.delete(health._bad_key(down, "tax_delinquent"))
+
+
+def test_unreadable_markers_still_probe_the_down_connector(monkeypatch):
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:1/15")  # nothing listens
+    down = _down("d")
+    assert (down, "probate") in health._canary_units([*(_row(i) for i in range(60)), down])
+
+
+def test_new_and_down_connectors_share_the_priority_slots_longest_unchecked_first():
+    """Codex: a down backlog must not starve a new connector, nor the other way round,
+    and neither takes the routine slots."""
+    new = [_row(f"n{i}", status="unknown", checked=False) for i in range(10)]
+    down = [_down(f"d{i}", hours_ago=i + 1) for i in range(10)]
+    units = health._canary_units([*new, *down, *(_row(i) for i in range(60))])
+    assert len(units) == health.CANARY_UNITS_PER_TICK
+    priority = health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
+    assert sum(c in new for c, _ in units) == priority - 1
+    assert [c for c, _ in units if c in down][:1] == [down[-1]]   # the longest unchecked
+    only_down = health._canary_units([*down, *(_row(i) for i in range(60))])
+    assert [c for c, _ in only_down[:priority]] == down[::-1][:priority]
+
+
+def test_a_down_connectors_other_types_stay_in_the_rotation():
+    down = _down("d", ("probate", "pre_foreclosure", "divorce"))
+    units = health._canary_units([down], k=100)
+    assert sorted(rt for _, rt in units) == ["divorce", "pre_foreclosure", "probate"]
+
+
 def test_no_pair_is_probed_twice_in_a_tick():
     rows = [_row(i, ("probate", "divorce"), status="unknown", checked=False) for i in range(2)]
     units = health._canary_units(rows, k=100)

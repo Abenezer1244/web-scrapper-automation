@@ -1582,7 +1582,7 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     return " ".join((found or "").split())[:512] or None
 
 
-_APN_SEPARATORS = frozenset({"&", "/", "+"})
+_APN_SEPARATOR_RE = re.compile(r"[&/+,;:]")
 _CHELAN_APN_RE = re.compile(r"\d{12}")
 
 
@@ -1618,10 +1618,11 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     legal = _DOC_LEGAL_RE.search(text)
     label = re.search(r"\bAPN\b", legal.group(1), re.I) if legal else None
     run: list[str] = []
-    for token in (legal.group(1)[label.end():].split() if label else []):
-        token = token.strip(",;:")
-        if not token or token in _APN_SEPARATORS or token.upper() == "AND":
-            continue  # "APN: 1 & 2", "APN 1, 2": separators inside the APN field
+    # Separators become spaces before splitting, wherever they sit ("&252104" too).
+    field = _APN_SEPARATOR_RE.sub(" ", legal.group(1)[label.end():]) if label else ""
+    for token in field.split():
+        if token.upper() == "AND":
+            continue  # "APN 1 AND 2"
         if not re.fullmatch(r"[\d-]+", token):
             break  # the first word ends the field ("NORTH ENTIAT LOT 2")
         run.append(token.replace("-", ""))

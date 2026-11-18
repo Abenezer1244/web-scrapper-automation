@@ -1484,7 +1484,9 @@ def stage_recorder_document(db, *, county: str, state: str, doc: dict, detail_ht
                       decision_note=str(out["reason"])[:500],
                       fields={"recording_apns": apns, "related_deeds_of_trust": dts})
 
-    stmt = pg_insert(Doc).values(id=str(uuid4()), **values)
+    # entry_name only on a new row: never in the update below, so a retry from a stored
+    # failure (no entry) cannot erase it (Codex).
+    stmt = pg_insert(Doc).values(id=str(uuid4()), entry_name=doc.get("entry"), **values)
     retryable = and_(Doc.status == "failed",
                      Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
     stmt = stmt.on_conflict_do_update(
@@ -1575,24 +1577,113 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     said 170 Hill Street; the assessor and the parcel layer give 62 Village Vista Ln for
     the same legal description). Network: call it OUTSIDE any transaction holding
     NTS_CANCEL_LOCK_KEY, and freeze what it returns (Codex): a lookup per scrape would let
-    a layer outage flip the address, and with it the lead's dedup hash, between runs."""
-    from src.scrapers.enrichment.county_gis import enrich_parcel_gis
+    a layer outage flip the address, and with it the lead's dedup hash, between runs.
 
-    found = enrich_parcel_gis(parcel, county, state).get("property_address")
+    The BATCH lookup pre-foreclosure enrichment runs, not the single one: the two differ
+    (the single one falls back to the statewide layer for a parcel the county matched
+    with no street, and for a 5-character Cowlitz parcel), and a different address for
+    the same parcel is a different lead identity, so a second charge (Codex, Cowlitz)."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    if not cg.settings.GIS_ENRICHMENT_ENABLED:
+        return None
+    found = (cg.batch_enrich_parcels_gis([parcel], county, state, mailing=False).get(parcel) or {}).get("property_address")
     return " ".join((found or "").split())[:512] or None
+
+
+def image_address_disagreement(printed: str, situs: str, city: str | None, zip_code: str | None) -> str | None:
+    """Why the address printed on a notice is not the county's site address for a parcel,
+    or None when they agree. Pure. Same street key (house number, street, directional);
+    and where both sides give one, the same unit, city and ZIP: a street key alone drops
+    units and ZIP, so a neighbouring parcel could pass (Codex High). A printed unit the
+    layer does not carry cannot be verified: refused. Known limit: two parcels sharing
+    one site address both agree; the parcel itself is the one the operator copies from
+    the image. The unit is exactly what the street
+    key strips (its own markers: APT, LOT, BLDG, TRLR, #...), so the two never drift."""
+    from src.utils.address_intel import (
+        _HASH_UNIT_RE,
+        _UNIT_STRIP_RE,
+        address_match_key,
+        parse_property_for_display,
+    )
+
+    def _unit(address: str) -> str | None:
+        # Both strips, in the street key's own order: the whole tail they remove, so
+        # "LOT 2 #4" and "LOT 3 #4" stay different (Codex).
+        street = " ".join((parse_property_for_display(address).get("street") or "").upper().split())
+        base = _UNIT_STRIP_RE.sub("", _HASH_UNIT_RE.sub("", street))
+        # "#" kept (only "# 4" -> "#4"): folding it would make "LOT 2 #4" equal "LOT 2 4".
+        tail = re.sub(r"#\s+", "#", " ".join(street[len(base):].split()))
+        return tail or None
+
+    want, have = address_match_key(printed), address_match_key(situs)
+    if not want or not have or want.split("|")[0] != have.split("|")[0]:
+        return "the street is not the same"
+    p_unit, l_unit = _unit(printed), _unit(situs)
+    if (p_unit or l_unit) and p_unit != l_unit:
+        return "the unit cannot be matched"
+    parsed = parse_property_for_display(printed)
+    if parsed.get("zip") and zip_code and parsed["zip"][:5] != str(zip_code)[:5]:
+        return "the ZIP code differs"
+    if parsed.get("city") and city and " ".join(parsed["city"].upper().split()) != " ".join(city.upper().split()):
+        return "the city differs"
+    return None
+
+
+def confirm_image_parcel(county: str, state: str, parcel: str, printed_address: str | None) -> dict:
+    """Evidence that a parcel printed on a notice image is that notice's property, for a
+    recording whose recorder index lists no parcel (Cowlitz 3798834, 3799365, 3799644).
+    Network: call before approval takes its lock; pass the result as ``image_parcel``.
+
+    A parcel the layer knows proves only that it exists, not that it is this property,
+    and a typo can hit a real neighbour (Codex High). So: the COUNTY layer only (no
+    statewide fallback), the exact parcel, and the county's site address for it must be
+    the printed address (same street key: house number, street, directional). A parcel
+    with no site address in the layer (vacant land) is refused: its legal description
+    would need checking by hand. Raises ReviewError; never returns a guess."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    cleaned = (parcel or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9-]+", cleaned):
+        raise ReviewError("the parcel must be letters, digits and hyphens as printed")
+    cleaned = cleaned.replace("-", "")  # the recorder drops them: 2-3292 is 23292
+    if len(cleaned) < cg.gis_min_parcel_len(county, state):
+        raise ReviewError("the parcel is shorter than any parcel in this county")
+    printed = " ".join((printed_address or "").split())
+    if not printed:
+        raise ReviewError("--address (as printed on the image) is required to confirm the parcel")
+    config = cg._effective_gis_config(f"{county.lower()}_{state.upper()}")
+    if not cg.settings.GIS_ENRICHMENT_ENABLED or not config:
+        raise ReviewError(f"no county parcel layer to confirm a {county} parcel against")
+    row = cg._batch_query_county([cleaned], config).get(cleaned) or {}
+    situs = " ".join((row.get("property_address") or "").split())[:512]
+    if not situs:
+        raise ReviewError(f"the county parcel layer has no site address for {cleaned}: "
+                          "confirm it against the legal description by hand, not here")
+    city, zip_code = row.get("property_city"), row.get("property_zip")
+    why = image_address_disagreement(printed, situs, city, zip_code)
+    if why:
+        raise ReviewError(f"the county's site address for {cleaned} ({situs}) is not the "
+                          f"address printed on the notice: {why}")
+    return {"county": county, "state": state, "parcel": cleaned, "situs": situs,
+            "city": city, "zip": zip_code, "printed": printed}
 
 
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
                               supersedes: str | None = None, independent: bool = False,
                               discontinued_by: str | None = None, not_discontinued: bool = False,
-                              situs: str | None = None, today=None) -> str:
+                              situs: str | None = None, image_parcel: dict | None = None,
+                              today=None) -> str:
     """The operator has compared the staged read with the recorded image: write the
     notice they confirmed. Returns the nts_notices id. Caller commits.
 
     ``values`` are what the reviewer read off the image: auction_date (date), parcel
     and grantor are required; auction_time, property_address, principal_owing (Decimal)
     with principal_owing_basis, trustee and beneficiary are optional. The parcel must be
-    one of the recording's own APNs. The grantor goes through the privacy gate into
+    one of the recording's own APNs, except for a recording whose index lists none: then
+    ``image_parcel`` (:func:`confirm_image_parcel`'s evidence, for this county and this
+    parcel) stands in, its site address becomes the property address, and the approval
+    records parcel_source 'notice_image'. The grantor goes through the privacy gate into
     nts_notices only, never into staging.
 
     A later notice for the same sale is linked EXPLICITLY (``supersedes``: the older
@@ -1633,8 +1724,28 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     today = today or datetime.now(UTC).date()
 
     parcel = (values.get("parcel") or "").strip()
-    if parcel not in (_recording_facts(doc)["recording_apns"] or []):
-        raise ReviewError("the parcel is not one of this recording's own APNs")
+    recording_apns = _recording_facts(doc)["recording_apns"] or []
+    parcel_source = "recording"
+    if image_parcel is not None:
+        # Rechecked under the lock: the evidence must be for this county and parcel, and
+        # the recording must still list no parcel of its own (Codex).
+        if recording_apns:
+            raise ReviewError("this recording lists its own APNs: use one of them, not the image")
+        printed_now = " ".join((values.get("property_address") or "").split())
+        if (image_parcel.get("county"), image_parcel.get("state")) != (doc.county, doc.state) \
+                or image_parcel.get("parcel") != parcel or not image_parcel.get("situs") \
+                or not printed_now or image_parcel.get("printed") != printed_now:
+            raise ReviewError("the parcel confirmation is not for this county, parcel and printed address")
+        # The agreement is checked again here, from the evidence, at the approval boundary.
+        why = image_address_disagreement(printed_now, image_parcel["situs"],
+                                         image_parcel.get("city"), image_parcel.get("zip"))
+        if why:
+            raise ReviewError(f"the printed address is not the parcel's site address: {why}")
+        situs, parcel_source = image_parcel["situs"], "notice_image"
+    elif parcel not in recording_apns:
+        raise ReviewError("the parcel is not one of this recording's own APNs"
+                          + ("" if recording_apns else
+                             " (it lists none: confirm one printed on the image with --parcel-from-image)"))
     auction = values.get("auction_date")
     if auction is None:
         raise ReviewError("a sale date is required")
@@ -1713,6 +1824,8 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         "principal_owing_basis": basis,
         "trustee": (values.get("trustee") or None), "beneficiary": (values.get("beneficiary") or None),
     }
+    if parcel_source != "recording":
+        approved["parcel_source"] = parcel_source
     payload = "|".join(str(v or "") for v in (doc.instrument_number, *approved.values()))
     now = datetime.now(UTC)
     _upsert_notice(db, NtsNotice, {
@@ -1930,7 +2043,9 @@ def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html:
             values.update(status="discontinuance", fields=fields,
                           decision_note="matches no approved notice yet (kept for later approvals)")
 
-    stmt = pg_insert(Doc).values(id=str(uuid4()), **values)
+    # entry_name only on a new row: never in the update below, so a retry from a stored
+    # failure (no entry) cannot erase it (Codex).
+    stmt = pg_insert(Doc).values(id=str(uuid4()), entry_name=doc.get("entry"), **values)
     retryable = and_(Doc.status == "failed", Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
     stmt = stmt.on_conflict_do_update(
         constraint="uq_nts_recorder_documents_county_item",
@@ -2212,6 +2327,61 @@ _COWLITZ_DOC_RESERVE_S = 60 + 120 + 180 + 5 + _COWLITZ_STAGE_RESERVE_S
 _COWLITZ_PACE_S = 3.0
 
 
+def relocate_recorder_entries(db, county: str, state: str, docs: list[dict]) -> int:
+    """Move staged rows to the recorder's current ids before anything is filtered or
+    staged, for a recorder whose ids are not stable (Cowlitz re-indexed 2026-11-17 and
+    every recording was staged twice). Returns the rows changed. Caller commits.
+
+    A row is found by its entry name; a row without one yet (staged before migration
+    170) is claimed by the id it still has, and given the name. Either way the row must
+    be the same recording (instrument, code, date), or this raises: the run fails loud
+    rather than bind one recording's decisions to another. Plain updates of the id and
+    the name only: status, fields and decisions are untouched, so no staging or
+    cancellation path runs again (Codex). An approved notice's published link moves
+    with it. Takes approval's lock first, so the two never lock rows in opposite orders
+    and an approval never publishes an id this is moving (Codex)."""
+    from sqlalchemy import select, update
+
+    from src.db.models import NtsNotice
+    from src.db.models import NtsRecorderDocument as Doc
+    from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
+
+    db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
+    prof = _profile(county, state)
+    now = datetime.now(UTC)
+    changed = 0
+    for d in docs:
+        entry, item = d.get("entry"), d.get("item_id")
+        if not entry or not item:
+            continue
+        row = db.execute(select(Doc).where(Doc.county == county, Doc.entry_name == entry)
+                         .with_for_update()).scalar_one_or_none()
+        holder = db.execute(select(Doc).where(Doc.county == county, Doc.transaction_item_id == item)
+                            .with_for_update()).scalar_one_or_none()
+        if row is None:
+            if holder is None or holder.entry_name == entry:
+                continue                      # a new recording: staged as usual
+            if holder.entry_name is not None:
+                raise ValueError(f"{county} id {item} is held by entry {holder.entry_name}, not {entry}")
+            row = holder
+        elif holder is not None and holder.id != row.id:
+            raise ValueError(f"{county} entry {entry}: id {item} is held by another row")
+        same = (row.instrument_number, row.doc_code, row.record_date.strftime("%m/%d/%Y")) == (
+            d["instrument"], d["doc_code"], d["record_date"])
+        if not same:
+            raise ValueError(f"{county} entry {entry} (id {item}) is not the staged recording "
+                             f"{row.instrument_number} {row.doc_code}")
+        if row.entry_name != entry or row.transaction_item_id != item:
+            if row.transaction_item_id != item and row.nts_notice_id is not None:
+                # The notice THIS row was approved into: by its link, never by instrument,
+                # which a second entry under the same recording shares (Codex).
+                db.execute(update(NtsNotice).where(NtsNotice.id == row.nts_notice_id)
+                           .values(source_url=prof["url"](item)))
+            row.entry_name, row.transaction_item_id, row.updated_at = entry, item, now
+            changed += 1
+    return changed
+
+
 def _cowlitz_doc_url(item_id: str) -> str:
     return _RECORDER_PROFILES[("cowlitz", "WA")]["url"](item_id)
 
@@ -2258,21 +2428,6 @@ def crawl_nts_cowlitz_recorder() -> dict:
         with system_sync_session() as db:
             summary["expired"] = purge_stale_recorder_documents(db)
             db.commit()
-            retry = and_(Doc.status == "failed",
-                         Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
-            settled = {r[0] for r in db.execute(
-                select(Doc.transaction_item_id).where(Doc.county == "cowlitz", ~retry))}
-            # A failed notice is retried even once it is outside the window, from what
-            # staging kept of its recording (its parcels and related numbers).
-            stored_failures = [
-                {"item_id": r.transaction_item_id, "instrument": r.instrument_number,
-                 "doc_code": r.doc_code, "record_date": r.record_date.strftime("%m/%d/%Y"),
-                 "recording_apns": (r.fields or {}).get("recording_apns") or [],
-                 "related": (r.fields or {}).get("related_deeds_of_trust") or [],
-                 "href": _cowlitz_doc_url(r.transaction_item_id)}
-                for r in db.execute(select(Doc).where(Doc.county == "cowlitz", retry,
-                                                      Doc.doc_code != "NOD")
-                                    .order_by(Doc.updated_at)).scalars()]
             last_read = (get_source_state(db, nts_crawl_heartbeat_key("cowlitz")) or {}).get("last_success_at")
 
         today = datetime.now(UTC).date()
@@ -2282,6 +2437,38 @@ def crawl_nts_cowlitz_recorder() -> dict:
         # Past the reach limit the gap is not read at all: never call the cache fresh,
         # and say so every run until an operator backfills it (Codex 3b r2 P1).
         gap = recorder_gap_beyond_reach(today, last_read)
+
+        def _relocate_and_snapshot(docs: list[dict]) -> tuple[set[str], list[dict]]:
+            """Rows moved to the live ids (committed), then what is settled and what is
+            to retry, read AFTER the move (Codex): before it, a re-index would make
+            every recording look new and every stored failure point at a dead id."""
+            with system_sync_session() as db:
+                try:
+                    moved = relocate_recorder_entries(db, "cowlitz", "WA", docs)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                if moved:
+                    _logger.info("Cowlitz NTS: %d staged recording(s) moved to the recorder's current ids", moved)
+                retry = and_(Doc.status == "failed",
+                             Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
+                settled = {r[0] for r in db.execute(
+                    select(Doc.transaction_item_id).where(Doc.county == "cowlitz", ~retry))}
+                # A failed notice is retried even once it is outside the window, from what
+                # staging kept of its recording (its parcels and related numbers). One out
+                # of the window after a re-index keeps a dead id and fails loudly.
+                stored = [
+                    {"item_id": r.transaction_item_id, "entry": r.entry_name,
+                     "instrument": r.instrument_number,
+                     "doc_code": r.doc_code, "record_date": r.record_date.strftime("%m/%d/%Y"),
+                     "recording_apns": (r.fields or {}).get("recording_apns") or [],
+                     "related": (r.fields or {}).get("related_deeds_of_trust") or [],
+                     "href": _cowlitz_doc_url(r.transaction_item_id)}
+                    for r in db.execute(select(Doc).where(Doc.county == "cowlitz", retry,
+                                                          Doc.doc_code != "NOD")
+                                        .order_by(Doc.updated_at)).scalars()]
+                return settled, stored
 
         def _stage_one(doc: dict, pdf: bytes | None) -> str:
             """OCR and stage one recording right after it is read (sync, in a thread)."""
@@ -2315,6 +2502,7 @@ def crawl_nts_cowlitz_recorder() -> dict:
                 valid = [d for d in docs if _ITEM_ID_RE.fullmatch(d.get("item_id") or "")]
                 summary["discovered"] = len(docs)
                 summary["invalid"] = len(docs) - len(valid)
+                settled, stored_failures = await asyncio.to_thread(_relocate_and_snapshot, valid)
                 fresh = [d for d in valid if d["item_id"] not in settled]
                 summary["kept"] = len(valid) - len(fresh)
                 retries = [d for d in stored_failures if _ITEM_ID_RE.fullmatch(d["item_id"])]

@@ -151,8 +151,10 @@ _MARKED_UNIT_RE = re.compile(
 )
 
 
-# A dot between digits is part of the number ("12.5 MAIN" is not "12 5 MAIN", Codex).
-_DIGIT_DOT_RE = re.compile(r"(?<=\d)\.(?=\d)")
+# A dot right after a digit stays with the number in every comparison path: "12.5 MAIN"
+# is not "12 5 MAIN" and "12 - 22. ND AVE" is not "12 - 22 ND AVE" (Codex). Dots after
+# letters ("AVE.", "S.W.", "ST. JOHN") are abbreviations and are still dropped.
+_DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 
 
 def _compare_street(street: str | None) -> str:

@@ -19,6 +19,60 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-17 — Asotin lis pendens through the CAPTCHA-gated recorder (branch `feat/asotin-helion-recorder`)
+
+**Built / Shipped:**
+- `src/scrapers/asotin_wa_recorder.py` (AsotinWARecorderScraper) reads Asotin's recorder, which
+  runs on Helion's Digital Research Room. The disclaimer's reCAPTCHA v2 is solved through the
+  existing 2Captcha helper, with a fresh token per session (`captcha.forget_token`); the owner
+  approved this route on 2026-11-16.
+- Migration 169 adds one INACTIVE `pre_foreclosure` connector. The legacy scraper-less Asotin
+  row is untouched.
+- `health.py`: a scraper declaring `CANARY_ACCEPTS_VALIDATED_EMPTY` is healthy on an empty week,
+  with no history probe.
+
+**Tried / Decided:**
+- Probes (4 solves) measured the volumes. Decree Dis: 0 in 2025 and 2026, so divorce is
+  dropped. Lis Penden: ~2 a year. Death certificates: ~2 a month, none with a parcel.
+- 7 real death certificates went through the estate-marked parcel rule and gave 0 leads; 6 of
+  the deceased own no Asotin parcel by name. The owner chose lis pendens only, and death
+  certificates stay unwired.
+- A lis pendens is delivered as LIS PENDENS, not as a foreclosure. One lead per printed parcel;
+  SEE ATTACHED is held.
+
+**Failed / Blocked:**
+- The portal rate-limits ("Too Many Requests"). My probe sessions got the laptop IP blocked for
+  hours.
+- A single-result search skips the list and opens `/Document/Details`. Both were found only on
+  live runs, and the fail-loud checks caught both before any zero was reported.
+
+**Caught & fixed:**
+- Codex Phase 1 NO-GO:
+  - `chunk_windows` returns nothing for a same-day request and overlaps window edges.
+  - Stacked parties were joined with `"; "`, which the orientation helper does not split.
+  - Paging checked offsets, not content.
+- Codex Phase 2 NO-GO:
+  - A details page must be this search's own redirect, and its URL must name the instrument.
+  - A block page carrying the empty-results text could pass as a "validated empty".
+- Probe slip: a doc-type summary printed party names from public records into the session
+  output. No names reached the code, fixtures, logs or docs; the tests use synthetic names.
+
+**Pending / Handoff:**
+- The owner switches the connector on.
+- Death certificates need a different matching source to be worth wiring.
+- One live lead has a 15-digit parcel.
+
+**Facts learned:**
+- Asotin Helion:
+  - the sitekey (read from the page at run time);
+  - one solve unlocks the session;
+  - `type=date` inputs take ISO dates;
+  - `Filter_DocumentSubtype` filters server-side (Lis Penden=39, DEATH CERTIFICATE=109,
+    Decree Dis=21);
+  - empty results show "No matching results found", and the form echoes the search.
+
+---
+
 ## 2026-11-16 — Clallam integrity: no-address leads leaked unbilled; hold, late billing, 45-row backfill
 
 **Built / Shipped:** branch `fix/clallam-cross-scraper-data-integrity` (PR pending owner merge). Plan and
@@ -66,6 +120,8 @@ dry-run report: `tasks/todo.md` ("Clallam cross-scraper integrity").
   delivery" must be frozen with the run or it drifts.
 - `mailing_recovery_last_at` / `property_recovery_last_at` vs `jobs.billing_applied_at` tell whether an
   address existed when the run was billed.
+
+---
 
 ## 2026-11-15 — Cowlitz County: repaired recorder, death certificates, auction leads, tax (branch, unmerged)
 

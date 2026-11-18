@@ -43,7 +43,11 @@ _ALLOWED_SCRAPER_MODULES = frozenset([
     "src.scrapers.clallam_wa_tax_delinquent",
     "src.scrapers.asotin_wa_tax_delinquent",
     "src.scrapers.columbia_wa_tax_delinquent",
+    "src.scrapers.cowlitz_wa_tax_delinquent",
     "src.scrapers.asotin_wa_probate",
+    "src.scrapers.asotin_wa_recorder",
+    "src.scrapers.ferry_wa_tax_delinquent",
+    "src.scrapers.ferry_wa_court_index",
     "src.scrapers.trustee_sale",
     "src.scrapers.base_scraper",
 ])

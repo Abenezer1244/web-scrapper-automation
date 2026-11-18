@@ -19,6 +19,283 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-17 — Asotin lis pendens through the CAPTCHA-gated recorder (branch `feat/asotin-helion-recorder`)
+
+**Built / Shipped:**
+- `src/scrapers/asotin_wa_recorder.py` (AsotinWARecorderScraper) reads Asotin's recorder, which
+  runs on Helion's Digital Research Room. The disclaimer's reCAPTCHA v2 is solved through the
+  existing 2Captcha helper, with a fresh token per session (`captcha.forget_token`); the owner
+  approved this route on 2026-11-16.
+- Migration 169 adds one INACTIVE `pre_foreclosure` connector. The legacy scraper-less Asotin
+  row is untouched.
+- `health.py`: a scraper declaring `CANARY_ACCEPTS_VALIDATED_EMPTY` is healthy on an empty week,
+  with no history probe.
+
+**Tried / Decided:**
+- Probes (4 solves) measured the volumes. Decree Dis: 0 in 2025 and 2026, so divorce is
+  dropped. Lis Penden: ~2 a year. Death certificates: ~2 a month, none with a parcel.
+- 7 real death certificates went through the estate-marked parcel rule and gave 0 leads; 6 of
+  the deceased own no Asotin parcel by name. The owner chose lis pendens only, and death
+  certificates stay unwired.
+- A lis pendens is delivered as LIS PENDENS, not as a foreclosure. One lead per printed parcel;
+  SEE ATTACHED is held.
+
+**Failed / Blocked:**
+- The portal rate-limits ("Too Many Requests"). My probe sessions got the laptop IP blocked for
+  hours.
+- A single-result search skips the list and opens `/Document/Details`. Both were found only on
+  live runs, and the fail-loud checks caught both before any zero was reported.
+
+**Caught & fixed:**
+- Codex Phase 1 NO-GO:
+  - `chunk_windows` returns nothing for a same-day request and overlaps window edges.
+  - Stacked parties were joined with `"; "`, which the orientation helper does not split.
+  - Paging checked offsets, not content.
+- Codex Phase 2 NO-GO:
+  - A details page must be this search's own redirect, and its URL must name the instrument.
+  - A block page carrying the empty-results text could pass as a "validated empty".
+- Probe slip: a doc-type summary printed party names from public records into the session
+  output. No names reached the code, fixtures, logs or docs; the tests use synthetic names.
+
+**Pending / Handoff:**
+- The owner switches the connector on.
+- Death certificates need a different matching source to be worth wiring.
+- One live lead has a 15-digit parcel.
+
+**Facts learned:**
+- Asotin Helion:
+  - the sitekey (read from the page at run time);
+  - one solve unlocks the session;
+  - `type=date` inputs take ISO dates;
+  - `Filter_DocumentSubtype` filters server-side (Lis Penden=39, DEATH CERTIFICATE=109,
+    Decree Dis=21);
+  - empty results show "No matching results found", and the form echoes the search.
+
+---
+
+## 2026-11-15 — Cowlitz County: repaired recorder, death certificates, auction leads, tax (branch, unmerged)
+
+**Built / Shipped:** branch `feat/cowlitz-wa-seven-record-types` (not pushed). Plan, matrix and review:
+`tasks/cowlitz-wa-seven.md`.
+- `0799c118`: the Laserfiche template reads one day per search and fails unless captured rows equal the
+  portal's count. It reads each kept document's properties table, holds multi-parcel recordings as
+  ambiguous, and takes an NTS borrower from the grantees. `gis_min_parcel_len()` (Cowlitz 5) now drives
+  every generic GIS gate.
+- `b737a3de`: death_certificate split from probate (migration now 164). Agency regex accepts "DEPARMENT".
+- `10c27137`: the OCR child accepts Laserfiche's CCITT Group 4 PDF, wrapped as TIFF; the drawing grammar
+  uses PDF tokens.
+- `6d1d6304`: the recorded-NTS review pipeline is per county. Cowlitz discovery, PDF fetch and crawl.
+- `d840718f`: Cowlitz trustee_sale reader, matcher county and beat; connector inactive (now 165).
+- `60dc1370`, `8bce696e`: Cowlitz tax_delinquent from the Treasurer's live foreclosure listing;
+  connector inactive (now 166).
+- `a0222a63`: merged origin/main (head 163); Cowlitz migrations renumbered 164-166.
+
+**Tried / Decided:**
+- Bisecting short windows was the first fix for the partial capture. It was too slow: 8-day windows
+  were still short (339 of 399), so the scraper now searches one day at a time.
+- The DocView plain-text view returns nothing, and Laserfiche PDFs have no text layer, so auction leads
+  need OCR. The existing pipeline (operator approves every notice) was reused rather than building a
+  second one.
+- Tesseract `--psm 6` reads the two-column sale-date line whole. It is used for the Laserfiche shape only.
+- Tax: Cowlitz has no per-parcel account source we may use (its property app carries an RCW
+  42.56.070(9) acknowledgement), so the Treasurer's re-issued listing is the status. Each holder is
+  confirmed against the Assessor's deed holder.
+
+**Failed / Blocked:**
+- divorce and court probate: Odyssey is a paid clerk subscription, plus GR 31.
+- code_violation: no public case index for the county or Longview, Kelso, Castle Rock, Kalama or Woodland.
+- My first full-suite run was invalid: `-p no:logging` disables `caplog`.
+- Bash heredocs twice wrote literal NUL or backspace bytes where `\x00` and `\b` were meant. Edit
+  scripts now go in a file.
+- The first Codex final review used a stale base: main had added migrations 162 and 163.
+
+**Caught & fixed:**
+- Production baseline: the template silently kept 1,068 of 1,428 rows. 27 of 27 short-parcel leads
+  had no address. One probate lead names the State agency as decedent.
+- The grid shows only the first grantee and parcel. The old code also named an attorney trustee as the
+  borrower.
+- Codex findings fixed, each with tests:
+  - the worker's own 6-character GIS gate;
+  - an incomplete DocView read accepted as complete;
+  - hyphenated surnames grouped together;
+  - a resource-name comment trick in the PDF drawing grammar;
+  - false-fresh crawls from deferred retries (Chelan had it too);
+  - the PDF size cap only checked after download;
+  - a null tax year rejected by the validator;
+  - a tentative sale date treated as final;
+  - an owner name mis-split by the parser.
+
+**Pending / Handoff:**
+- Owner approval for push, merge and deploy.
+- Prerequisites to check at deploy: alembic 166, recorder row plus death_certificate, 165/166 inactive,
+  Chromium and Tesseract in the worker image.
+- Watch the first Cowlitz NTS crawl and review its notices before activating 165.
+- Expose the minimum-bid basis before activating 166, and do it before 12/7/2026.
+- Production recovery of 27 short-parcel leads and 1 agency-as-party lead.
+- Playwright UI QA after deploy.
+- Chelan's silent 60-day reach clamp.
+
+**Facts learned:**
+- Cowlitz Laserfiche: AFNs are sequential, and a -1 suffix marks a second entry under one recording.
+- The DocView properties table renders one empty placeholder row per field.
+- Codes: NTTRUS for an NTS, DISTRS for a discontinuance. Related AFN means the deed of trust for an NTS,
+  and the NTS and/or deed of trust for a discontinuance.
+- PDFs come from `/WLAUDPublic/PDF10/<guid>/<docid>`, bound to the session cookie.
+- The Cowlitz GIS layer's TAX_STATUS is blank on every parcel.
+## 2026-11-15 — Ferry County: tax_delinquent + court-index probate/divorce (all connectors inactive)
+
+**Built / Shipped:** branch `feat/ferry-wa-seven-record-types` (local, not pushed). `taxsifter.resolve_tax`
+reads each parcel's TaxSifter Treasurer page (5-year statements, Balance Due) through the Whitman parcel pass,
+now shared as `_parcel_pass`; `FerryWATaxDelinquentScraper` reads `pacs_tax_status` with Asotin's contract plus
+a 14-day source-date gate and fail-on-held. `sources/wa_digital_archives.py` reads the WA State Archives Superior
+Court docket index (17 counties; Ferry title 3007) and `ferry_wa_court_index.py` classifies probate (open "ESTATE
+OF") and divorce (petition for dissolution). Migration 163 seeds three Ferry connectors, fixed ids, inactive.
+**Tried / Decided:** Auditor has no online recorder index and its request form pledges no commercial use of lists,
+so pre_foreclosure/trustee_sale/death_certificate have no route; code_violation has no case data. wapublicnotices
+bans scraping; Ferry County View has no online legal notices. Court index: GR 31(g)(4) bars commercial
+solicitation from bulk court records -> built at owner request but nothing is ever delivered (every run raises,
+held count or "not a verified zero"). Ferry is wired into `pacs_tax_crawler` but NOT scheduled until the owner
+approves the first broad crawl.
+**Failed / Blocked:** Archives ResultsTable answers HTTP 500 outside the browser flow (Playwright required, ~20 s
+per search). A live divorce run raised drift on one unrecognised results page. Prod read-only connector check and
+the Gmail outreach drafts were not possible in-session (permission classifier; connector re-auth).
+**Caught & fixed:** fixture `__VIEWSTATE` decoded to the real owner/address (amended before any push); malformed
+statement rows and personal-property rows could become false zeros; case-history lookups could become false
+zeros; "MOTION ... CLOSING ESTATE" read as closed; a stray backspace byte in a regex; migration downgrade scope;
+Review C: crawl would start on deploy, freshness by fetch time only, rural parcels silently dropped, court zeros
+called verified, inventory not count-reconciled (now checked against the layer's count, Asotin 13,612 live).
+**Pending / Handoff:** owner: first broad Ferry tax crawl, rural no-situs delivery rule, Reservation tenure rule,
+counsel on GR 31, send the two outreach emails (texts in `tasks/ferry-wa-seven.md`), push/PR.
+**Facts learned:** Ferry parcels are 14-digit; statewide layer FIPS 019 = 9,195 parcels; ~58% sampled lack a situs.
+Archives: pages are 1-based and clamp; one-page answers carry no pager; newest Ferry case opening Nov 2025.
+## 2026-11-16 — Chelan notices take the parcel's current address (#650); follow-up tests
+
+**Built / Shipped:**
+- **#650** (`6475d4e1`, deployed; prod alembic 164). The 2026-11-15 entry listed this as pending.
+  - Migration 164: `nts_notices.address_source` (`assessor_situs` | `notice`) and `address_on_notice`.
+  - `approve` looks up the parcel's site address (`lookup_parcel_situs`, via `enrich_parcel_gis`, the same form pre-foreclosure enrichment stores) before taking the lock, and freezes it on the notice. `--keep-notice-address` opts out.
+  - `refresh-address` does the same for notices approved earlier. It is refused once the notice has been delivered as a trustee-sale lead, or while a trustee-sale run in its county is unfinished.
+  - `_TrusteeSaleScraper.scrape` reads notices under `NTS_CANCEL_LOCK_KEY`, shared.
+- **REC-2628915** refreshed in production: `170 HILL STREET` became `62 VILLAGE VISTA LN MANSON, WA 98831`, the same as the parcel's pre-foreclosure lead. The printed address is kept in `address_on_notice`. No customer had a Chelan trustee-sale scraper configuration, and `refresh-address`'s own check found no delivered trustee-sale lead for the notice, so nothing had gone out with the old address.
+- **Frontend #329** (`93c6b09b`, live): the Dependabot critical and highs are cleared.
+- **This PR:** two tests for gaps Codex left open.
+  - `tests/test_stale_doc_type_worker.py` runs the real `run_scrape_job` on a stale selection. The job fails with the customer copy, is not re-queued, nothing is billed or held, and it is reported once.
+  - `tests/test_nts_refresh_concurrency.py` runs two real sessions: a trustee-sale read during an uncommitted refresh waits and then sees the new address, and the scraper's shared lock is released once its read is done.
+  - Each test was shown to fail with the code it guards disabled. The race test watches `pg_locks` for the reader's queued lock rather than sleeping.
+
+**Tried / Decided:**
+- Codex chose an approval-time, frozen address over a scrape-time lookup: a layer outage would otherwise flip a lead's `dedup_hash` between runs and bill twice.
+- Codex chose a guarded refresh command over silently rewriting delivered leads.
+
+**Failed / Blocked:**
+- Main gained Columbia's migration 163 while #650 was in review; ours was renumbered to 164.
+- The permission classifier refused `git push`, `gh pr merge --auto` and an amended commit pushed together. The owner ran those. A short SHA was rejected by `--match-head-commit`; the full SHA is required.
+- #650's Test job took 45 minutes, against about 31 before.
+
+**Caught & fixed:**
+- **Codex review of #650, NO-GO twice:**
+  - A refresh could commit while a trustee-sale run held the old address.
+  - A run starting after the refresh's active-job check could still read the old address. Fixed by the scraper's shared lock.
+
+**Pending / Handoff:**
+- **Chelan review queue:** newly staged recordings still need operator approval or rejection.
+- **Dev-only dependency alerts:** 12 remain, waiting on typescript-eslint and ts-morph; deepmerge has no fix.
+
+**Facts learned:**
+- A trustee's "more commonly known as" address can be years stale. The parcel and legal description are the reliable identity.
+- The trustee-sale scraper's freshness and cancellation guarantees now include the shared cancellation lock on its notice read; Benton cancellations and refreshes can briefly delay it.
+
+---
+
+## 2026-11-16 — Asotin parcel-layer query: letters only (branch `fix/asotin-arcgis-letters-only`)
+
+**Built / Shipped:** `src/scrapers/enrichment/asotin_parcels.py` `surname_where()`. The where clause now
+searches the surname's longest A-Z letter run only (O'BRIEN -> BRIEN, SMITH-JONES -> SMITH), so nothing
+else from a notice reaches it. This closes the post-deploy review's ArcGIS Medium; Codex says GO and
+the Medium resolved.
+
+**Tried / Decided:**
+- Service-side parameters were tried first. The hosted layer's `displayField` is NAME, but it ignores
+  ArcGIS's `text` parameter: `where=1=1&text=SMITH` returned all 13,651 parcels against 89 for the
+  LIKE, and `text` alone is rejected.
+- Downloading the whole layer was rejected: the cost per run, and keeping every owner name in the
+  county.
+- A broader LIKE only adds candidates, and `match_estate` keeps exact name matches.
+
+**Caught & fixed:** the old check used `re.match` with `$`, which in Python also accepts a trailing
+newline, so "SMITH\n" passed. It now uses `fullmatch` on both the surname and the letter run, checked at
+runtime rather than with `assert`.
+
+**Pending / Handoff:** a short letter run, such as NG, can exceed the 1,000-row page. That is still a
+failed lookup (`LayerError`), never a short list.
+
+---
+
+## 2026-11-15 — Benton death-certificate parcels from the recording cover sheet (#642, FE #327, #647)
+
+**Built / Shipped:** Run `f1277c60` (Benton death_certificate, 10/15–11/14) had 6 of 11 records with no
+address. The probate run returned the same 11 Cert Of Death documents.
+- **Cause.** Benton's EagleWeb index truncates (`Parcel: 1079810...`) or omits the parcel, but the recorded
+  PDF's page-1 cover sheet prints it on the line after its label.
+- **#642 (`8022556b`).** `recording_cover_sheet.read_cover_sheet_parcel` returns found, none, unreadable or
+  ambiguous. Outcomes go in `recording_apn_lookup`, so only `none` may use the owner-name fallback.
+  - Benton probate and death_certificate read the cover sheet.
+  - `probate` strips "STATE OF WA, DEPTH OF HEALTH" (a county typo) and "STATE OF WA, DSHS".
+  - PACS probate and death leads record `assessor_current_owner` and `title_status`, display-only as on
+    King's path.
+- **FE #327 (`45e34fe9`).** No-address reasons: "No parcel in the record", "Parcel unreadable", "Parcel needs
+  review".
+- **#647 (`e3292a08`).** The mailing-recovery sweep writes the same owner keys.
+- **Recovery run `c5c0e51e`** (rolling 90 days, 34 records): Lamborn, Hay, Pearson and Macias are new leads.
+  Murray is "none" (blank in the source); Campbell is "unreadable" (handwriting).
+- **Data fix.** Four one-row owner writes on that run, because their mailing addresses were filled before
+  #647 deployed. Only Lamborn is flagged `current_owner_name_differs`: a title company recorded the
+  certificate for a sale, and an unrelated buyer owns the parcel now.
+
+**Tried / Decided:**
+- **Owner-differs leads are flagged, not held.** Owner decision: flag (display-only) rather than hold, because
+  heirs with another surname are valid sellers and the assessor lags.
+- **No production rows were rewritten for the parcels.** The recovery is a fresh run; old rows stay as
+  history.
+- **Probate's overlap with death certificates is left as is.** Billing dedup is per property.
+- **Kept out of the integration test:** real death-certificate PDFs carry sensitive details, so the tests
+  use verbatim cover-sheet field excerpts only.
+
+**Failed / Blocked:**
+- **Recovery run killed by a deploy.** Another session's merge redeployed the worker at 22:02. The watchdog
+  re-queued the run after a 15-minute stale heartbeat.
+  - **Fix proposed, not applied:** `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=3900` on the worker. Railway's
+    default is 0 s between SIGTERM and SIGKILL, and Celery is exec'd, so its warm shutdown would finish
+    running scrapes. The classifier blocked the variable change, so the owner must set it.
+- **Unexpected stash pop.** A `git stash pop` tried to pop another worktree's stash (the stash list is
+  shared). It refused, and nothing was lost. Don't use stash in shared worktrees.
+
+**Caught & fixed:** Codex on #642:
+- **Consult.** P1 name-lookup leak (fixed by reusing the `recording_apn_lookup` gate); P1 a cover-sheet
+  parcel does not prove ownership (led to the owner flag).
+- **Round 1, GATE FAIL.** P1 prefix bypass, P1 multi-parcel accepted as one, P2 glued tokens, P2 permanent
+  document failures poisoning runs, P2 page-1-only read.
+- **Round 2.** P1 field truncation after 3 lines.
+- **Round 3.** GATE PASS.
+- **Frontend.** The ambiguous wording claimed more than the outcome means; broadened.
+- **Live run.** Found the #647 gap: the recovery sweep wrote no owner.
+
+**Pending / Handoff:**
+- Set the worker drain window (above).
+- Kitsap probate: 41 of 80 rows have parcels, but none was enriched (all from one Oct 12 run, no lookup
+  markers). Needs one fresh Kitsap probate run to see whether current code enriches them.
+- Grant, Okanogan and Island probate: their indexes carry no parcel or legal description.
+- The 20:14 Chelan failure was a stale doc-type selection, already fixed by #644.
+
+**Facts learned:**
+- Benton recording cover sheets put the parcel on the line after its label. Handwritten values come through
+  the text layer as noise.
+- `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` defaults to 0.
+- Most PACS mailing addresses arrive via the recovery sweep, not inline, so per-row extras must be written
+  in both places.
+
+---
+
 ## 2026-11-15 — Probate representatives in deletion, and a guarded Current Owner (branch `fix/probate-rep-erasure-owner`)
 
 **Built / Shipped:**

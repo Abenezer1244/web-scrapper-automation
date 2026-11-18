@@ -20,6 +20,12 @@ _token_cache: dict[_CacheKey, tuple[str, float]] = {}
 _TOKEN_TTL = 100  # seconds (tokens valid ~2 min, use 100s to be safe)
 
 
+def forget_token(site_url: str, sitekey: str, *, enterprise: bool = False) -> None:
+    """Drop the cached token for this page: a token is single-use once a form has been
+    submitted with it, so a caller that submits one must not hand it to the next session."""
+    _token_cache.pop((sitekey, site_url, enterprise), None)
+
+
 async def solve_recaptcha(site_url: str, sitekey: str, *, enterprise: bool = False) -> str | None:
     """Solve a reCAPTCHA challenge and return the token.
 

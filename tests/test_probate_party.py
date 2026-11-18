@@ -20,6 +20,18 @@ def test_strip_dept_of_health_with_state_prefix():
     assert strip_filing_agency("STATE OF WASHINGTON DEPARTMENT OF HEALTH") == ""
 
 
+def test_strip_cowlitz_misspelled_deparment_of_health():
+    # The Cowlitz recorder's own spelling (live 2026-11-15); it used to become the party.
+    assert strip_filing_agency("STATE OF WASHINGTON DEPARMENT OF HEALTH") == ""
+    assert orient_probate_party(
+        "STATE OF WASHINGTON DEPARMENT OF HEALTH", "SAMPLE DECEDENT W", "Death Certificate"
+    )[0] == "SAMPLE DECEDENT W"
+
+
+def test_a_surname_near_deparment_is_not_stripped():
+    assert strip_filing_agency("DEPARMENT JOHN") == "DEPARMENT JOHN"
+
+
 def test_strip_dept_of_health_state_first():
     assert strip_filing_agency("WASHINGTON STATE DEPARTMENT OF HEALTH") == ""
 

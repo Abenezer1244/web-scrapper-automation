@@ -606,6 +606,13 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> tuple[str,
         if records:
             connector.health_status = "healthy"
             mark = ("ok", f"{len(records)} records in the last 7 days")
+        elif getattr(scraper_class, "CANARY_ACCEPTS_VALIDATED_EMPTY", False):
+            # The scraper proves an empty answer is the very search it asked for and
+            # raises on anything else (a sparse source: Asotin's ~2 lis pendens a year),
+            # so an empty week is a verified zero. Healthy from any status, no history
+            # probe; a failure still takes the DOWN path below.
+            connector.health_status = "healthy"
+            mark = ("ok", "validated empty search")
         elif record_type in _NO_ZERO_OUTPUT_DOWNGRADE and prev_status == "healthy":
             pass  # see _NO_ZERO_OUTPUT_DOWNGRADE
         else:

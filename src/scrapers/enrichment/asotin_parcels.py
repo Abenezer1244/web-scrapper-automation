@@ -36,7 +36,9 @@ LAYER_URL = ("https://services6.arcgis.com/VsJGTl1jmCYBc0EX/arcgis/rest/services
              "/Parcels/FeatureServer/0/query")
 OUT_FIELDS = ("PARCEL_ID", "Prop_ID", "NAME", "BILLING1", "BILLING2", "CITY", "ST", "ZIP",
               "FULL_ADD", "SITE_CITY", "SITE_ZIP")
-_PAGE = 1000  # the layer's maxRecordCount is 2000; a surname never comes close
+# The layer's maxRecordCount is 2000. A surname rarely comes close; a short letter run
+# (surname_where) can, and then the answer is truncated and the lookup fails (LayerError).
+_PAGE = 1000
 
 _SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV"})
 # Words that end the person part of an owner segment ("SMITH, JOHN A ESTATE C/O ...").
@@ -56,7 +58,9 @@ _ORG_WORDS = frozenset({"TRUST", "TRST", "TRUSTEE", "TRUSTEES", "ESTATE", "FAMIL
                         "REVOCABLE", "IRREVOCABLE", "PARTNERSHIP", "HEIRS"})
 _TEXT_FIELDS = ("PARCEL_ID", "NAME", "BILLING1", "BILLING2", "CITY", "ST", "ZIP", "FULL_ADD",
                 "SITE_CITY", "SITE_ZIP")
-_SAFE_SURNAME = re.compile(r"^[A-Z][A-Z'\-]{1,40}$")
+_SAFE_SURNAME = re.compile(r"[A-Z][A-Z'\-]{1,40}")       # fullmatch only
+_LETTER_RUN = re.compile(r"[A-Z]+")
+_SAFE_TOKEN = re.compile(r"[A-Z]{2,41}")                  # fullmatch only
 _ADDR_WORDS = {
     "STREET": "ST", "AVENUE": "AVE", "AV": "AVE", "DRIVE": "DR", "ROAD": "RD",
     "BOULEVARD": "BLVD", "COURT": "CT", "LANE": "LN", "PLACE": "PL", "CIRCLE": "CIR",
@@ -389,16 +393,31 @@ def parse_layer_response(data: object) -> list[dict]:
     return rows
 
 
+def surname_where(surname: str) -> str:
+    """The layer's where clause for ``surname``: NAME contains its longest letter run.
+
+    The hosted layer takes no query parameters (its ``text`` parameter is ignored), so
+    the clause is built here, from A-Z letters only: no quote, hyphen or anything else
+    from the notice ever reaches it. O'BRIEN asks for BRIEN and SMITH-JONES for SMITH
+    (the first of equal runs); both still return every O'BRIEN / SMITH-JONES parcel,
+    and the caller keeps exact name matches only. ValueError for anything else."""
+    surname = surname.upper()
+    if not _SAFE_SURNAME.fullmatch(surname):
+        raise ValueError("surname is not a plain name")
+    token = max(_LETTER_RUN.findall(surname), key=len)   # max keeps the first of a tie
+    if not _SAFE_TOKEN.fullmatch(token):
+        raise ValueError("surname has no two-letter run to search for")
+    return f"NAME LIKE '%{token}%'"
+
+
 def query_surname(surname: str) -> list[dict]:
-    """Every parcel whose owner NAME contains ``surname`` (filtered exactly by the caller).
+    """Every parcel whose owner NAME contains ``surname``'s longest letter run (filtered
+    exactly by the caller).
 
     Raises LayerError when the layer gives no trustworthy answer, and ValueError for a
-    surname that is not a plain name (it is quoted into the where clause)."""
-    surname = surname.upper()
-    if not _SAFE_SURNAME.match(surname):
-        raise ValueError("surname is not a plain name")
+    surname that is not a plain name (surname_where)."""
     params = {
-        "where": "NAME LIKE '%" + surname.replace("'", "''") + "%'",
+        "where": surname_where(surname),
         "outFields": ",".join(OUT_FIELDS), "returnGeometry": "false",
         "resultRecordCount": str(_PAGE), "f": "json",
     }

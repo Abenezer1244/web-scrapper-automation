@@ -493,3 +493,67 @@ async def test_parcel_wrapper_keeps_a_mailing_only_gis_answer(monkeypatch):
     out = await p.enrich_parcel("00522400008900", "snohomish", "WA")
     assert out["mailing_address"] == "22801 64TH PL W, MOUNTLAKE TERRACE, WA 98043"
     assert out["property_address"] is None
+
+
+# Kitsap, 2026-11-16: two spellings per parcel made a 50-parcel chunk 100 IN values; past
+# ~26 parcels the statewide service refused the URL and the batch came back empty, so no
+# Kitsap probate lead ever got a property address (live: 0/38 before, 34/38 after).
+
+def _kitsap_parcels(n):
+    return [f"{4250220422000 + i:014d}" for i in range(n)]
+
+
+def test_statewide_chunks_by_query_values_not_parcels(monkeypatch):
+    from src.scrapers.enrichment import county_gis as cg
+
+    sizes: list[int] = []
+
+    def fake_get(url, params=None, **kw):
+        sizes.append(params["where"].count(",") + 1)
+        return _Resp({"features": []})
+
+    monkeypatch.setattr(cg, "safe_get", fake_get)
+    cg._batch_query_wa_statewide(_kitsap_parcels(38), "kitsap")
+    assert sum(sizes) == 76 and max(sizes) <= 50  # 38 parcels x 2 spellings, each request bounded
+
+
+def test_every_kitsap_parcel_in_a_large_batch_reaches_its_caller(monkeypatch):
+    from src.scrapers.enrichment import county_gis as cg
+
+    def fake_get(url, params=None, **kw):
+        # Answer the 6-1-3-4 spelling of every parcel this request asked for.
+        asked = [v.strip(" '") for v in params["where"].split("(", 1)[1].split(")", 1)[0].split(",")]
+        return _Resp({"features": [{"attributes": {"ORIG_PARCEL_ID": v, "SITUS_ADDRESS": f"{v} MAIN ST"}}
+                                   for v in asked if len(v.split("-")[0]) == 6]})
+
+    monkeypatch.setattr(cg, "safe_get", fake_get)
+    parcels = _kitsap_parcels(38)
+    out = cg._batch_query_wa_statewide(parcels, "kitsap")
+    assert sorted(out) == sorted(parcels)
+
+
+def test_a_refused_statewide_request_is_logged_not_silent(monkeypatch, caplog):
+    from src.scrapers.enrichment import county_gis as cg
+
+    class _Refused(_Resp):
+        status_code = 414
+
+    monkeypatch.setattr(cg, "safe_get", lambda *a, **kw: _Refused({}))
+    assert cg._batch_query_wa_statewide(_kitsap_parcels(3), "kitsap") == {}
+    assert any("HTTP 414" in r.getMessage() for r in caplog.records)
+
+
+def test_a_parcel_whose_two_spellings_straddle_chunks_still_reaches_its_caller(monkeypatch):
+    """One non-14-digit parcel (a single value) shifts every pair by one, so the 25th
+    Kitsap parcel's spellings land in different requests (Codex)."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    def fake_get(url, params=None, **kw):
+        asked = [v.strip(" '") for v in params["where"].split("(", 1)[1].split(")", 1)[0].split(",")]
+        return _Resp({"features": [{"attributes": {"ORIG_PARCEL_ID": v, "SITUS_ADDRESS": f"{v} MAIN ST"}}
+                                   for v in asked if "-" in v and len(v.split("-")[0]) == 4]})
+
+    monkeypatch.setattr(cg, "safe_get", fake_get)
+    parcels = ["123456789", *_kitsap_parcels(38)]
+    out = cg._batch_query_wa_statewide(parcels, "kitsap")
+    assert sorted(out) == sorted(parcels[1:])  # every Kitsap parcel, via its 4-3-3-4 spelling

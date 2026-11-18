@@ -643,7 +643,7 @@ _GIS_CANDIDATE_PARCELS_SQL = """
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
     WHERE r.mailing_address IS NULL
       AND r.parcel_id IS NOT NULL
-      AND length(btrim(r.parcel_id)) >= 6
+      AND length(btrim(r.parcel_id)) >= 5  -- per-county floor applied in Python (gis_min_parcel_len)
       AND coalesce(r.enrichment_data->>'mailing_lookup_deferred', '') = 'true'
       AND coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) < :max_attempts
       AND j.status = 'done'
@@ -679,6 +679,7 @@ def recover_deferred_gis_mailing() -> dict:
     from src.scrapers.enrichment.county_gis import (
         batch_enrich_parcels_gis,
         gis_mailing_source_counties,
+        gis_min_parcel_len,
         has_gis_mailing_source,
     )
 
@@ -698,6 +699,8 @@ def recover_deferred_gis_mailing() -> dict:
             sa_text(_GIS_CANDIDATE_PARCELS_SQL),
             {"max_attempts": _MAX_ATTEMPTS, "counties": counties},
         ).all()
+        parcel_rows = [r for r in parcel_rows
+                       if len(r.parcel_id) >= gis_min_parcel_len(r.county, "WA")]
         picked = sorted(parcel_rows,
                         key=lambda r: (r.attempts, r.last_at, r.county, r.parcel_id))
         picked = picked[:_GIS_BATCH_PARCELS]

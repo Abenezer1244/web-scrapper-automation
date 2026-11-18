@@ -463,6 +463,7 @@ class TestPunctuationAndSpacing:
             ("123-A MAIN ST, SEATTLE, WA 98101", "123 A MAIN ST, SEATTLE, WA 98101"),
             ("123 LOT.AB RD, SEATTLE, WA 98101-0001", "123 LOT AB RD, SEATTLE, WA 98101-0002"),
             ("123 23 RD AVE, SEATTLE, WA 98101", "123 23RD AVE, SEATTLE, WA 98101"),
+            ("123 AVENUE N E, SEATTLE, WA 98101", "123 AVENUE NE, SEATTLE, WA 98101"),
         ):
             assert compute_owner_flags(a, b)["absentee_owner"] is True, a
             assert compute_owner_flags(b, a)["absentee_owner"] is True, a

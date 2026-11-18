@@ -202,8 +202,11 @@ def _break_is_spacing(raw: list[str], canon: list[str], i: int, kind: str) -> bo
     if (i > 0 and canon[i].isdigit() and raw[i + 1] in ("TH", "ND")
             and _ordinal_ok(canon[i], raw[i + 1]) and nxt in _STREET_TYPE_WORDS):
         return True  # 19|TH AVE. Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
-    if raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and prev in _STREET_TYPE_WORDS:
-        return True  # AVE S.W.: a post-directional. "123 N E MAIN" may be North E Main.
+    if (raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and nxt is None
+            and prev in _STREET_TYPE_WORDS and i >= 3):
+        # "EARL AV N W": the street's last two chunks, after a type that follows a name.
+        # "123 N E MAIN" may be North E Main; "123 AVENUE N E" may be Avenue N East.
+        return True
     if (i == 0 and canon[i].isdigit() and len(raw[i + 1]) == 1 and raw[i + 1].isalpha()
             and kind == "-"
             and any(t not in _TRAILING_OPTIONAL_TOKENS for t in canon[i + 2:])):

@@ -1583,10 +1583,7 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
 
 
 _CHELAN_APN_RE = re.compile(r"\d{12}")
-# Three or more short digit groups in a row ("2521 0473 2030"): an APN printed in spaced
-# groups, which the strict parser would split or miss. Lots and blocks ("LOT 2 BLK 2")
-# are single digits between words, so they never match.
-_SPACED_APN_RE = re.compile(r"\b\d{2,6}(?: \d{2,6}){2,}\b")
+
 
 
 def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
@@ -1605,22 +1602,30 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     except Exception:  # noqa: BLE001 -- unreadable: nothing is re-read
         _logger.warning("Chelan detail page %s unreadable for the APN re-read", transaction_item_id)
         return None
-    apns = parse_detail_apns(html_text)
-    if not apns:
-        return apns
-    # Trusted only when it is the whole, clean answer (Codex): every candidate a
-    # 12-digit Chelan parcel, and no APN printed in spaced groups that the parser would
-    # have split or missed. Otherwise the answer is unknown, never partial.
-    if any(not _CHELAN_APN_RE.fullmatch(a) for a in apns):
-        return None
     import html
 
     from src.scrapers.templates.acclaimweb import _DOC_LEGAL_RE
 
-    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_text)))
+    apns = parse_detail_apns(html_text)
+    if apns is None:
+        return None
+    # Trusted only when it is the whole, clean answer (Codex): the run of number tokens
+    # right after the APN label must be 12-digit Chelan parcels, every one, and exactly
+    # what the parser found. A spaced or partial APN, or one the parser missed, makes
+    # the answer unknown, never a shorter list. Entities are decoded first (&nbsp;).
+    text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", html_text)).split())
     legal = _DOC_LEGAL_RE.search(text)
-    tail = legal.group(1)[re.search(r"\bAPN\b", legal.group(1), re.I).end():] if legal else ""
-    return None if _SPACED_APN_RE.search(tail) else apns
+    label = re.search(r"\bAPN\b", legal.group(1), re.I) if legal else None
+    run: list[str] = []
+    for token in (legal.group(1)[label.end():].split() if label else []):
+        if not re.fullmatch(r"[\d-]+", token):
+            break
+        run.append(token.replace("-", ""))
+    if not run:
+        return apns if not apns else None
+    if any(not _CHELAN_APN_RE.fullmatch(t) for t in run) or list(dict.fromkeys(run)) != apns:
+        return None
+    return apns
 
 
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,

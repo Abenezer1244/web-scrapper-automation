@@ -116,8 +116,14 @@ def test_the_cli_does_not_re_read_when_the_crawl_stored_apns(c, db, tmp_path, mo
     ("APN 222014846080 252104732030", ["222014846080", "252104732030"]),
     ("APN 123456789 SP 2019-008", None),                            # 9 digits: not a Chelan APN
     ("APN 222014846080 2521 0473 2030", None),                      # a second APN in spaced groups
-    ("APN 2220 1484 6080", []),                                     # nothing the parser could read
-], ids=["clean", "two-clean", "nine-digit", "spaced-second", "spaced-only"])
+    ("APN 2220 1484 6080", None),                                   # an APN the parser cannot read
+    ("APN 222014846080 252104 732030", None),                       # second APN in two groups
+    ("APN 2521&nbsp;0473&nbsp;2030", None),                         # entity-spaced APN
+    ("APN 222014846080 SEC TWP RGE 12 23 20", ["222014846080"]),    # numbers after words are not APNs
+    ("APN 222014846080 NORTH ENTIAT LOT 2 BLK 2", ["222014846080"]),  # 2629393's shape
+    ("SP 2019-008 LOT 7", []),                                      # no APN label: none listed
+], ids=["clean", "two-clean", "nine-digit", "spaced-second", "spaced-only", "two-groups",
+        "nbsp", "sec-twp-rge", "2629393-shape", "no-label"])
 def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, legal, expected):
     page = _DETAIL.replace("APN 222014846080", legal)
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())

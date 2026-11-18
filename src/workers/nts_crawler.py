@@ -1649,9 +1649,11 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     for label in re.finditer(r"\bAPNS?\b", block, re.I):
         after = re.sub(r"[&/+,;:#]", " ", block[label.end():]).split()
         listed = []
-        for token in after:
+        for i, token in enumerate(after):
             if re.fullmatch(r"(?:NO|NOS|AND|APNS?)\.?", token, re.I):
                 continue
+            if token == "LINEBREAK" and i + 1 < len(after) and after[i + 1][:1].isdigit():
+                continue  # a number on the next line still belongs to this APN list (Codex)
             if not token.isdigit():
                 break
             if not _CHELAN_APN_RE.fullmatch(token):

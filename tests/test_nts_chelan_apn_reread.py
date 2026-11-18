@@ -150,12 +150,15 @@ def _page(*lines: str) -> str:
     (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE&#39;S DEED", "ADDITIONAL APN 2521-",
       "0473-2030"], None),                                              # APN split across a break
     (["APN 222014846080", "LOT 7 <span>2521</span><span>04732030</span>"], None),  # inline tags
-    (["APN", "222014846080"], None),                                    # label and number apart
+    (["APN", "222014846080"], ["222014846080"]),                        # number on the next line
+    (["APN 222014846080", "252104", "732030"], None),                   # APN in pieces on bare lines
+    (["APN 222014846080", "252104732030", "LOT 7"], ["222014846080", "252104732030"]),
 ], ids=["real", "2629393", "two-on-a-line", "two-lines", "colon-comma", "hash", "dashed",
         "nine-digit", "spaced-second", "spaced-only", "amp-split", "glued-amp", "nbsp",
         "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn",
         "empty-apn-line", "bare-label", "additional-apn", "spaced-elsewhere",
-        "short-numbers", "split-across-break", "inline-tags", "label-apart"])
+        "short-numbers", "split-across-break", "inline-tags", "label-apart",
+        "bare-line-pieces", "bare-line-apn"])
 def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, lines, expected):
     page = _page(*lines)
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())

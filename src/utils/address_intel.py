@@ -155,6 +155,13 @@ _MARKED_UNIT_RE = re.compile(
 # is not "12 5 MAIN" and "12 - 22. ND AVE" is not "12 - 22 ND AVE" (Codex). Dots after
 # letters ("AVE.", "S.W.", "ST. JOHN") are abbreviations and are still dropped.
 _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
+# A dot between single letters ("N.E.", "S.W.") is kept too, so "N.E. MAIN" is never
+# equated with a spaced "N E MAIN" (North E Main) by the dot-dropping paths (Codex).
+_LETTER_DOT_RE = re.compile(r"(?<=\b[A-Z])\.(?=[A-Z]\b)", re.IGNORECASE)
+
+
+def _keep_meaningful_dots(text: str) -> str:
+    return _LETTER_DOT_RE.sub("\u00b7", _DIGIT_DOT_RE.sub("_", text))
 
 
 # "NO 5" names a road ("COUNTY ROAD NO 5"), so in comparisons it is kept, never stripped
@@ -162,21 +169,44 @@ _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 _ROAD_NUMBER_RE = re.compile(r"\bNO\.?\s*(?=\d)", re.IGNORECASE)
 
 
-_STREET_TYPE_ALT = "|".join(sorted(set(_SUFFIX) | set(_SUFFIX.values()), key=len, reverse=True))
-# In comparisons a "unit" with a street-type word anywhere after it is part of the name
-# ("OLD LOT 5 RD", "OLD LOT 5 ACCESS RD"), so it is glued and kept rather than stripped
-# with the rest of the street (Codex). A trailing unit ("UNIT G 304", "BLDG B") is still
-# stripped: a unit-only difference is not absentee (product rule, module docstring).
-_NAMED_UNIT_RE = re.compile(
-    rf"\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b\s*#?\s*([A-Z0-9-]{{1,6}})\b"
-    rf"(?=(?:\s+\S+)*?\s+(?:{_STREET_TYPE_ALT})\b)",
+_UNIT_DESIGNATOR_RE = re.compile(
+    rf"\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b\s*#?\s*([A-Z0-9-]{{1,6}})\b",
     re.IGNORECASE,
 )
+_UNIT_DESIGNATOR_WORDS = frozenset(
+    _UNIT_WORDS.split("|") + ["NO", "BOX", "FL", "FLR", "FLOOR", "DEPT", "TRLR", "TRAILER", "BLD"])
+_STREET_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values()) | frozenset(_DIRECTIONAL) \
+    | frozenset(_DIRECTIONAL.values())
+
+
+def _unit_like(token: str) -> bool:
+    """A token that can only be part of a unit tail: a designator, "AND"/"&", an id with
+    a digit, or a 1-2 letter id that is not a street word ("UNIT 4 DZ", "UNIT A AND B")."""
+    t = token.upper().strip("#,.-")
+    if not t or t in _UNIT_DESIGNATOR_WORDS or t in ("AND", "&"):
+        return True
+    if any(ch.isdigit() for ch in t):
+        return True
+    return len(t) <= 2 and t not in _STREET_WORDS
+
+
+def _glue_named_units(street: str) -> str:
+    """Glue a designator + id that is NOT a trailing unit, so _UNIT_STRIP_RE keeps it.
+
+    In comparisons a unit is stripped only when everything after it looks like part of a
+    unit; any real word after it ("OLD LOT 5 ACCESS ALY", "OLD LOT 5 RD") makes it part
+    of the street name (Codex). A trailing unit ("UNIT G 304", "BLDG B") is still stripped:
+    a unit-only difference is not absentee (product rule, module docstring).
+    """
+    def repl(m: re.Match) -> str:
+        tail = street[m.end():].split()
+        return m.group(0) if all(_unit_like(t) for t in tail) else f"{m.group(1)}_{m.group(2)}"
+    return _UNIT_DESIGNATOR_RE.sub(repl, street)
 
 
 def _compare_street(street: str | None) -> str:
-    s = _DIGIT_DOT_RE.sub("_", _DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
-    s = _NAMED_UNIT_RE.sub(r"\1_\2", s)
+    s = _keep_meaningful_dots(_DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _glue_named_units(s)
     s = _ROAD_NUMBER_RE.sub("NO_", s)
     # No trailing " -" cleanup: "MAIN ST - LOT A RD" may be a street name (Codex).
     return _normalize_street(s)
@@ -205,7 +235,7 @@ def _ordinal_ok(num: str, suffix: str) -> bool:
 
 def _chunks(street: str) -> tuple[list[str], list[str], list[str]]:
     """(raw chunks, canonical chunks, separators) split on space / dot / hyphen."""
-    s = _DIGIT_DOT_RE.sub("_", street.upper()).strip(" .-")
+    s = _DIGIT_DOT_RE.sub("_", street.upper()).strip(" .-")  # letter dots stay separators
     raw = _SEP_RE.split(s) if s else []
     seps = _SEP_RE.findall(s)
     # Abbreviate only free-standing words: "NORTH-STAR RD" is a name, not "N-STAR" (Codex).
@@ -222,6 +252,8 @@ def _sep_kind(sep: str) -> str:
     "8337-A"); "N. E" or "123 - N" are mixed and prove nothing (Codex)."""
     if sep.isspace():
         return " "
+    if sep[0] == "." and sep[1:].isspace():
+        return " "  # ". " ends an abbreviation ("S.E. 272ND", "AVE. S"): it is a space
     return sep if sep in (".", "-") else "mixed:" + "".join(sep.split())
 
 
@@ -233,7 +265,6 @@ def _break_is_spacing(raw: list[str], canon: list[str], seps: list[str], i: int,
     Anything else keeps today's answer (absentee), never a merge of two properties.
     No word|word rule: "RIDGE WOOD" vs "RIDGEWOOD" may be two streets.
     """
-    prev = canon[i - 1] if i > 0 else None
     nxt = canon[i + 2] if i + 2 < len(canon) else None
     if (kind == " " and canon[i].isdigit() and len(canon[i]) <= 3
             and raw[i + 1] in ("TH", "ND") and _ordinal_ok(canon[i], raw[i + 1])
@@ -244,11 +275,10 @@ def _break_is_spacing(raw: list[str], canon: list[str], seps: list[str], i: int,
         # (or its compass words), plain spaces only, so "120-122 ND AVE" never feeds it
         # (Codex). Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
         return True
-    if (raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and kind == "." and nxt is None
-            and prev in _STREET_TYPE_WORDS and i >= 2):
-        # "16TH AVE. S.W.": a DOTTED pair, the street's last two chunks, after a type that
-        # follows a name. A spaced "N E" may be North E Main, Avenue N East or unit E
-        # at Main Ave N (Codex), so "EARL AV N W" keeps today's answer.
+    if raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and kind == ".":
+        # "16TH AVE. S.W.", "N.E. 8TH ST": a pair joined by a lone dot is an abbreviation.
+        # A spaced "N E" may be North E Main, Avenue N East or unit E at Main Ave N, and
+        # "N. E" is mixed (Codex), so "EARL AV N W" keeps today's answer.
         return True
     # No house-letter rule: "123-A-LINE RD" may be A-Line Road and "123-N MAIN" North
     # Main (Codex), so "8337-A" vs "8337A" keeps today's answer.
@@ -344,7 +374,7 @@ def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_s
 
 
 def _normalize_full(addr: str) -> str:
-    s = _PUNCT_RE.sub(" ", _DIGIT_DOT_RE.sub("_", addr)).upper()
+    s = _PUNCT_RE.sub(" ", _keep_meaningful_dots(addr)).upper()
     return _WS_RE.sub(" ", s).strip()
 
 

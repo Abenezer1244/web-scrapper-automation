@@ -481,6 +481,8 @@ class TestPunctuationAndSpacing:
             ("123 COUNTY ROAD NO. 5, WA 98022", "123 COUNTY ROAD NO 7, WA 98022"),
             ("123 OLD LOT 5 RD, WA 98052", "123 OLD LOT 7 RD, WA 98052"),
             ("123 OLD LOT 5 ACCESS RD, WA 98023", "123 OLD, WA 98023"),
+            ("123 OLD LOT 5 ACCESS ALY, SEATTLE, WA 98101", "123 OLD, SEATTLE, WA 98101"),
+            ("123 N.E. MAIN ST, SEATTLE, WA 98101", "123 N E MAIN ST, SEATTLE, WA 98101"),
             ("123 MAIN ST - LOT A RD, SEATTLE, WA 98144", "123 MAIN ST, SEATTLE, WA 98144"),
             ("1817 29TH AVE W, SEATTLE, WA 98199", "1817 - 29TH AVENUE WEST, SEATTLE, WA 98199"),
             ("123 MAIN AVE N E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
@@ -491,13 +493,6 @@ class TestPunctuationAndSpacing:
         ):
             assert compute_owner_flags(a, b)["absentee_owner"] is True, a
             assert compute_owner_flags(b, a)["absentee_owner"] is True, a
-
-    def test_split_pre_directional_stays_flagged_by_design(self):
-        # "S.E. 272ND" vs "SE 272ND": not matched on purpose. A pre-directional split
-        # cannot be told from "N E MAIN" (North E Main), so it keeps today's answer.
-        f = compute_owner_flags("22218 SE 272ND PL, MAPLE VALLEY, WA 98038-0001",
-                                "22218 S.E. 272ND PL., MAPLE VALLEY, WA 98038-0002")
-        assert f["absentee_owner"] is True
 
     def test_hyphen_vs_space_keeps_todays_answer(self):
         # Owner decision 2026-11-17 after Codex: "OLD-MILL RD" may not be "OLD MILL RD",
@@ -520,3 +515,12 @@ class TestPunctuationAndSpacing:
         for a, b in (("12602 109TH CT NE #G304", "12602 109TH CT NE UNIT G 304"),
                      ("6021 199TH ST NE", "6021 199TH ST NE BLDG B")):
             assert compute_owner_flags(f"{a}, KIRKLAND, WA 98034", f"{b}, KIRKLAND, WA 98034")["absentee_owner"] is False, a
+
+    def test_dotted_pre_directional_matches(self):
+        f = compute_owner_flags("22218 SE 272ND PL, MAPLE VALLEY, WA 98038", "22218 S.E. 272ND PL., MAPLE VALLEY, WA 98038")
+        assert f["absentee_owner"] is False
+
+    def test_unit_tail_shapes_stay_same_place(self):
+        for a, b in (("24815 LAKE FENWICK RD S", "24815 LAKE FENWICK RD S UNIT 4 DZ"),
+                     ("15330 40TH AVE W", "15330 40TH AVE W UNIT A AND B")):
+            assert compute_owner_flags(f"{a}, KENT, WA 98032", f"{b}, KENT, WA 98032")["absentee_owner"] is False, b

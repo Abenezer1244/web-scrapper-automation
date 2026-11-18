@@ -39,7 +39,7 @@ from src.utils.address_intel import compute_owner_flags
 
 _SELECT = text(
     """
-    SELECT id, property_address, mailing_address
+    SELECT id, property_address, mailing_address, property_city, property_state, property_zip
     FROM results
     WHERE owner_state IS NULL
       AND property_state IS NULL
@@ -61,6 +61,8 @@ _UPDATE = text(
     WHERE id = :id
       AND property_address IS NOT DISTINCT FROM :pa
       AND mailing_address IS NOT DISTINCT FROM :ma
+      AND property_city IS NOT DISTINCT FROM :pc
+      AND property_zip IS NOT DISTINCT FROM :pz
       AND absentee_owner IS NOT DISTINCT FROM :cur_absentee
       AND owner_state IS NOT DISTINCT FROM :cur_owner_state
       AND property_state IS NOT DISTINCT FROM :cur_property_state
@@ -178,8 +180,11 @@ def main() -> None:
                     if not rows:
                         done = True
                         break
-                    for rid, prop, mail in rows:
-                        flags = compute_owner_flags(prop, mail)
+                    for rid, prop, mail, pc, ps, pz in rows:
+                        # With the structured situs parts, exactly as the worker does, so
+                        # a row is never settled on a weaker verdict than live rows get.
+                        flags = compute_owner_flags(prop, mail, property_city=pc,
+                                                    property_state=ps, property_zip=pz)
                         scanned += 1
                         if flags["property_state"]:
                             would_set["property_state"] += 1
@@ -193,7 +198,7 @@ def main() -> None:
                         if has_any and args.commit:
                             # Selected from the all-NULL window, so all four were NULL.
                             db.execute(_UPDATE, {"id": rid, **flags, "pa": prop, "ma": mail,
-                                                 **_NULL_FLAGS})
+                                                 "pc": pc, "pz": pz, **_NULL_FLAGS})
                             committed += 1
                     if args.commit:
                         db.commit()

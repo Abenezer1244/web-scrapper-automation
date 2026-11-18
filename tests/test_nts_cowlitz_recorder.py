@@ -25,6 +25,7 @@ from src.workers.nts_crawler import (
     ReviewError,
     approve_recorder_document,
     reject_recorder_document,
+    relocate_recorder_entries,
     stage_discontinuance,
     stage_recorder_document,
 )
@@ -57,8 +58,8 @@ def db():
 
 
 def _nts(item="38772571", instrument="3799745", apns=("61896",), related=("3718972",),
-         recorded="11/12/2026") -> dict:
-    return {"item_id": item, "instrument": instrument, "doc_code": "NTTRUS", "record_date": recorded,
+         recorded="11/12/2026", entry="3799745-0") -> dict:
+    return {"item_id": item, "entry": entry, "instrument": instrument, "doc_code": "NTTRUS", "record_date": recorded,
             "recording_apns": list(apns), "related": list(related)}
 
 
@@ -74,8 +75,9 @@ def _stage(session, tmp_path, **kw) -> str:
         Doc.county == "cowlitz", Doc.transaction_item_id == doc["item_id"])).scalar_one())
 
 
-def _nod(session, related, item="38772177", instrument="3799351", recorded="11/13/2026") -> str:
-    doc = {"item_id": item, "instrument": instrument, "doc_code": "NOD", "record_date": recorded}
+def _nod(session, related, item="38772177", instrument="3799351", recorded="11/13/2026",
+         entry="3799351-0") -> str:
+    doc = {"item_id": item, "entry": entry, "instrument": instrument, "doc_code": "NOD", "record_date": recorded}
     status = stage_discontinuance(session, county="cowlitz", state="WA", doc=doc, detail_html=None,
                                   related_afns=list(related), recording_apns=["WG3623040"])
     session.flush()
@@ -189,6 +191,104 @@ def _row(afn, doc_type, docid):
     return {"afn": afn, "date": "11/3/2026", "doc_type": doc_type, "href": _href(docid)}
 
 
+# ── the recorder re-indexed (2026-11-17: every entry id moved ~+9963) ───────────
+
+def _rows(session, instrument: str) -> list:
+    return session.execute(select(Doc).where(Doc.county == "cowlitz",
+                                             Doc.instrument_number == instrument)).scalars().all()
+
+
+def test_a_reindexed_notice_moves_to_its_new_id_and_is_not_staged_twice(db, tmp_path):
+    doc_id = _stage(db, tmp_path)
+    moved = _nts(item="38782534")
+    assert relocate_recorder_entries(db, "cowlitz", "WA", [moved]) == 1
+    db.flush()
+    row = db.get(Doc, doc_id)
+    assert (row.transaction_item_id, row.entry_name, row.status) == ("38782534", "3799745-0", "pending_review")
+    # Staging the rediscovered recording finds the same row: kept, never a second one.
+    assert stage_recorder_document(
+        db, county="cowlitz", state="WA", doc=moved, detail_html=None, pdf=laserfiche_pdf(1),
+        tesseract=_tool(tmp_path, "tess_ok", _OK), recording_apns=moved["recording_apns"],
+        related_dts=moved["related"]) == "kept"
+    assert [r.id for r in _rows(db, "3799745")] == [doc_id]
+    assert relocate_recorder_entries(db, "cowlitz", "WA", [moved]) == 0     # nothing left to move
+
+
+def test_an_approved_notice_published_link_moves_with_it(db, tmp_path):
+    approve_recorder_document(db, _stage(db, tmp_path), reviewer="op-1", values=_values())
+    db.flush()
+    assert relocate_recorder_entries(db, "cowlitz", "WA", [_nts(item="38782534")]) == 1
+    db.flush()
+    n = _notice(db, "3799745")
+    db.refresh(n)
+    assert n.source_url == ("https://www.cowlitzinfo.net/WLAudPublic/DocView.aspx"
+                            "?id=38782534&dbid=0&repo=CCIMAGES")
+
+
+def test_a_sibling_entry_moving_leaves_the_approved_notices_link_alone(db, tmp_path):
+    approve_recorder_document(db, _stage(db, tmp_path), reviewer="op-1", values=_values())
+    _stage(db, tmp_path, item="38772599", entry="3799745-1")   # a second entry, same recording
+    db.flush()
+    assert relocate_recorder_entries(db, "cowlitz", "WA", [_nts(item="38782599", entry="3799745-1")]) == 1
+    db.flush()
+    n = _notice(db, "3799745")
+    db.refresh(n)
+    assert n.source_url.endswith("?id=38772571&dbid=0&repo=CCIMAGES")
+
+
+def test_a_row_staged_before_entry_names_is_claimed_by_its_id_then_followed(db, tmp_path):
+    doc_id = _stage(db, tmp_path)
+    db.get(Doc, doc_id).entry_name = None                          # as staged before migration 170
+    db.flush()
+    assert relocate_recorder_entries(db, "cowlitz", "WA", [_nts()]) == 1   # same id: named
+    assert db.get(Doc, doc_id).entry_name == "3799745-0"
+    assert relocate_recorder_entries(db, "cowlitz", "WA", [_nts(item="38782534")]) == 1
+    assert db.get(Doc, doc_id).transaction_item_id == "38782534"
+
+
+@pytest.mark.parametrize("other", [
+    {"instrument": "3799746"}, {"recorded": "11/13/2026"}], ids=["instrument", "date"])
+def test_an_entry_that_is_not_the_staged_recording_fails_the_run(db, tmp_path, other):
+    _stage(db, tmp_path)
+    with pytest.raises(ValueError, match="is not the staged recording"):
+        relocate_recorder_entries(db, "cowlitz", "WA", [_nts(item="38782534", **other)])
+
+
+def test_an_id_held_by_another_entry_fails_the_run(db, tmp_path):
+    _stage(db, tmp_path)
+    _stage(db, tmp_path, item="38782534", instrument="3799746", entry="3799746-0")
+    with pytest.raises(ValueError, match="held by"):
+        relocate_recorder_entries(db, "cowlitz", "WA", [_nts(item="38782534")])
+
+
+def test_a_retry_from_a_stored_failure_keeps_the_entry_name(db, tmp_path):
+    doc = _nts()
+    assert stage_recorder_document(db, county="cowlitz", state="WA", doc=doc, detail_html=None, pdf=None,
+                                   recording_apns=doc["recording_apns"], related_dts=doc["related"]) == "failed"
+    retry = {k: v for k, v in doc.items() if k != "entry"}      # a stored failure carries no entry
+    stage_recorder_document(db, county="cowlitz", state="WA", doc=retry, detail_html=None,
+                            pdf=laserfiche_pdf(1), tesseract=_tool(tmp_path, "tess_ok", _OK),
+                            recording_apns=doc["recording_apns"], related_dts=doc["related"])
+    db.flush()
+    (row,) = _rows(db, "3799745")
+    assert (row.status, row.entry_name) == ("pending_review", "3799745-0")
+
+
+def test_a_reindexed_discontinuance_is_moved_not_applied_again(db, tmp_path):
+    approve_recorder_document(db, _stage(db, tmp_path), reviewer="op-1", values=_values())
+    db.flush()
+    assert _nod(db, ["3799745"]) == "discontinuance"
+    nod = db.execute(select(Doc).where(Doc.doc_code == "NOD")).scalar_one()
+    cancelled = list(nod.fields["cancelled"])
+    moved = {"item_id": "38782140", "entry": "3799351-0", "instrument": "3799351", "doc_code": "NOD",
+             "record_date": "11/13/2026"}
+    assert relocate_recorder_entries(db, "cowlitz", "WA", [moved]) == 1
+    assert _nod(db, ["3799745"], item="38782140") == "kept"
+    db.refresh(nod)
+    assert nod.transaction_item_id == "38782140" and nod.fields["cancelled"] == cancelled
+    assert len(_rows(db, "3799351")) == 1
+
+
 @pytest.mark.asyncio
 async def test_discover_returns_notices_and_discontinuances_with_their_facts():
     portal = _Portal(
@@ -201,9 +301,9 @@ async def test_discover_returns_notices_and_discontinuances_with_their_facts():
                        "Rec Doc Parcel": ["0278801"]}})
     docs = await portal.discover("11/03/2026", "11/03/2026")
     assert docs == [
-        {"item_id": "38772177", "instrument": "3799351", "doc_code": "NOD", "record_date": "11/03/2026",
+        {"item_id": "38772177", "entry": "3799351-0", "instrument": "3799351", "doc_code": "NOD", "record_date": "11/03/2026",
          "recording_apns": ["WG3623040"], "related": ["3717613", "3793143"], "href": _href(38772177)},
-        {"item_id": "38772100", "instrument": "3799307", "doc_code": "NTTRUS", "record_date": "11/03/2026",
+        {"item_id": "38772100", "entry": "3799307-0", "instrument": "3799307", "doc_code": "NTTRUS", "record_date": "11/03/2026",
          "recording_apns": ["0278801"], "related": ["3665592"], "href": _href(38772100)},
     ]
 

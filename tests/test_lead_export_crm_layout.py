@@ -87,7 +87,7 @@ class TestHeaderOrder:
             "Tax Balance Owed", "Oldest Tax Year", "Months Delinquent",
             "WA Foreclosure Eligible", "Tax Billed Amount", "Tax Paid Amount",
             "Tax Account Status",
-        ] + REFERENCE_HEADER
+        ] + REFERENCE_HEADER + ["Foreclosure Minimum Bid"]   # added later: after reference
 
     def test_code_violation_header_exact(self):
         header, _, _ = _export([], "code_violation")

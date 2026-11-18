@@ -95,6 +95,11 @@ LEAD_CSV_COLUMNS: list[str] = [
     # notice labels it so, else "Amount stated in notice" (an unlabelled total, or a
     # figure read before the type was recorded). Blank without an amount. Appended at END.
     "default_amount_type",
+    # A tax foreclosure listing's minimum bid (2026-11-17): the redemption total the
+    # county will sell for, costs included. Not a balance owed, so never in
+    # delinquent_amount (Cowlitz publishes no balance; Benton's balance is separate).
+    # Blank elsewhere. Appended at END.
+    "foreclosure_minimum_bid",
 ]
 
 
@@ -136,6 +141,7 @@ _TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
         "delinquent_amount", "delinquent_bill_year",
         "tax_billed_amount", "tax_paid_amount", "tax_account_status",
         "months_delinquent", "wa_foreclosure_eligible",
+        "foreclosure_minimum_bid",
     ),
     "code_violation": (
         "code_violation_type", "code_violation_status",
@@ -249,9 +255,10 @@ _CRM_REFERENCE: tuple[tuple[str, str], ...] = (
 # Added after crm_v1 shipped, so it follows the reference block instead of joining
 # the auction block: every existing column keeps its position.
 _CRM_AUCTION_TAIL: tuple[tuple[str, str], ...] = (("default_amount_type", "Amount Type"),)
+_CRM_TAX_TAIL: tuple[tuple[str, str], ...] = (("foreclosure_minimum_bid", "Foreclosure Minimum Bid"),)
 CRM_V1_LABELS: dict[str, str] = dict(
     (*_CRM_CORE, *_CRM_AUCTION, *_CRM_TAX, *_CRM_CODE_VIOLATION,
-     *_CRM_TYPE_BLOCKS["probate"], *_CRM_REFERENCE, *_CRM_AUCTION_TAIL)
+     *_CRM_TYPE_BLOCKS["probate"], *_CRM_REFERENCE, *_CRM_AUCTION_TAIL, *_CRM_TAX_TAIL)
 )
 
 
@@ -268,7 +275,8 @@ def resolve_crm_export_columns(record_type: str | None) -> list[str]:
         else [_CRM_AUCTION, _CRM_TAX, _CRM_CODE_VIOLATION, _CRM_TYPE_BLOCKS["probate"]]
     )
     keys: list[str] = []
-    tail = _CRM_AUCTION_TAIL if _CRM_AUCTION in blocks else ()
+    tail = (*(_CRM_AUCTION_TAIL if _CRM_AUCTION in blocks else ()),
+            *(_CRM_TAX_TAIL if _CRM_TAX in blocks else ()))
     for key, _label in (*_CRM_CORE, *(pair for block in blocks for pair in block),
                         *_CRM_REFERENCE, *tail):
         if key not in keys:
@@ -436,6 +444,22 @@ def _amount_type(record: Any, enr: dict) -> str:
         return ""
     basis = _get(record, "default_amount_basis") or _nts(enr).get("amount_basis")
     return "Principal" if basis == "principal" else "Amount stated in notice"
+
+
+def _minimum_bid(record: Any, enr: dict) -> str:
+    """A tax foreclosure listing's minimum bid as a plain dollar figure, '' when none or
+    not a clean amount. Tax rows only. SQL-fed rows (segments, batch) carry no
+    enrichment_data and project it as foreclosure_minimum_bid."""
+    if _get(record, "record_type") not in (None, "tax_delinquent"):
+        return ""
+    raw = _get(record, "foreclosure_minimum_bid")
+    if raw in (None, ""):
+        raw = enr.get("foreclosure_minimum_bid")
+    try:
+        d = Decimal(str(raw)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError, TypeError):
+        return ""
+    return f"{d}" if d.is_finite() and Decimal("0") < d <= Decimal("99999999.99") else ""
 
 
 def _plain(val: Any) -> str:
@@ -664,6 +688,7 @@ def build_lead_export_row(
         "tax_billed_amount": _enrich_num(enr, "billed_amount"),
         "tax_paid_amount": _enrich_num(enr, "paid_amount"),
         "tax_account_status": _enrich_str(enr, "account_status"),
+        "foreclosure_minimum_bid": _minimum_bid(record, enr),
         # Derived signals — blank/Yes rendering keeps the dialer CSV scannable.
         "months_delinquent": "" if sig["months_delinquent"] is None else str(sig["months_delinquent"]),
         "wa_foreclosure_eligible": "Yes" if sig["wa_foreclosure_eligible"] else "",

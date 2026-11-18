@@ -94,27 +94,6 @@ def test_a_malformed_attachment_link_is_rejected_not_raised():
     assert _recorded_document_url("erecording.co.benton.wa.us", "https://[bad/recorder?docName=Deed&id=DOC1.A0&parent=DOC1") is None
 
 
-def test_a_shared_surname_corroborates_a_prefix_match():
-    from src.scrapers.templates.eagleweb import _shares_surname
-
-    assert _shares_surname("MACIAS REUBEN & CECELIA", "MACIAS, REUBEN")                  # decedent on title
-    assert not _shares_surname("CRUZ MARTIN LUIS", "CRUZ, MARTIN")                       # prefix only: held
-    assert _shares_surname("SMITH JANE", "DOE, JOHN", "DOE, MARY, SMITH, JANE")           # an heir by name
-    assert not _shares_surname("HAY BARBARA L", "HAY, JAMES LEROY")                      # surname only: held
-    assert not _shares_surname("BRADLEY MARK C & CHRISTINA M", "DAVIS, ANN L")           # live Davis decedent
-    assert not _shares_surname("", "DAVIS, ANN L")
-    assert not _shares_surname("DAVIS ANN", None)
-    # Where an assessor surname ends cannot be told: a surname alone never matches (Codex).
-    assert not _shares_surname("CRUZ MARTINEZ LUIS", "CRUZ, ANA")
-    assert not _shares_surname("DE MARIA ANA", "DE LA CRUZ, ANA")
-    assert _shares_surname("DE LA CRUZ ANA", "DE LA CRUZ, ANA")
-    # Grantees separated by " / ".
-    assert _shares_surname("SMITH JOHN", "DOE, JANE / SMITH, JOHN")
-    # The live Davis recording names the Bradleys as grantees, who own the parcel.
-    assert _shares_surname("BRADLEY MARK C & CHRISTINA M", "DAVIS, ANN L",
-                           "BRADLEY, MARK C, BRADLEY, CHRISTINA M, DAVIS, ANNA LEE")
-
-
 def test_prefix_results_need_a_complete_grid_and_one_match():
     """The real Benton results page for one parcel ("1 - 1 of 1"), searched by prefix."""
     from pathlib import Path

@@ -43,19 +43,19 @@ _SITUS = "62 VILLAGE VISTA LN MANSON, WA 98831"
 
 @pytest.fixture
 def layer(monkeypatch):
-    """The statewide layer answering for _APN, as _query_wa_statewide returns it."""
+    """The statewide layer answering for _APN, as _batch_query_wa_statewide returns it:
+    the lookup runs the batch path pre-foreclosure enrichment runs (Codex, Cowlitz)."""
     asked: list[tuple[str, str]] = []
 
-    def _answer(parcel_id, county):
-        asked.append((parcel_id, county))
-        if parcel_id != _APN:
-            return cg._empty()
-        return {"property_address": "62 VILLAGE VISTA LN \r\nMANSON, WA 98831".replace("\r\n", " "),
-                "mailing_address": None, "parcel_id": _APN, **cg._situs_parts("MANSON", "98831")}
+    def _answer(parcel_ids, county):
+        asked.extend((p, county) for p in parcel_ids)
+        return {p: {"property_address": "62 VILLAGE VISTA LN \r\nMANSON, WA 98831".replace("\r\n", " "),
+                    "mailing_address": None, "parcel_id": _APN, **cg._situs_parts("MANSON", "98831")}
+                for p in parcel_ids if p == _APN}
 
     monkeypatch.setattr(cg.settings, "GIS_ENRICHMENT_ENABLED", True, raising=False)
-    monkeypatch.setattr(cg, "_query_gis", lambda *a, **k: cg._empty())
-    monkeypatch.setattr(cg, "_query_wa_statewide", _answer)
+    monkeypatch.setattr(cg, "_batch_query_county", lambda *a, **k: {})
+    monkeypatch.setattr(cg, "_batch_query_wa_statewide", _answer)
     return asked
 
 
@@ -63,6 +63,16 @@ def test_the_lookup_returns_the_parcels_site_address_in_enrichments_form(layer):
     assert lookup_parcel_situs("chelan", "WA", _APN) == _SITUS
     assert layer == [(_APN, "chelan")]
     assert lookup_parcel_situs("chelan", "WA", "000000000000") is None
+
+
+def test_the_lookup_never_sets_off_an_owner_mailing_request(layer, monkeypatch):
+    """Situs only (Codex): Chelan has a bulk mailing source the batch path would ask."""
+    def _never(*a, **k):
+        raise AssertionError("owner-mailing source asked")
+
+    monkeypatch.setattr(cg, "has_bulk_mailing_source", lambda *a, **k: True)
+    monkeypatch.setattr(cg, "_resolve_bulk_mailing", _never)
+    assert lookup_parcel_situs("chelan", "WA", _APN) == _SITUS
 
 
 def test_the_lookup_is_off_when_gis_enrichment_is(monkeypatch):

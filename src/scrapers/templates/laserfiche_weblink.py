@@ -667,8 +667,9 @@ class LaserficheWebLinkScraper(BridgeScraper):
     async def discover(self, date_from: str, date_to: str) -> list[dict]:
         """Every recorded Notice of Trustee's Sale and Discontinuance of Trustee's Sale in
         the window, from the same complete per-day read as scrape(); each with its entry
-        properties: {item_id, instrument, doc_code, record_date, recording_apns, related,
-        href}. doc_code is the recorder's code ("NTTRUS"), except a discontinuance is
+        properties: {item_id, entry, instrument, doc_code, record_date, recording_apns,
+        related, href}. ``entry`` is the full grid name ("3799745-0"): the entry id is not
+        stable (the repository re-indexed 2026-11-17), the name is. doc_code is the recorder's code ("NTTRUS"), except a discontinuance is
         "NOD", the staging table's code for one. Call inside ``async with``."""
         rows = await self._collect(date_from, date_to)
         found: list[dict] = []
@@ -685,6 +686,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
                 raise self._fail(f"AFN {row['afn']}: no document id")
             found.append({
                 "item_id": m.group(1),
+                "entry": row["afn"].strip(),
                 "instrument": _afn_base(row["afn"]),
                 "doc_code": "NOD" if kind == "nod" else code,
                 "record_date": datetime.strptime(row["date"], "%m/%d/%Y").strftime("%m/%d/%Y"),

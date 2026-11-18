@@ -574,3 +574,105 @@ def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, m
     # Counts only: no parcels, no addresses, no names in logs.
     _logger.info("%s: %d parcel(s) requested, outcomes %s", site.source_key, len(by_key), counts)
     return out
+
+
+def parse_prefix_results(html: str, prefix: str) -> tuple[str, str | None]:
+    """(outcome, geo_id) for an account-number search on a truncated parcel ``prefix``.
+
+    The portal's account-number search is a prefix search. Only a page that IS the whole
+    result set (``_grid_is_complete is True``), every row's Geo ID read, and exactly one
+    15-digit Geo ID starting literally with ``prefix`` is ``found``. Several matches, an
+    incomplete or unreadable page, is ``ambiguous``/``unparsed``; none is not found.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table", id=re.compile(r"resultsTable"))
+    if table is None:
+        return (PARCEL_NOT_FOUND, None) if "None found" in soup.get_text(" ") else (UNPARSED, None)
+    heads = [th.get_text(" ", strip=True) for th in table.find_all("th")]
+    geo_col = next((i for i, h in enumerate(heads) if _GEO_HEADER_RE.search(h)), None)
+    if geo_col is None:
+        return UNPARSED, None
+    geos: list[str] = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) <= geo_col:
+            if len(tds) > 1:
+                return UNPARSED, None  # a data row whose identity cannot be read
+            continue
+        cell = tds[geo_col].get_text("", strip=True)
+        # Digits and dashes only: never synthesise an id from a malformed cell (Codex).
+        if not re.fullmatch(r"\d[\d-]*\d", cell):
+            return UNPARSED, None
+        geos.append(cell.replace("-", ""))
+    if _grid_is_complete(soup, len(geos)) is not True:
+        return AMBIGUOUS, None
+    matches = sorted({g for g in geos if len(g) == 15 and g.startswith(prefix)})
+    if not matches:
+        return PARCEL_NOT_FOUND, None
+    return (FOUND, matches[0]) if len(matches) == 1 else (AMBIGUOUS, None)
+
+
+def resolve_prefixes(county: str, prefixes: list[str], *, time_budget_s: float = CALL_BUDGET_S
+                     ) -> dict[str, str | None]:
+    """The single parcel each truncated index ``prefix`` names on the current roll, or
+    None. Same lease, form, roll-year and block handling as resolve_mailing; one
+    request per prefix, never retried here, nothing guessed: any doubt is None.
+
+    A match is a CANDIDATE: the caller corroborates it before treating it as the
+    recording's parcel (Codex: a complete grid proves uniqueness on today's roll only).
+    """
+    from src.scrapers.enrichment.source_admission import SourceAdmission
+    from src.scrapers.enrichment.source_health import (
+        SourceUnavailableError,
+        check_source_or_raise,
+        record_source_blocked,
+    )
+
+    out: dict[str, str | None] = dict.fromkeys(prefixes)
+    site = PACS_SITES.get((county or "").lower())
+    todo = sorted({p for p in prefixes if re.fullmatch(r"\d{10,14}", p or "")})
+    if site is None or not todo or (site.license_restricted
+                                    and not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED):
+        return out
+    deadline = time.monotonic() + time_budget_s
+    with SourceAdmission(site.source_key, max_wait_s=_LEASE_WAIT_S) as admission:
+        if not admission.holds_lease:
+            return out
+        try:
+            check_source_or_raise(site.source_key)
+        except SourceUnavailableError:
+            return out
+        session = pinned_session()
+        session.headers.update(_HEADERS)
+        time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
+        resp, blocked = _request(lambda: _http_get(session, site.search_url), admission.still_held)
+        if blocked:
+            record_source_blocked(site.source_key, f"PACS search form {blocked}")
+            return out
+        tokens = _form_tokens(resp.text) if resp is not None else None
+        mode = search_type_field(resp.text, "account-number") if resp is not None else None
+        if tokens is None or mode is None:
+            return out
+        try:
+            year = ownership_year(site.search_url, resp.text)
+        except ValueError:
+            return out  # which roll is current is unknown
+        for prefix in todo:
+            if time.monotonic() > deadline or not admission.still_held():
+                break
+            time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
+            data = {**tokens, **mode, "propertySearchOptions$geoid": prefix,
+                    "propertySearchOptions$search": "Search",
+                    **({"propertySearchOptions$taxyear": year} if year else {})}
+            try:
+                r = _http_post(session, site.search_url, data)
+            except (requests.Timeout, requests.ConnectionError):
+                continue  # one attempt only: a failed lookup stays unresolved
+            if r.status_code in _BLOCK_STATUSES:
+                record_source_blocked(site.source_key, f"PACS HTTP {r.status_code}")
+                break
+            if r.status_code != 200:
+                continue
+            outcome, geo = parse_prefix_results(r.text, prefix)
+            out[prefix] = geo if outcome == FOUND else None
+    return out

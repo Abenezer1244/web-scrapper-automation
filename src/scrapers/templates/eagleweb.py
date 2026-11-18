@@ -15,6 +15,7 @@ Benton, Clallam, Grant, Grays Harbor, Island, Jefferson, Kitsap,
 Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 """
 
+import asyncio
 import re
 
 from src.api.middleware.security import add_scrape_domain
@@ -112,6 +113,28 @@ _RECORDED_DOCUMENT_MIN_TEXT = 200   # characters; below this the PDF is a scan w
 _COVER_SHEET_PARCEL_TYPES = frozenset({"probate", "death_certificate"})
 # Wall-clock budget for one run's cover-sheet reads (the job's own limit is 30 minutes).
 _COVER_SHEET_BUDGET_S = 15 * 60
+
+
+def _shares_surname(owner: str, *people: str | None) -> bool:
+    """Whether the assessor's owner ("LAST FIRST & LAST2 FIRST2") names a person the
+    recording names ("LAST, FIRST", an heirs list of the same form) by SURNAME AND FIRST
+    GIVEN NAMES: an owner segment must EQUAL a recorded "LAST GIVEN...". A surname or a
+    prefix is not enough, since where an assessor surname ends cannot be told ("CRUZ, ANA"
+    or "CRUZ, MARTIN" against "CRUZ MARTIN LUIS", Codex). An unparseable side is no match, never a match."""
+    def norm(text: str) -> str:
+        return " ".join(re.sub(r"[^A-Z ]", " ", text.upper()).split())
+
+    segments = [norm(s) for s in re.split(r"[&/;]", owner or "") if norm(s)]
+    names: set[str] = set()
+    for person in people:
+        for party in re.split(r"[/;]", person or ""):
+            # "HAY, BARBARA LOIS, HAY, JAMES LEROY": comma parts pair as (surname, given).
+            parts = [norm(p) for p in party.split(",") if norm(p)]
+            for last, given in zip(parts[::2], parts[1::2], strict=False):  # an odd tail has no given name
+                if len(last) > 1 and len(given) > 1:
+                    names.add(f"{last} {given}")
+    # The WHOLE owner segment must equal one recorded full name: no prefix of it (Codex).
+    return any(seg in names for seg in segments)
 
 
 def _recorded_document_url(portal_host: str | None, attach_href: str | None) -> str | None:
@@ -490,9 +513,44 @@ class EagleWebScraper(BridgeScraper):
                 record.enrichment_data["parcel_source"] = "recorded_document"
             elif got.candidates:
                 record.enrichment_data["apn_candidates"] = got.candidates
+        await self._resolve_index_prefixes(todo)
         outcomes = [r.enrichment_data["recording_apn_lookup"] for r in todo]
         _logger.info("%s: cover-sheet parcels %s", self.county,
                      {o: outcomes.count(o) for o in sorted(set(outcomes))})
+
+    async def _resolve_index_prefixes(self, records: list[ScrapedRecord]) -> None:
+        """An unreadable cover sheet whose index shows 10+ digits of the parcel: the single
+        parcel on the assessor's roll starting with them, corroborated by its owner.
+
+        The match is attached only when the assessor's current owner shares a surname with
+        the decedent or an heir named on the recording; otherwise it is kept as a review
+        candidate ("ambiguous"). A unique prefix on today's roll is not proof on its own: a
+        renumbered parcel or an index typo could name another property (Codex). Any lookup
+        failure leaves the row as it was."""
+        from src.scrapers.enrichment import pacs_parcel
+
+        rows = [r for r in records if r.enrichment_data.get("recording_apn_lookup") == "unreadable"
+                and len(getattr(r, "_index_parcel_prefix", None) or "") >= 10]
+        if not rows:
+            return
+        found = await asyncio.to_thread(pacs_parcel.resolve_prefixes, self.county,
+                                        [r._index_parcel_prefix for r in rows])
+        geos = sorted({g for g in found.values() if g})
+        owners = await asyncio.to_thread(pacs_parcel.resolve_tax, self.county, geos) if geos else {}
+        for r in rows:
+            geo = found.get(r._index_parcel_prefix)
+            if not geo:
+                continue
+            owner = getattr(owners.get(geo), "owner_name", None)
+            evidence = f"index prefix {r._index_parcel_prefix} -> only parcel {geo}; assessor owner {owner or 'unread'}"
+            r.enrichment_data["recording_apn_evidence"] = evidence
+            if owner and _shares_surname(owner, r.party_name, r.heirs):
+                r.parcel_id = geo
+                r.enrichment_data["recording_apn_lookup"] = "found"
+                r.enrichment_data["parcel_source"] = "index_prefix_unique"
+            else:
+                r.enrichment_data["recording_apn_lookup"] = "ambiguous"
+                r.enrichment_data["apn_candidates"] = [geo]
 
     async def _read_cover_sheet(self, url: str, name: str, prefix: str | None, *, delay_first: bool,
                                 instrument: str | None = None):

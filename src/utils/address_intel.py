@@ -204,17 +204,17 @@ def _break_is_spacing(raw: list[str], canon: list[str], seps: list[str], i: int,
     """
     prev = canon[i - 1] if i > 0 else None
     nxt = canon[i + 2] if i + 2 < len(canon) else None
-    if (i > 0 and canon[0].isdigit() and canon[i].isdigit() and len(canon[i]) <= 3
+    if (canon[i].isdigit() and len(canon[i]) <= 3
             and raw[i + 1] in ("TH", "ND") and _ordinal_ok(canon[i], raw[i + 1])
             and nxt in _STREET_TYPE_WORDS
             and all(s.isspace() for s in seps[:i])
-            and all(c in _TRAILING_OPTIONAL_TOKENS for c in canon[1:i])):
-        # "5233 19 TH AVE", "14703 NE 35 TH ST": right after the house number (or its
-        # compass words), plain spaces only, so a range like "120-122 ND AVE" never
-        # feeds it (Codex). Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
+            and all(c in _TRAILING_OPTIONAL_TOKENS for c in canon[:i])):
+        # "5233 19 TH AVE", "14703 NE 35 TH ST": the first number after the house id
+        # (or its compass words), plain spaces only, so "120-122 ND AVE" never feeds it
+        # (Codex). Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
         return True
     if (raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and kind == "." and nxt is None
-            and prev in _STREET_TYPE_WORDS and i >= 3):
+            and prev in _STREET_TYPE_WORDS and i >= 2):
         # "16TH AVE. S.W.": a DOTTED pair, the street's last two chunks, after a type that
         # follows a name. A spaced "N E" may be North E Main, Avenue N East or unit E
         # at Main Ave N (Codex), so "EARL AV N W" keeps today's answer.
@@ -224,9 +224,26 @@ def _break_is_spacing(raw: list[str], canon: list[str], seps: list[str], i: int,
     return False
 
 
+_HOUSE_SPLIT_RE = re.compile(r"\s*(\S+)\s*([.\-]*)\s*(.*)$")
+
+
+def _split_house(street: str) -> tuple[str, str, str] | None:
+    """(house id, punctuation right after it, rest). The house id is everything up to
+    the first space and is compared RAW and whole: "123-45-AB", "123-NORTH", "1508-E"
+    are house ids, never re-spelled (Codex)."""
+    m = _HOUSE_SPLIT_RE.match(street.upper())
+    if not m or not any(ch.isdigit() for ch in m.group(1)):
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
 def _same_street_modulo_punctuation(a: str, b: str) -> bool:
-    ra, ca, sa = _chunks(a)
-    rb, cb, sb = _chunks(b)
+    ha, hb = _split_house(a), _split_house(b)
+    # Same house id, same punctuation after it ("1508 - 1510A" is a range).
+    if ha is None or hb is None or ha[:2] != hb[:2]:
+        return False
+    ra, ca, sa = _chunks(ha[2])
+    rb, cb, sb = _chunks(hb[2])
     if not ca or "".join(ca) != "".join(cb):
         return False
 
@@ -246,10 +263,6 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
             for canon, k in ((ca, ia), (cb, ib)):  # both sides, so order never matters
                 # A dash between two house-like numbers is a range ("1508 - 1510A").
                 if _HOUSE_LIKE_RE.fullmatch(canon[k]) and _HOUSE_LIKE_RE.fullmatch(canon[k + 1]):
-                    return False
-                # Never re-spell the break after the house number: "123-A MAIN" /
-                # "123-AB MAIN" may be the house id, "123 AB MAIN" AB Main St (Codex).
-                if k == 0:
                     return False
                 # "LOT-AB RD" / "LOT.AB RD" is a street name; "LOT AB" is a unit.
                 if canon[k] in _UNIT_WORD_SET:

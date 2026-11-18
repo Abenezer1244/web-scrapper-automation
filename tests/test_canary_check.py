@@ -359,7 +359,7 @@ def test_a_priority_backlog_never_takes_the_routine_slots():
     assert len({c.id for c, _ in units if c in stuck}) == health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
 
 
-def _down(n, record_types=("probate",), hours_ago=2):
+def _down(n, record_types=("probate",), hours_ago=1):
     row = _row(n, record_types, status="down")
     row.id = f"down-{uuid.uuid4().hex}"  # its own Redis marker keys
     row.last_checked = datetime.now(UTC) - timedelta(hours=hours_ago)
@@ -424,30 +424,28 @@ def test_no_down_connector_is_always_the_one_recovered():
 
 
 def test_a_down_connectors_other_types_stay_in_the_rotation():
-    waiting_turn = _down("w", ("probate", "pre_foreclosure", "divorce"), hours_ago=1)
-    older = [_down(f"o{i}", hours_ago=10 + i) for i in range(3)]   # take the recovery slots
-    units = health._canary_units([waiting_turn, *older])
-    assert {c.id for c, _ in units[-3:]} == {c.id for c in older}
-    mine = [rt for c, rt in units if c is waiting_turn]   # the rotation slots are all it
-    assert len(mine) == len(set(mine)) == health.CANARY_ROUTINE_SLOTS
-
-
-def test_a_down_connector_just_probed_waits_and_its_types_rotate():
-    """Codex P2: a source that stays down must not take a priority slot every hour,
-    leaving its other types unwatched."""
-    recent = _down("r", ("probate", "pre_foreclosure", "divorce"), hours_ago=0.5)
-    units = health._canary_units([recent], k=100)   # recovering would probe one type alone
+    down = _down("w", ("probate", "pre_foreclosure", "divorce"))
+    units = health._canary_units([down], k=100)
     assert sorted(rt for _, rt in units) == ["divorce", "pre_foreclosure", "probate"]
-    due = _down("d", ("probate", "pre_foreclosure", "divorce"))
-    assert len(health._canary_units([due], k=100)) == 1
 
 
-def test_a_recovering_connector_is_probed_once_in_its_tick():
-    """Codex P2: a sibling probed after it would overwrite the shared status."""
+def test_a_sibling_probed_in_the_same_tick_runs_before_the_recovery_probe():
+    """Codex P2: probed after it, a working sibling would write the shared status over
+    the still-broken type's verdict."""
     down = _down("d", ("probate", "pre_foreclosure", "divorce"))
     for _ in range(20):
-        units = health._canary_units([down, *(_row(i) for i in range(3))])
-        assert sum(c is down for c, _ in units) == 1
+        units = health._canary_units([down], k=100)
+        assert len(units) == 3 and len({rt for _, rt in units}) == 3
+        assert units[-1][0] is down
+
+
+def test_a_hung_redis_read_is_bounded():
+    r = health._redis(timeout_s=2)
+    try:
+        kw = r.connection_pool.connection_kwargs
+        assert kw["socket_timeout"] == 2 and kw["socket_connect_timeout"] == 2
+    finally:
+        r.close()
 
 
 def test_no_pair_is_probed_twice_in_a_tick():

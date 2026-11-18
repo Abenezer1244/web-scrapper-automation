@@ -452,9 +452,6 @@ CANARY_UNITS_PER_TICK = 5
 # Slots per tick kept for the random rotation, whatever the priority backlog (Codex P1:
 # a connector whose probe never records a verdict must not crowd out every other probe).
 CANARY_ROUTINE_SLOTS = 2
-# A down connector re-probed this recently waits a tick, so a source that stays down
-# does not hold a priority slot every hour and its other types get rotation turns (Codex P2).
-CANARY_RECOVERY_INTERVAL = timedelta(minutes=90)
 # Its "history" windows are forward auction horizons and zero upcoming auctions is
 # legitimate, so an empty probe never downgrades it; it has its own stale-source path.
 _NO_ZERO_OUTPUT_DOWNGRADE = frozenset({"trustee_sale"})
@@ -469,21 +466,17 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     through every other pair. A connector switched on used to wait for the rotation,
     a day or more (Benton tax_delinquent, 2026-11-14).
 
-    A 'down' connector is hidden too, so it shares those priority slots: a random sample
-    of those not probed for CANARY_RECOVERY_INTERVAL, one type each, the type paged down
-    if its marker says so. One
+    A 'down' connector is hidden too, so it shares those priority slots: a random sample,
+    one type each, the type paged down if its marker says so. One
     transient failure used to hide a working source until the rotation came back to it,
     30+ hours (Clallam tax_delinquent, 2026-11-16). Each group keeps a slot while the
-    other has a backlog. Recovery probes run last in the tick; a recovering connector's
-    other types sit that tick out and rotate in until it is due again
-    (CANARY_RECOVERY_INTERVAL)."""
+    other has a backlog. Recovery probes run last in the tick; a down connector's other
+    types stay in the rotation."""
     import random
 
     pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
     waiting = {c.id for c in pending}
-    due = datetime.now(UTC) - CANARY_RECOVERY_INTERVAL
-    down = [c for c in connectors if c.record_types and c.id not in waiting
-            and c.health_status == "down" and c.last_checked <= due]
+    down = [c for c in connectors if c.record_types and c.id not in waiting and c.health_status == "down"]
     slots = max(k - CANARY_ROUTINE_SLOTS, 0)
     n_first = min(len(pending), slots - min(len(down), 1) if slots > 1 else slots)
     first = [(c, random.choice(c.record_types)) for c in random.sample(pending, n_first)]
@@ -493,13 +486,13 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     marked = _down_marked_types(recovering)
     last = [(c, random.choice(marked.get(c.id) or c.record_types)) for c in recovering]
     # Pending connectors stay out of the rotation, so a stuck backlog gets only the
-    # priority slots; their other types rotate in once a probe certifies them. A
-    # recovering connector sits out the rest of this tick: a sibling probed after it
-    # would write the one shared status over its still-broken type (Codex P2).
-    skip = waiting | {c.id for c in recovering}
-    rest = [(c, rt) for c in connectors if c.id not in skip for rt in (c.record_types or [])]
+    # priority slots; their other types rotate in once a probe certifies them.
+    chosen = {(c.id, rt) for c, rt in last}
+    rest = [(c, rt) for c in connectors if c.id not in waiting
+            for rt in (c.record_types or []) if (c.id, rt) not in chosen]
     # Recovery probes run last: one that times out every tick then costs only itself, never
-    # the routine probes (Codex P2), and its own verdict is the last written in its tick.
+    # the routine probes, and a sibling type probed in the same tick cannot write the one
+    # shared status over the still-broken type's verdict (Codex P2s).
     units = first + random.sample(rest, min(k - len(first) - len(last), len(rest)))
     # Slots the rotation cannot fill go to the rest of the pending pairs.
     chosen = {(c.id, rt) for c, rt in units}
@@ -514,7 +507,7 @@ def _down_marked_types(connectors) -> dict:
     if not pairs:
         return {}
     try:
-        r = _redis()
+        r = _redis(timeout_s=2)  # advisory: a hung Redis must not stall the tick (Codex P2)
         try:
             values = r.mget([f"{_BAD_PREFIX}{cid}:{rt}" for cid, rt in pairs])
         finally:
@@ -747,12 +740,13 @@ def _bad_key(connector, record_type: str) -> str:
     return f"{_BAD_PREFIX}{connector.id}:{record_type}"
 
 
-def _redis():
+def _redis(timeout_s: float | None = None):
     import redis as sync_redis
 
     from src.config import settings
 
-    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    bound = {} if timeout_s is None else {"socket_timeout": timeout_s, "socket_connect_timeout": timeout_s}
+    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs(), **bound)
 
 
 def _text(value) -> str | None:

@@ -162,12 +162,14 @@ _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 _ROAD_NUMBER_RE = re.compile(r"\bNO\.?\s*(?=\d)", re.IGNORECASE)
 
 
-# In comparisons a unit is stripped only when it ENDS the street. Anything after it
-# ("OLD LOT 5 RD", "OLD LOT 5 ACCESS RD") makes it part of the name, so it is glued and
-# kept rather than stripped with the rest of the street (Codex).
+_STREET_TYPE_ALT = "|".join(sorted(set(_SUFFIX) | set(_SUFFIX.values()), key=len, reverse=True))
+# In comparisons a "unit" with a street-type word anywhere after it is part of the name
+# ("OLD LOT 5 RD", "OLD LOT 5 ACCESS RD"), so it is glued and kept rather than stripped
+# with the rest of the street (Codex). A trailing unit ("UNIT G 304", "BLDG B") is still
+# stripped: a unit-only difference is not absentee (product rule, module docstring).
 _NAMED_UNIT_RE = re.compile(
-    rf"\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\s*#?\s*([A-Z0-9-]{{1,6}})"
-    r"(?=\s+[A-Z0-9])",
+    rf"\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b\s*#?\s*([A-Z0-9-]{{1,6}})\b"
+    rf"(?=(?:\s+\S+)*?\s+(?:{_STREET_TYPE_ALT})\b)",
     re.IGNORECASE,
 )
 

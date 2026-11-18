@@ -508,3 +508,15 @@ class TestPunctuationAndSpacing:
         ):
             assert compute_owner_flags(a, b)["absentee_owner"] is True, a
             assert compute_owner_flags(b, a)["absentee_owner"] is True, a
+
+    def test_words_starting_with_a_designator_are_not_units(self):
+        # "NORTH" / "NOBLE" start with "NO"; "LOTUS" with "LOT" (regression guard).
+        for a, b in (("411 N 90TH ST #406", "411 NORTH 90TH STREET UNIT #406"),
+                     ("123 NOBLE ST", "123 NOBLE STREET"), ("123 LOTUS LN", "123 LOTUS LANE")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98103", f"{b}, SEATTLE, WA 98103")["absentee_owner"] is False, a
+
+    def test_trailing_unit_only_difference_stays_same_place(self):
+        # Product rule: a unit-only difference on the same street + ZIP is not absentee.
+        for a, b in (("12602 109TH CT NE #G304", "12602 109TH CT NE UNIT G 304"),
+                     ("6021 199TH ST NE", "6021 199TH ST NE BLDG B")):
+            assert compute_owner_flags(f"{a}, KIRKLAND, WA 98034", f"{b}, KIRKLAND, WA 98034")["absentee_owner"] is False, a

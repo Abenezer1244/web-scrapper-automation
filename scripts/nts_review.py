@@ -13,7 +13,9 @@ Commands
   approve   write the notice confirmed against the image. Required: --doc, --sale-date
             (YYYY-MM-DD), --parcel (one of the recording's APNs), --grantor. Optional:
             --sale-time, --address, --amount with --amount-basis (principal|sum_owing),
-            --trustee, --beneficiary. --supersedes <instrument> when the image says it amends
+            --trustee, --beneficiary. --parcel-from-image (with --address as printed): for a
+            recording whose index lists no parcel, the parcel printed on the image, confirmed
+            by the county parcel layer's site address matching the printed one. --supersedes <instrument> when the image says it amends
             an approved notice; --independent when it shares a deed of trust but is a new sale.
             A discontinuance on file that cites only this notice's loan must be answered:
             --discontinued-by <its instrument> or --not-discontinued.
@@ -55,6 +57,7 @@ from src.workers.nts_crawler import (  # noqa: E402
     _profile,
     ReviewError,
     approve_recorder_document,
+    confirm_image_parcel,
     lookup_parcel_situs,
     refresh_notice_address,
     reject_recorder_document,
@@ -153,11 +156,23 @@ def cmd_approve(db, op, args) -> None:
     }
     # Before approval takes its lock: a network lookup must not hold it (Codex).
     county, state, _ = _county_of(db, args.doc)
-    situs = lookup_parcel_situs(county, state, args.parcel) if not args.keep_notice_address else None
+    image_parcel = None
+    if args.parcel_from_image:
+        if args.keep_notice_address:
+            raise SystemExit("--parcel-from-image takes the county's site address: drop --keep-notice-address")
+        try:
+            image_parcel = confirm_image_parcel(county, state, args.parcel, args.address)
+        except ReviewError as exc:
+            raise SystemExit(f"refused: {exc}") from exc
+        values["parcel"] = image_parcel["parcel"]
+        situs = image_parcel["situs"]
+    else:
+        situs = lookup_parcel_situs(county, state, args.parcel) if not args.keep_notice_address else None
     notice = approve_recorder_document(db, args.doc, reviewer=op, values=values,
                                        supersedes=args.supersedes, independent=args.independent,
                                        discontinued_by=args.discontinued_by,
-                                       not_discontinued=args.not_discontinued, situs=situs)
+                                       not_discontinued=args.not_discontinued, situs=situs,
+                                       image_parcel=image_parcel)
     db.commit()
     print(f"approved: notice {notice}")
     _print_address(args.address, situs)
@@ -219,6 +234,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--not-discontinued", action="store_true")
     p.add_argument("--amount-basis", choices=("principal", "sum_owing"))
     p.add_argument("--independent", action="store_true")
+    p.add_argument("--parcel-from-image", action="store_true",
+                   help="the recording lists no parcel: confirm the one printed on the image")
     p.add_argument("--keep-notice-address", action="store_true",
                    help="use the printed address even when the parcel has a current site address")
     sub.add_parser("refresh-address").add_argument("--doc", required=True)

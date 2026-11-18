@@ -1591,17 +1591,99 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     return " ".join((found or "").split())[:512] or None
 
 
+def image_address_disagreement(printed: str, situs: str, city: str | None, zip_code: str | None) -> str | None:
+    """Why the address printed on a notice is not the county's site address for a parcel,
+    or None when they agree. Pure. Same street key (house number, street, directional);
+    and where both sides give one, the same unit, city and ZIP: a street key alone drops
+    units and ZIP, so a neighbouring parcel could pass (Codex High). A printed unit the
+    layer does not carry cannot be verified: refused. Known limit: two parcels sharing
+    one site address both agree; the parcel itself is the one the operator copies from
+    the image. The unit is exactly what the street
+    key strips (its own markers: APT, LOT, BLDG, TRLR, #...), so the two never drift."""
+    from src.utils.address_intel import (
+        _HASH_UNIT_RE,
+        _UNIT_STRIP_RE,
+        address_match_key,
+        parse_property_for_display,
+    )
+
+    def _unit(address: str) -> str | None:
+        # Both strips, in the street key's own order: the whole tail they remove, so
+        # "LOT 2 #4" and "LOT 3 #4" stay different (Codex).
+        street = " ".join((parse_property_for_display(address).get("street") or "").upper().split())
+        base = _UNIT_STRIP_RE.sub("", _HASH_UNIT_RE.sub("", street))
+        # "#" kept (only "# 4" -> "#4"): folding it would make "LOT 2 #4" equal "LOT 2 4".
+        tail = re.sub(r"#\s+", "#", " ".join(street[len(base):].split()))
+        return tail or None
+
+    want, have = address_match_key(printed), address_match_key(situs)
+    if not want or not have or want.split("|")[0] != have.split("|")[0]:
+        return "the street is not the same"
+    p_unit, l_unit = _unit(printed), _unit(situs)
+    if (p_unit or l_unit) and p_unit != l_unit:
+        return "the unit cannot be matched"
+    parsed = parse_property_for_display(printed)
+    if parsed.get("zip") and zip_code and parsed["zip"][:5] != str(zip_code)[:5]:
+        return "the ZIP code differs"
+    if parsed.get("city") and city and " ".join(parsed["city"].upper().split()) != " ".join(city.upper().split()):
+        return "the city differs"
+    return None
+
+
+def confirm_image_parcel(county: str, state: str, parcel: str, printed_address: str | None) -> dict:
+    """Evidence that a parcel printed on a notice image is that notice's property, for a
+    recording whose recorder index lists no parcel (Cowlitz 3798834, 3799365, 3799644).
+    Network: call before approval takes its lock; pass the result as ``image_parcel``.
+
+    A parcel the layer knows proves only that it exists, not that it is this property,
+    and a typo can hit a real neighbour (Codex High). So: the COUNTY layer only (no
+    statewide fallback), the exact parcel, and the county's site address for it must be
+    the printed address (same street key: house number, street, directional). A parcel
+    with no site address in the layer (vacant land) is refused: its legal description
+    would need checking by hand. Raises ReviewError; never returns a guess."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    cleaned = (parcel or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9-]+", cleaned):
+        raise ReviewError("the parcel must be letters, digits and hyphens as printed")
+    cleaned = cleaned.replace("-", "")  # the recorder drops them: 2-3292 is 23292
+    if len(cleaned) < cg.gis_min_parcel_len(county, state):
+        raise ReviewError("the parcel is shorter than any parcel in this county")
+    printed = " ".join((printed_address or "").split())
+    if not printed:
+        raise ReviewError("--address (as printed on the image) is required to confirm the parcel")
+    config = cg._effective_gis_config(f"{county.lower()}_{state.upper()}")
+    if not cg.settings.GIS_ENRICHMENT_ENABLED or not config:
+        raise ReviewError(f"no county parcel layer to confirm a {county} parcel against")
+    row = cg._batch_query_county([cleaned], config).get(cleaned) or {}
+    situs = " ".join((row.get("property_address") or "").split())[:512]
+    if not situs:
+        raise ReviewError(f"the county parcel layer has no site address for {cleaned}: "
+                          "confirm it against the legal description by hand, not here")
+    city, zip_code = row.get("property_city"), row.get("property_zip")
+    why = image_address_disagreement(printed, situs, city, zip_code)
+    if why:
+        raise ReviewError(f"the county's site address for {cleaned} ({situs}) is not the "
+                          f"address printed on the notice: {why}")
+    return {"county": county, "state": state, "parcel": cleaned, "situs": situs,
+            "city": city, "zip": zip_code, "printed": printed}
+
+
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
                               supersedes: str | None = None, independent: bool = False,
                               discontinued_by: str | None = None, not_discontinued: bool = False,
-                              situs: str | None = None, today=None) -> str:
+                              situs: str | None = None, image_parcel: dict | None = None,
+                              today=None) -> str:
     """The operator has compared the staged read with the recorded image: write the
     notice they confirmed. Returns the nts_notices id. Caller commits.
 
     ``values`` are what the reviewer read off the image: auction_date (date), parcel
     and grantor are required; auction_time, property_address, principal_owing (Decimal)
     with principal_owing_basis, trustee and beneficiary are optional. The parcel must be
-    one of the recording's own APNs. The grantor goes through the privacy gate into
+    one of the recording's own APNs, except for a recording whose index lists none: then
+    ``image_parcel`` (:func:`confirm_image_parcel`'s evidence, for this county and this
+    parcel) stands in, its site address becomes the property address, and the approval
+    records parcel_source 'notice_image'. The grantor goes through the privacy gate into
     nts_notices only, never into staging.
 
     A later notice for the same sale is linked EXPLICITLY (``supersedes``: the older
@@ -1642,8 +1724,28 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     today = today or datetime.now(UTC).date()
 
     parcel = (values.get("parcel") or "").strip()
-    if parcel not in (_recording_facts(doc)["recording_apns"] or []):
-        raise ReviewError("the parcel is not one of this recording's own APNs")
+    recording_apns = _recording_facts(doc)["recording_apns"] or []
+    parcel_source = "recording"
+    if image_parcel is not None:
+        # Rechecked under the lock: the evidence must be for this county and parcel, and
+        # the recording must still list no parcel of its own (Codex).
+        if recording_apns:
+            raise ReviewError("this recording lists its own APNs: use one of them, not the image")
+        printed_now = " ".join((values.get("property_address") or "").split())
+        if (image_parcel.get("county"), image_parcel.get("state")) != (doc.county, doc.state) \
+                or image_parcel.get("parcel") != parcel or not image_parcel.get("situs") \
+                or not printed_now or image_parcel.get("printed") != printed_now:
+            raise ReviewError("the parcel confirmation is not for this county, parcel and printed address")
+        # The agreement is checked again here, from the evidence, at the approval boundary.
+        why = image_address_disagreement(printed_now, image_parcel["situs"],
+                                         image_parcel.get("city"), image_parcel.get("zip"))
+        if why:
+            raise ReviewError(f"the printed address is not the parcel's site address: {why}")
+        situs, parcel_source = image_parcel["situs"], "notice_image"
+    elif parcel not in recording_apns:
+        raise ReviewError("the parcel is not one of this recording's own APNs"
+                          + ("" if recording_apns else
+                             " (it lists none: confirm one printed on the image with --parcel-from-image)"))
     auction = values.get("auction_date")
     if auction is None:
         raise ReviewError("a sale date is required")
@@ -1722,6 +1824,8 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         "principal_owing_basis": basis,
         "trustee": (values.get("trustee") or None), "beneficiary": (values.get("beneficiary") or None),
     }
+    if parcel_source != "recording":
+        approved["parcel_source"] = parcel_source
     payload = "|".join(str(v or "") for v in (doc.instrument_number, *approved.values()))
     now = datetime.now(UTC)
     _upsert_notice(db, NtsNotice, {

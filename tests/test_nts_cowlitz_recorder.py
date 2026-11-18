@@ -24,6 +24,7 @@ from src.workers.nts_crawler import (
     COWLITZ_RECORDER_SOURCE,
     ReviewError,
     approve_recorder_document,
+    confirm_image_parcel,
     reject_recorder_document,
     relocate_recorder_entries,
     stage_discontinuance,
@@ -503,3 +504,136 @@ def test_the_review_cli_reviews_a_cowlitz_notice_in_cowlitz(tmp_path, capsys, mo
                                                                            "123 MAIN ST, KELSO, WA 98626")
         finally:
             outer.rollback()
+
+
+# ── a recording whose index lists no parcel (3798834, 3799365, 3799644) ─────────
+
+_SITUS_ROW = {"property_address": "1430 HAZEL DELL RD", "property_city": "CASTLE ROCK",
+              "property_zip": "98611", "mailing_address": None, "matched": True}
+_PRINTED = "1430 Hazel Dell Rd, Castle Rock, WA 98611"
+
+
+@pytest.fixture
+def county_layer(monkeypatch):
+    """The Cowlitz county layer answering for WJ2811002 only; the statewide one is never asked."""
+    import src.scrapers.enrichment.county_gis as cg
+
+    asked: list[list[str]] = []
+
+    def _county(parcel_ids, cfg, unreached=None):
+        asked.append(list(parcel_ids))
+        return {p: dict(_SITUS_ROW) for p in parcel_ids if p == "WJ2811002"}
+
+    def _never(*a, **k):
+        raise AssertionError("statewide layer asked")
+
+    monkeypatch.setattr(cg.settings, "GIS_ENRICHMENT_ENABLED", True, raising=False)
+    monkeypatch.setattr(cg, "_batch_query_county", _county)
+    monkeypatch.setattr(cg, "_batch_query_wa_statewide", _never)
+    return asked
+
+
+def _unlisted(db, tmp_path) -> str:
+    return _stage(db, tmp_path, item="38781620", instrument="3798834", apns=(), related=("3695865",),
+                  recorded="10/22/2026", entry="3798834-0")
+
+
+def test_a_parcel_printed_on_the_image_is_approved_when_the_county_confirms_its_address(
+        db, tmp_path, county_layer):
+    doc_id = _unlisted(db, tmp_path)
+    evidence = confirm_image_parcel("cowlitz", "WA", "WJ2811002", _PRINTED)
+    assert county_layer == [["WJ2811002"]]
+    approve_recorder_document(db, doc_id, reviewer="op-1",
+                              values=_values(parcel="WJ2811002", property_address=_PRINTED),
+                              situs=evidence["situs"], image_parcel=evidence)
+    db.flush()
+    n = _notice(db, "3798834")
+    assert (n.parcel, n.property_address, n.address_source) == (
+        "WJ2811002", "1430 HAZEL DELL RD", "assessor_situs")
+    row = db.get(Doc, doc_id)
+    assert row.fields["approved"]["parcel_source"] == "notice_image"
+    assert row.fields["recording_apns"] == []                   # the recording's facts unchanged
+
+
+@pytest.mark.parametrize("parcel,address,match", [
+    ("WJ2811002", "1431 Hazel Dell Rd, Castle Rock, WA 98611", "is not the address printed"),
+    ("WJ2811002", "1430 Pacific Ave, Castle Rock, WA 98611", "is not the address printed"),
+    ("WJ2811002", "1430 Hazel Dell Rd, Kelso, WA 98611", "the city differs"),
+    ("WJ2811002", "1430 Hazel Dell Rd, Castle Rock, WA 98626", "the ZIP code differs"),
+    ("WJ2811002", "1430 Hazel Dell Rd Unit 2, Castle Rock, WA 98611", "the unit cannot be matched"),
+    ("WJ2811002", "1430 Hazel Dell Rd Lot 2, Castle Rock, WA 98611", "the unit cannot be matched"),
+    ("WJ2811002", None, "--address"),
+    ("3015103", "1430 Hazel Dell Rd, Castle Rock, WA 98611", "has no site address"),
+    ("WJ 2811002", "1430 Hazel Dell Rd", "letters, digits and hyphens"),
+    ("12-3", "1430 Hazel Dell Rd", "shorter than any parcel"),
+], ids=["house-number", "street", "city", "zip", "unit", "lot", "no-address", "unknown-parcel", "space",
+        "too-short"])
+def test_an_image_parcel_the_county_does_not_confirm_is_refused(county_layer, parcel, address, match):
+    with pytest.raises(ReviewError, match=match):
+        confirm_image_parcel("cowlitz", "WA", parcel, address)
+
+
+def test_hyphens_are_dropped_as_the_recorder_drops_them(monkeypatch):
+    import src.scrapers.enrichment.county_gis as cg
+
+    monkeypatch.setattr(cg.settings, "GIS_ENRICHMENT_ENABLED", True, raising=False)
+    monkeypatch.setattr(cg, "_batch_query_county", lambda ids, cfg, unreached=None: {
+        p: {"property_address": "1007 S 5TH AVE", "property_city": "KELSO", "property_zip": "98626",
+            "matched": True} for p in ids if p == "23292"})
+    assert confirm_image_parcel("cowlitz", "WA", "2-3292", "1007 S 5th Ave, Kelso, WA 98626")["parcel"] == "23292"
+
+
+def test_image_evidence_is_refused_for_a_recording_that_lists_its_own_apns(db, tmp_path):
+    doc_id = _stage(db, tmp_path)                                # lists 61896, 6190401
+    with pytest.raises(ReviewError, match="lists its own APNs"):
+        approve_recorder_document(db, doc_id, reviewer="op-1",
+                                  values=_values(parcel="WJ2811002", property_address=_PRINTED),
+                                  image_parcel=dict(_EVIDENCE))
+    assert _notice(db, "3799745") is None
+
+
+_EVIDENCE = {"county": "cowlitz", "state": "WA", "parcel": "WJ2811002", "situs": "1430 HAZEL DELL RD",
+             "city": "CASTLE ROCK", "zip": "98611", "printed": _PRINTED}
+_NOT_FOR = "not for this county, parcel and printed address"
+
+
+@pytest.mark.parametrize("change,printed,match", [
+    ({"county": "chelan"}, _PRINTED, _NOT_FOR),
+    ({"parcel": "3015103"}, _PRINTED, _NOT_FOR),
+    ({"situs": None}, _PRINTED, _NOT_FOR),
+    ({}, "1431 Hazel Dell Rd, Castle Rock, WA 98611", _NOT_FOR),
+    ({}, None, _NOT_FOR),
+    # Evidence made up by a caller is re-judged at the boundary, not trusted.
+    ({"situs": "9 OTHER RD"}, _PRINTED, "is not the parcel's site address"),
+], ids=["other-county", "other-parcel", "no-situs", "other-printed", "no-printed", "fabricated"])
+def test_image_evidence_for_anything_else_is_refused(db, tmp_path, change, printed, match):
+    doc_id = _unlisted(db, tmp_path)
+    with pytest.raises(ReviewError, match=match):
+        approve_recorder_document(db, doc_id, reviewer="op-1",
+                                  values=_values(parcel="WJ2811002", property_address=printed),
+                                  image_parcel={**_EVIDENCE, **change})
+
+
+def test_without_the_image_flag_an_unlisted_recording_says_how_to_proceed(db, tmp_path):
+    doc_id = _unlisted(db, tmp_path)
+    with pytest.raises(ReviewError, match="--parcel-from-image"):
+        approve_recorder_document(db, doc_id, reviewer="op-1", values=_values(parcel="WJ2811002"))
+
+
+@pytest.mark.parametrize("printed,situs,agrees", [
+    ("1430 Hazel Dell Rd Lot 2, Castle Rock, WA 98611", "1430 HAZEL DELL RD LOT 3", False),
+    ("1430 Hazel Dell Rd Lot 2, Castle Rock, WA 98611", "1430 HAZEL DELL RD LOT 2", True),
+    ("12 Main St #4B, Kelso, WA 98626", "12 MAIN ST APT 4B", False),
+    ("12 Main St Bldg 2, Kelso, WA 98626", "12 MAIN ST", False),
+    ("12 Main St, Kelso, WA 98626", "12 MAIN ST TRLR 7", False),
+    ("1007 S 5th Ave, Kelso, WA 98626", "1007 S 5TH AVE", True),
+    ("12 Main St Lot 2 #4, Kelso, WA 98626", "12 MAIN ST LOT 3 #4", False),
+    ("12 Main St Lot 2 #4, Kelso, WA 98626", "12 MAIN ST LOT 2 #4", True),
+    ("12 Main St Lot 2 #4, Kelso, WA 98626", "12 MAIN ST LOT 2 4", False),
+    ("12 Main St # 4, Kelso, WA 98626", "12 MAIN ST #4", True),
+], ids=["other-lot", "same-lot", "marker-differs", "printed-bldg", "layer-trailer", "plain", "lot-and-hash", "same-lot-hash", "hash-vs-bare",
+        "hash-spacing"])
+def test_units_are_compared_as_the_street_key_strips_them(printed, situs, agrees):
+    from src.workers.nts_crawler import image_address_disagreement
+
+    assert (image_address_disagreement(printed, situs, None, None) is None) is agrees

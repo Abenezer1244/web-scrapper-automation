@@ -21,6 +21,8 @@ Commands
             and becomes the property
             address; --address (what the notice printed) is kept beside it. A printed
             address can be years out of date. --keep-notice-address uses the printed one.
+            When the crawl stored no APN (Chelan indexes it some time after recording),
+            the recorder page is read again and the parcel must be one it lists now.
   refresh-address  --doc of an approved notice: give it the parcel's current site
             address, keeping the printed one. Refused once it has gone out as a
             trustee-sale lead (its address is part of that lead's identity).
@@ -55,6 +57,7 @@ from src.workers.nts_crawler import (  # noqa: E402
     _profile,
     ReviewError,
     approve_recorder_document,
+    chelan_live_recording_apns,
     lookup_parcel_situs,
     refresh_notice_address,
     reject_recorder_document,
@@ -93,15 +96,17 @@ def _image_url(doc) -> str:
     return _profile(doc.county, doc.state)["url"](doc.transaction_item_id)
 
 
-def _county_of(db, doc_id: str) -> tuple[str, str, dict]:
-    """The staged document's county, state and fields, read and released before any
-    network lookup (approval and refresh re-read the row under their own lock)."""
-    d = db.get(Doc, doc_id)
-    if d is None:
-        raise SystemExit("no staged document with that id")
-    found = (d.county, d.state, dict(d.fields or {}))
+def _county_of(db, doc_id: str) -> tuple[str, str, dict, str]:
+    """The staged document's county, state, fields and recorder item id, read and
+    released before any network lookup (approval and refresh re-read the row under their
+    own lock). Plain values, not an ORM object: a cached object could carry a stale
+    'pending_review' into approval after another reviewer decided the row (Codex)."""
+    row = db.execute(select(Doc.county, Doc.state, Doc.fields, Doc.transaction_item_id)
+                     .where(Doc.id == doc_id)).one_or_none()
     db.rollback()
-    return found
+    if row is None:
+        raise SystemExit("no staged document with that id")
+    return row.county, row.state, dict(row.fields or {}), row.transaction_item_id
 
 
 def cmd_list(db, op, args) -> None:
@@ -151,13 +156,18 @@ def cmd_approve(db, op, args) -> None:
         "principal_owing": _amount(args.amount), "principal_owing_basis": args.amount_basis,
         "trustee": args.trustee, "beneficiary": args.beneficiary,
     }
-    # Before approval takes its lock: a network lookup must not hold it (Codex).
-    county, state, _ = _county_of(db, args.doc)
+    # Before approval takes its lock: network reads must not hold it (Codex).
+    county, state, fields, item = _county_of(db, args.doc)
+    live_apns = None
+    if (county, state) == ("chelan", "WA") and fields.get("recording_apns") == []:
+        live_apns = chelan_live_recording_apns(item)
+        print(f"the crawl stored no APN; the recorder page lists now: {live_apns}")
     situs = lookup_parcel_situs(county, state, args.parcel) if not args.keep_notice_address else None
     notice = approve_recorder_document(db, args.doc, reviewer=op, values=values,
                                        supersedes=args.supersedes, independent=args.independent,
                                        discontinued_by=args.discontinued_by,
-                                       not_discontinued=args.not_discontinued, situs=situs)
+                                       not_discontinued=args.not_discontinued, situs=situs,
+                                       live_apns=live_apns)
     db.commit()
     print(f"approved: notice {notice}")
     _print_address(args.address, situs)
@@ -174,7 +184,7 @@ def _print_address(printed: str | None, situs: str | None) -> None:
 
 
 def cmd_refresh_address(db, op, args) -> None:
-    county, state, fields = _county_of(db, args.doc)  # refresh takes the lock itself
+    county, state, fields, _ = _county_of(db, args.doc)  # refresh takes the lock itself
     parcel = (fields.get("approved") or {}).get("parcel")
     if not parcel:
         raise SystemExit("this document has no approved parcel")

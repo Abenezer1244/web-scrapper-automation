@@ -1591,10 +1591,95 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     return " ".join((found or "").split())[:512] or None
 
 
+_MORE_PARCELS_RE = re.compile(
+    r"\b(?:ADDITIONAL|SEE|ATTACHED|EXHIBIT|SCHEDULE|CONT(?:INUED)?|PAGE|PG|ETC|OTHERS?|MORE|REMAINING)\b", re.I
+)
+_APN_LIST_WORD = re.compile(r"(?:NO|NOS|AND|APNS?)\.?", re.I)
+_CHELAN_APN_RE = re.compile(r"\d{12}")
+
+
+
+def _doc_legal_lines(html_text: str) -> list[str] | None:
+    """The text lines of a recording detail page's DocLegal value, or None when the page
+    has no such block."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    label = next((d for d in soup.find_all("div", class_="detailLabel")
+                  if " ".join(d.get_text().split()).rstrip(":").upper() == "DOCLEGAL"), None)
+    value = label.find_next_sibling("div", class_="listDocDetails") if label else None
+    if value is None:
+        return None
+    # Every text line in the block, inside a <span> or not (Codex): a line outside a
+    # span would otherwise go unchecked.
+    for hidden in value.find_all(class_="expandDown"):
+        hidden.decompose()
+    # Lines are the page's own <br> breaks, not text nodes: a number split across
+    # inline tags reads as the one number it renders as (Codex).
+    for br in value.find_all("br"):
+        br.replace_with("\n")
+    return [" ".join(x.split()) for x in value.get_text("").split("\n") if x.strip()]
+
+
+def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
+    """The APNs the recording's detail page lists NOW, or None when the page cannot be
+    read. Chelan indexes a recording's APN some time after recording it: 2629393 was
+    crawled the day after it was recorded with no APN on its page, and the page has
+    listed APN 252104732030 since. Network: call it OUTSIDE any transaction holding
+    NTS_CANCEL_LOCK_KEY."""
+    from src.scrapers.templates.acclaimweb import parse_detail_apns
+
+    try:
+        html_text = _bounded_fetch(
+            f"{_CHELAN_RECORDER}/details/documentdetails/{transaction_item_id}/1/1/11",
+            _DETAIL_MAX_BYTES, _DETAIL_FETCH_S, {"User-Agent": _PDF_BROWSER_UA},
+        ).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 -- unreadable: nothing is re-read
+        _logger.warning("Chelan detail page %s unreadable for the APN re-read", transaction_item_id)
+        return None
+    apns = parse_detail_apns(html_text)
+    if apns is None:
+        return None
+    lines = _doc_legal_lines(html_text)
+    if lines is None:  # no DocLegal block to check against
+        return apns if not apns else None
+    # Trusted only when it is the whole, clean answer, judged without guessing where an
+    # APN sits on the page (Codex found a new layout for every heuristic): in the
+    # DocLegal block every number of 3+ digits (dash-joined) must be a whole 12-digit
+    # Chelan APN, and every APN label must be followed by one. A split APN always
+    # leaves such a piece, so it can never yield a shorter list. The cost: a legal that
+    # also carries plat or volume numbers ("SP 2019-008") is unknown here, which only
+    # matters when the crawl stored no APN and an operator then rejects or waits.
+    block = re.sub(r"(?<=\d)-\s*(?=\d)", "", " ".join(lines))
+    # Chelan's recording guide lets the first page list the parcels that fit and refer
+    # elsewhere for the rest (Codex): a pointer to more parcels makes the list unknown.
+    if _MORE_PARCELS_RE.search(block):
+        return None
+    found: list[str] = []
+    for number in re.findall(r"\d+", block):
+        if _CHELAN_APN_RE.fullmatch(number):
+            found.append(number)
+        elif len(number) >= 3:
+            return None
+    # Numbers side by side (only spaces or punctuation between) must all be whole APNs:
+    # an APN in short pieces ("25 21 04 73 20 30") is never read as fewer APNs. A lone
+    # short number after a word ("LOT 2", "SEC 12") is the legal description.
+    for run in re.finditer(r"\d+(?:[^\w]+\d+)+", block):
+        if any(not _CHELAN_APN_RE.fullmatch(g) for g in re.findall(r"\d+", run.group(0))):
+            return None
+    for label in re.finditer(r"\bAPNS?\b", block, re.I):
+        after = re.sub(r"[&/+,;:#()]", " ", block[label.end():]).split()
+        first = next((t for t in after if not _APN_LIST_WORD.fullmatch(t)), "")
+        if not _CHELAN_APN_RE.fullmatch(first):
+            return None  # a label whose APN is not the next thing on the page
+    return apns if list(dict.fromkeys(found)) == apns else None
+
+
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
                               supersedes: str | None = None, independent: bool = False,
                               discontinued_by: str | None = None, not_discontinued: bool = False,
-                              situs: str | None = None, today=None) -> str:
+                              situs: str | None = None, live_apns: list[str] | None = None,
+                              today=None) -> str:
     """The operator has compared the staged read with the recorded image: write the
     notice they confirmed. Returns the nts_notices id. Caller commits.
 
@@ -1619,6 +1704,11 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     resolved by the caller before this takes the lock. When given it becomes the
     notice's property_address (address_source 'assessor_situs') and the printed address
     is kept as address_on_notice; without it the printed address stands ('notice').
+
+    ``live_apns`` is what the recording's detail page lists now
+    (:func:`chelan_live_recording_apns`, read by the caller before the lock). It is used
+    only when the crawl stored NO APN (an empty list, never an unknown one): the county
+    had not indexed it yet. The parcel must then be one of those, and they are stored.
     """
     import hashlib
     from decimal import Decimal
@@ -1634,6 +1724,8 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         raise ReviewError("--supersedes and --independent contradict each other")
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
     doc = _recorder_doc_for_review(db, doc_id)
+    if live_apns is not None and (doc.county, doc.state) != ("chelan", "WA"):
+        raise ReviewError("a re-read of the recording's APNs is for Chelan recordings only")
     prof = _profile(doc.county, doc.state)
     if doc.doc_code not in prof["nts_codes"]:
         raise ReviewError("this is a discontinuance, not a notice: use resolve-nod")
@@ -1642,7 +1734,11 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     today = today or datetime.now(UTC).date()
 
     parcel = (values.get("parcel") or "").strip()
-    if parcel not in (_recording_facts(doc)["recording_apns"] or []):
+    recording_apns = _recording_facts(doc)["recording_apns"]
+    reread = recording_apns == [] and bool(live_apns)
+    if reread:
+        recording_apns = list(dict.fromkeys(live_apns))
+    if parcel not in (recording_apns or []):
         raise ReviewError("the parcel is not one of this recording's own APNs")
     auction = values.get("auction_date")
     if auction is None:
@@ -1756,8 +1852,12 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     notes = [f"supersedes {supersedes}" if supersedes
              else "independent of other notices on its deed of trust" if independent else None,
              f"discontinued by {ending.instrument_number}" if ending is not None else None,
-             "not discontinued by the loan's discontinuance(s) on file" if not_discontinued else None]
+             "not discontinued by the loan's discontinuance(s) on file" if not_discontinued else None,
+             "APNs re-read from the recorder page at approval" if reread else None]
     doc.decision_note = "; ".join(n for n in notes if n) or None
+    if reread:
+        doc.fields = {**(doc.fields or {}), "recording_apns": recording_apns}
+        doc.recording_apn = recording_apns[0] if len(recording_apns) == 1 else None
     doc.fields = {**_recording_facts(doc), "approved": approved}  # no grantor, no OCR text
     return str(notice_id)
 

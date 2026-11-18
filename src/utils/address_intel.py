@@ -157,8 +157,14 @@ _MARKED_UNIT_RE = re.compile(
 _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 
 
+# "NO 5" names a road ("COUNTY ROAD NO 5"), so in comparisons it is kept, never stripped
+# as a unit (Codex). Glued as "NO_5" so _UNIT_STRIP_RE cannot see a designator.
+_ROAD_NUMBER_RE = re.compile(r"\bNO\.?\s*(?=\d)", re.IGNORECASE)
+
+
 def _compare_street(street: str | None) -> str:
     s = _DIGIT_DOT_RE.sub("_", _DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _ROAD_NUMBER_RE.sub("NO_", s)
     # No trailing " -" cleanup: "MAIN ST - LOT A RD" may be a street name (Codex).
     return _normalize_street(s)
 

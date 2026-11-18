@@ -1586,6 +1586,20 @@ _CHELAN_APN_RE = re.compile(r"\d{12}")
 
 
 
+def _doc_legal_lines(html_text: str) -> list[str] | None:
+    """The lines of a recording detail page's DocLegal value (one <span> each), or None
+    when the page has no such block."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    label = next((d for d in soup.find_all("div", class_="detailLabel")
+                  if " ".join(d.get_text().split()).rstrip(":").upper() == "DOCLEGAL"), None)
+    value = label.find_next_sibling("div", class_="listDocDetails") if label else None
+    if value is None:
+        return None
+    return [" ".join(span.get_text().split()) for span in value.find_all("span")]
+
+
 def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     """The APNs the recording's detail page lists NOW, or None when the page cannot be
     read. Chelan indexes a recording's APN some time after recording it: 2629393 was
@@ -1602,33 +1616,26 @@ def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
     except Exception:  # noqa: BLE001 -- unreadable: nothing is re-read
         _logger.warning("Chelan detail page %s unreadable for the APN re-read", transaction_item_id)
         return None
-    import html
-
-    from src.scrapers.templates.acclaimweb import _DOC_LEGAL_RE
-
     apns = parse_detail_apns(html_text)
     if apns is None:
         return None
-    # Trusted only when it is the whole, clean answer (Codex). The legal after the APN
-    # label is read for runs of digit groups separated only by spaces or punctuation
-    # (never by a word). A run of 9+ digits must be whole 12-digit Chelan APNs; shorter
-    # runs are lots, blocks and plats. The APNs found must be exactly the parser's.
-    # Anything else (a split, spaced or odd-length number) makes the answer unknown,
-    # never a shorter list. Entities are decoded first (&nbsp;, &amp;).
-    text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", html_text)).split())
-    legal = _DOC_LEGAL_RE.search(text)
-    label = re.search(r"\bAPN\b", legal.group(1), re.I) if legal else None
-    if not label:
+    lines = _doc_legal_lines(html_text)
+    if lines is None:  # no DocLegal block to check against
         return apns if not apns else None
-    field = re.sub(r"(?<=\d)-(?=\d)", "", legal.group(1)[label.end():])
+    # Trusted only when it is the whole, clean answer (Codex). Each line of the
+    # DocLegal block that starts with APN must hold nothing but whole 12-digit Chelan
+    # APNs (separators, NO. and # aside); other lines are the legal description. The
+    # block comes from the page structure, not from where a word happens to appear.
     found: list[str] = []
-    for run in re.finditer(r"\d+(?:[^\w]+\d+)*", field):
-        groups = re.findall(r"\d+", run.group(0))
-        if sum(len(g) for g in groups) < 9:
+    for line in lines:
+        head = re.match(r"\s*APNS?\b(.*)", line, re.I | re.S)
+        if not head:
             continue
-        if any(not _CHELAN_APN_RE.fullmatch(g) for g in groups):
-            return None
-        found.extend(groups)
+        rest = re.sub(r"(?<=\d)-(?=\d)", "", head.group(1))
+        for token in re.sub(r"[&/+,;:#]|\b(?:NO|NOS|AND|APNS?)\b\.?", " ", rest, flags=re.I).split():
+            if not _CHELAN_APN_RE.fullmatch(token):
+                return None
+            found.append(token)
     return apns if list(dict.fromkeys(found)) == apns else None
 
 

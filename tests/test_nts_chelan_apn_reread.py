@@ -111,34 +111,46 @@ def test_the_cli_does_not_re_read_when_the_crawl_stored_apns(c, db, tmp_path, mo
     assert c.execute(text("SELECT parcel FROM nts_notices WHERE ts_number = 'REC-2630004'")).scalar() == _APN
 
 
-@pytest.mark.parametrize("legal,expected", [
-    ("APN 222014846080", ["222014846080"]),                         # the clean, whole answer
-    ("APN 222014846080 252104732030", ["222014846080", "252104732030"]),
-    ("APN 123456789 SP 2019-008", None),                            # 9 digits: not a Chelan APN
-    ("APN 222014846080 2521 0473 2030", None),                      # a second APN in spaced groups
-    ("APN 2220 1484 6080", None),                                   # an APN the parser cannot read
-    ("APN 222014846080 252104 732030", None),                       # second APN in two groups
-    ("APN 2521&nbsp;0473&nbsp;2030", None),                         # entity-spaced APN
-    ("APN 222014846080 SEC TWP RGE 12 23 20", ["222014846080"]),    # numbers after words are not APNs
-    ("APN 222014846080 NORTH ENTIAT LOT 2 BLK 2", ["222014846080"]),  # 2629393's shape
-    ("SP 2019-008 LOT 7", []),                                      # no APN label: none listed
-    ("APN 222014846080 &amp; 252104 732030", None),                 # split APN after a separator
-    ("APN: 252104 732030", None),                                   # colon, then a split APN
-    ("APN: 222014846080, 252104732030 LOT 7", ["222014846080", "252104732030"]),
-    ("APN 222014846080 AND 252104732030", ["222014846080", "252104732030"]),
-    ("APN 222014846080 &amp;252104 732030 LOT 7", None),            # separator glued to a split APN
-    ("APN 222014846080;252104732030", ["222014846080", "252104732030"]),
-    ("APN 222014846080; APN 252104 732030 LOT 7", None),           # repeated label, split APN
-    ("APN 222014846080; APN 252104732030 LOT 7", ["222014846080", "252104732030"]),
-    ("APN #252104732030", ["252104732030"]),
-    ("APN 222014846080; APN NO. 252104 732030 LOT 7", None),       # label word, then a split APN
-    ("APN 222014846080 SP 2019-008 LOT 7", ["222014846080"]),       # plat and lot numbers
-    ("APN 2220-1484-6080", ["222014846080"]),                       # dashed APN
-], ids=["clean", "two-clean", "nine-digit", "spaced-second", "spaced-only", "two-groups",
-        "nbsp", "sec-twp-rge", "2629393-shape", "no-label", "amp-split", "colon-split",
-        "comma-list", "and-list", "glued-amp-split", "glued-semicolon", "repeated-label-split",
-        "repeated-label", "hash", "apn-no-split", "plat-and-lot", "dashed"])
-def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, legal, expected):
-    page = _DETAIL.replace("APN 222014846080", legal)
+_LEGAL_BLOCK = '<span class="" >APN 222014846080</span><br /><span class="" >SP 2019-008 LOT 7</span><br />'
+
+
+def _page(*lines: str) -> str:
+    """The real detail page with its DocLegal block replaced, one <span> per line."""
+    assert _LEGAL_BLOCK in _DETAIL
+    return _DETAIL.replace(_LEGAL_BLOCK, "".join(f'<span class="" >{x}</span><br />' for x in lines))
+
+
+@pytest.mark.parametrize("lines,expected", [
+    (["APN 222014846080", "SP 2019-008 LOT 7"], ["222014846080"]),         # the real shape
+    (["APN 252104732030", "NORTH ENTIAT LOT 2 BLK 2"], ["252104732030"]),  # 2629393
+    (["APN 222014846080 252104732030"], ["222014846080", "252104732030"]),
+    (["APN 222014846080", "APN 252104732030", "LOT 7"], ["222014846080", "252104732030"]),
+    (["APN: 222014846080, 252104732030"], ["222014846080", "252104732030"]),
+    (["APN #252104732030"], ["252104732030"]),
+    (["APN 2220-1484-6080"], ["222014846080"]),
+    (["APN 123456789", "SP 2019-008"], None),                          # 9 digits: not a Chelan APN
+    (["APN 222014846080 2521 0473 2030"], None),                       # spaced second APN
+    (["APN 2220 1484 6080"], None),                                    # spaced only
+    (["APN 222014846080 &amp; 252104 732030"], None),                  # split after a separator
+    (["APN 222014846080 &amp;252104 732030", "LOT 7"], None),          # glued separator
+    (["APN 2521&nbsp;0473&nbsp;2030"], None),
+    (["APN 222014846080", "APN NO. 252104 732030", "LOT 7"], None),    # label word, split APN
+    (["APN 222014846080 PTN"], None),                                  # anything else on an APN line
+    # The shared parser stops at "TRUSTEE" and sees one APN; the block shows two. They
+    # disagree, so the answer is unknown rather than the partial list (Codex).
+    (["APN 222014846080", "LOT 7 AS DESCRIBED IN TRUSTEE'S DEED", "APN 252104732030"], None),
+    (["APN 222014846080", "SEC 12 TWP 23 RGE 20", "12-23-20"], ["222014846080"]),
+    (["SP 2019-008 LOT 7"], []),                                       # no APN line: none listed
+], ids=["real", "2629393", "two-on-a-line", "two-lines", "colon-comma", "hash", "dashed",
+        "nine-digit", "spaced-second", "spaced-only", "amp-split", "glued-amp", "nbsp",
+        "apn-no-split", "extra-word", "trustee-word", "str-line", "no-apn"])
+def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, lines, expected):
+    page = _page(*lines)
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())
     assert chelan_live_recording_apns("1") == expected
+
+
+def test_a_page_without_a_doclegal_block_is_unknown_unless_it_lists_nothing(monkeypatch):
+    page = _DETAIL.replace("DocLegal:", "Other:")
+    monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())
+    assert chelan_live_recording_apns("1") in (None, [])

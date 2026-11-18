@@ -548,3 +548,23 @@ async def test_parcels_with_a_delivered_lead_are_asked_before_already_delivered_
     await asyncio.to_thread(_tick)
 
     assert asked == ["1000000026"]
+
+
+async def test_a_row_held_for_having_had_no_address_still_gets_its_owner(
+    db, business_user, monkeypatch,
+):
+    """The no_address hold freezes delivery, not enrichment (owner, 2026-11-15)."""
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, parcel="0007200016")
+    await db.execute(text(
+        "UPDATE results SET mailing_address = NULL, enrichment_data = (enrichment_data::jsonb || "
+        "'{\"delivery_excluded_reason\": \"no_address\"}'::jsonb)::json WHERE id = :i"), {"i": rid})
+    await db.commit()
+    _county(monkeypatch, {"0007200016": _Resp(200, _page("0007200016", "HELD ROW OWNER LLC"))})
+
+    await asyncio.to_thread(_tick)
+
+    row = await _get(db, rid)
+    assert row.party_name == "HELD ROW OWNER LLC"
+    assert row.enrichment_data["delivery_excluded_reason"] == "no_address"   # still held

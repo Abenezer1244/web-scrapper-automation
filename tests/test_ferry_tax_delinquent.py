@@ -128,15 +128,16 @@ def _inventory_fresh(db):
     mark_source_healthy(db, "pacs_tax_inventory:ferry")
 
 
-def _seed(db, parcel: str, *, owing: str, oldest: int | None, county="ferry", mailing=True):
+def _seed(db, parcel: str, *, owing: str, oldest: int | None, county="ferry", mailing=True,
+          situs: str | None = "100 REDACTED RD, REPUBLIC 99166"):
     db.execute(text(
         "INSERT INTO pacs_tax_status (id, county, state, parcel_id, outcome, as_of, "
         "delinquent_amount, oldest_delinquent_year, owner_name, property_address, "
         "mailing_address, checked_at) VALUES (gen_random_uuid(), :c, 'WA', :p, "
-        "'found', :asof, :amt, :old, 'REDACTED OWNER', '100 REDACTED RD, REPUBLIC 99166', "
+        "'found', :asof, :amt, :old, 'REDACTED OWNER', :situs, "
         ":mail, :chk)"),
         {"c": county, "p": parcel, "asof": datetime.now(UTC).date(), "amt": Decimal(owing),
-         "old": oldest, "mail": "PO BOX 100, REPUBLIC, WA 99166" if mailing else None,
+         "old": oldest, "mail": "PO BOX 100, REPUBLIC, WA 99166" if mailing else None, "situs": situs,
          "chk": datetime.now(UTC)})
 
 
@@ -155,14 +156,16 @@ async def test_delivers_ferry_prior_year_debt_only(db):
     assert rec.enrichment_data["delinquent_amount"] == "900.00"
 
 
-async def test_a_held_parcel_fails_the_run_instead_of_shortening_it(db):
+async def test_a_rural_parcel_without_a_situs_is_held_and_the_rest_delivered(db):
+    """Owner decision 2026-11-18: deliver parcels with a site address, hold the rest."""
     year = datetime.now(UTC).year
     _seed(db, "33600000001000", owing="900.00", oldest=year - 2)
-    _seed(db, "33600000003000", owing="500.00", oldest=year - 1, mailing=False)  # rural: held
+    _seed(db, "33600000003000", owing="500.00", oldest=year - 1, situs=None)  # rural: held
     _inventory_fresh(db)
     db.commit()
-    with pytest.raises(ScraperExecutionError, match="1 of 2 qualifying parcel"):
-        await FerryWATaxDelinquentScraper().scrape("01/01/2026", "11/15/2026")
+    records = await FerryWATaxDelinquentScraper().scrape("01/01/2026", "11/15/2026")
+    assert [r.parcel_id for r in records] == ["33600000001000"]
+    assert all(r.property_address for r in records)  # never an invented address
 
 
 async def test_an_empty_ferry_cache_is_never_a_zero(db):

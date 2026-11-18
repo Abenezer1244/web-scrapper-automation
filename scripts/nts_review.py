@@ -1,4 +1,5 @@
-"""Operator review of OCR'd recorded Notices of Trustee's Sale (Chelan, phase 4a-3a).
+"""Operator review of OCR'd recorded Notices of Trustee's Sale (every county in
+nts_crawler._RECORDER_PROFILES: Chelan, Cowlitz).
 
 Run under `railway run --service worker python scripts/nts_review.py --operator-email <you> <command>`.
 The operator must be an admin with MFA (the privacy operators' check, run as the
@@ -6,7 +7,7 @@ migration role and rolled back); every read and write then goes through the syst
 
 Commands
   list      notices awaiting review, and unreadable ones (retried daily until rejected):
-            id, status, instrument, code, recorded, pages, flags (no names)
+            id, county, status, instrument, code, recorded, pages, flags (no names)
   show      one notice's OCR text, read fields, evidence, flags and the recorded image's URL.
             The text names the borrower: for the operator's eyes only.
   approve   write the notice confirmed against the image. Required: --doc, --sale-date
@@ -16,7 +17,8 @@ Commands
             an approved notice; --independent when it shares a deed of trust but is a new sale.
             A discontinuance on file that cites only this notice's loan must be answered:
             --discontinued-by <its instrument> or --not-discontinued.
-            The parcel's current site address is looked up and becomes the property
+            The parcel's current site address (in the notice's own county) is looked up
+            and becomes the property
             address; --address (what the notice printed) is kept beside it. A printed
             address can be years out of date. --keep-notice-address uses the printed one.
   refresh-address  --doc of an approved notice: give it the parcel's current site
@@ -50,6 +52,7 @@ from src.utils.crypto import blind_index  # noqa: E402
 from src.workers.nts_crawler import (  # noqa: E402
     _CHELAN_RECORDER,
     REJECT_REASONS,
+    _profile,
     ReviewError,
     approve_recorder_document,
     lookup_parcel_situs,
@@ -84,7 +87,21 @@ def _operator(db, email: str) -> str:
 
 
 def _image_url(doc) -> str:
-    return f"{_CHELAN_RECORDER}/Image/DocumentPdfAllPages/{doc.transaction_item_id}"
+    if (doc.county, doc.state) == ("chelan", "WA"):
+        return f"{_CHELAN_RECORDER}/Image/DocumentPdfAllPages/{doc.transaction_item_id}"
+    # Laserfiche (Cowlitz) has no stable all-pages PDF URL: its viewer page shows the image.
+    return _profile(doc.county, doc.state)["url"](doc.transaction_item_id)
+
+
+def _county_of(db, doc_id: str) -> tuple[str, str, dict]:
+    """The staged document's county, state and fields, read and released before any
+    network lookup (approval and refresh re-read the row under their own lock)."""
+    d = db.get(Doc, doc_id)
+    if d is None:
+        raise SystemExit("no staged document with that id")
+    found = (d.county, d.state, dict(d.fields or {}))
+    db.rollback()
+    return found
 
 
 def cmd_list(db, op, args) -> None:
@@ -92,7 +109,7 @@ def cmd_list(db, op, args) -> None:
                       .order_by(Doc.record_date, Doc.instrument_number)).scalars().all()
     for d in rows:
         f = d.fields or {}
-        print(f"{d.id}  {d.status:<14} {d.instrument_number}  {d.doc_code:<6} recorded {d.record_date}  "
+        print(f"{d.id}  {d.county:<8} {d.status:<14} {d.instrument_number}  {d.doc_code:<6} recorded {d.record_date}  "
               f"pages {d.page_count}  flags {len(f.get('flags') or [])}  "
               f"corroborated {bool(f.get('corroborated'))}")
     print(f"{len(rows)} awaiting review or unreadable (an unreadable one is retried daily "
@@ -104,7 +121,8 @@ def cmd_show(db, op, args) -> None:
     if d is None:
         raise SystemExit("no staged document with that id")
     f = d.fields or {}
-    print(f"{d.instrument_number} {d.doc_code} recorded {d.record_date} status {d.status}")
+    print(f"{d.county}, {d.state}  {d.instrument_number} {d.doc_code} recorded {d.record_date} "
+          f"status {d.status}")
     print(f"image: {_image_url(d)}")
     print(f"recording APNs: {f.get('recording_apns')}  deed of trust: {f.get('related_deeds_of_trust')}")
     if d.doc_code == "NOD":
@@ -134,7 +152,8 @@ def cmd_approve(db, op, args) -> None:
         "trustee": args.trustee, "beneficiary": args.beneficiary,
     }
     # Before approval takes its lock: a network lookup must not hold it (Codex).
-    situs = lookup_parcel_situs("chelan", "WA", args.parcel) if not args.keep_notice_address else None
+    county, state, _ = _county_of(db, args.doc)
+    situs = lookup_parcel_situs(county, state, args.parcel) if not args.keep_notice_address else None
     notice = approve_recorder_document(db, args.doc, reviewer=op, values=values,
                                        supersedes=args.supersedes, independent=args.independent,
                                        discontinued_by=args.discontinued_by,
@@ -155,14 +174,11 @@ def _print_address(printed: str | None, situs: str | None) -> None:
 
 
 def cmd_refresh_address(db, op, args) -> None:
-    d = db.get(Doc, args.doc)
-    if d is None:
-        raise SystemExit("no staged document with that id")
-    parcel = ((d.fields or {}).get("approved") or {}).get("parcel")
+    county, state, fields = _county_of(db, args.doc)  # refresh takes the lock itself
+    parcel = (fields.get("approved") or {}).get("parcel")
     if not parcel:
         raise SystemExit("this document has no approved parcel")
-    db.rollback()  # end the read before the network lookup; refresh takes the lock itself
-    situs = lookup_parcel_situs("chelan", "WA", parcel)
+    situs = lookup_parcel_situs(county, state, parcel)
     old, new = refresh_notice_address(db, args.doc, reviewer=op, situs=situs)
     db.commit()
     print(f"address: {old} -> {new}")

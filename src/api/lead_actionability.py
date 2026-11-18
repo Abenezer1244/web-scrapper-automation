@@ -53,7 +53,13 @@ OVER_QUOTA = "over_quota"
 # finished run's file or bill; a later run takes the claim and delivers it (owner,
 # 2026-10-25). Any other value in this key is not an exclusion.
 NOT_QUALIFIED = "not_qualified"
-EXCLUSION_REASONS = (OVER_QUOTA, NOT_QUALIFIED)
+# A row of any other record type that had no usable address when its run delivered
+# (code violations are held as NOT_QUALIFIED instead). A background sweep can find its
+# mailing address hours later; this mark keeps it out of the finished run's leads, file,
+# quota and bill, so it can only be delivered by a path that charges for it (owner,
+# 2026-11-15: Clark probate billed 643 but listed 655 once recovered addresses landed).
+NO_ADDRESS = "no_address"
+EXCLUSION_REASONS = (OVER_QUOTA, NOT_QUALIFIED, NO_ADDRESS)
 
 
 # Phase 6 privacy (migration 126): a row withheld because a person asked not to be in
@@ -112,8 +118,20 @@ def not_qualified_excluded_sql(alias: str) -> str:
     )
 
 
+def no_address_held_sql(alias: str) -> str:
+    """The row had no address when its run delivered and is still held for it."""
+    return (
+        f"COALESCE({alias}.enrichment_data->>'{DELIVERY_EXCLUDED_KEY}', '') = '{NO_ADDRESS}'"
+    )
+
+
+def no_address_held_condition():
+    """ORM twin of no_address_held_sql."""
+    return func.coalesce(Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), "") == NO_ADDRESS
+
+
 def delivery_excluded_sql(alias: str) -> str:
-    """Any delivery exclusion (over quota or not qualified)."""
+    """Any delivery exclusion (over quota, not qualified, or held with no address)."""
     listed = ", ".join(f"'{r}'" for r in EXCLUSION_REASONS)
     return f"COALESCE({alias}.enrichment_data->>'{DELIVERY_EXCLUDED_KEY}', '') IN ({listed})"
 
@@ -152,10 +170,13 @@ def deliverable_before_cap_sql(alias: str) -> str:
     Leaves the over_quota mark out on purpose (see address_actionable_sql): a re-run must
     rank the rows it already marked, or it would renumber and mark a second batch. The
     not_qualified mark is written before the cap ranks, from the same rule, so including
-    it changes nothing on a first pass and keeps a re-run from ranking a held row.
+    it changes nothing on a first pass and keeps a re-run from ranking a held row. The
+    no_address mark likewise: a held row whose address a sweep found between the hold and
+    the cap must not take quota in this run (Codex).
     """
     return (f"({address_actionable_sql(alias)} AND {qualified_sql(alias)} "
             f"AND NOT ({not_qualified_excluded_sql(alias)}) "
+            f"AND NOT ({no_address_held_sql(alias)}) "
             f"AND {not_privacy_suppressed_sql(alias)})")
 
 

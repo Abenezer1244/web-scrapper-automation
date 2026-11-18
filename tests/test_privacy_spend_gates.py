@@ -2,7 +2,7 @@
 
 The inventory (docs/legal/audit-2026-11/07-RESULTS-READ-INVENTORY.md) found three
 paths that bill or buy without the central predicate:
-  - late delivery of held code violations (cv_late_delivery._ELIGIBLE): would remove
+  - late delivery of held code violations (cv_late_delivery._eligible): would remove
     the hold and bill one record for a withheld row;
   - the paid skip-trace claim (skip_trace_claim.claim_skip_trace_rows), which every
     paid lookup goes through and which trusted its callers;
@@ -62,13 +62,13 @@ async def test_a_row_withheld_after_discovery_is_caught_under_the_lock(db, busin
     rid = await _held_row(db, business_user, job)
     with system_sync_session() as s:
         [found] = s.execute(text(late._CANDIDATES_SQL),
-                            {"batch": 10, "per_account": 10}).mappings().all()
+                            {"batch": 10, "per_account": 10, **late._rule_params()}).mappings().all()
         s.rollback()
     await _withhold(db, rid)
     used = await _used(db, business_user)
 
     with system_sync_session() as s:
-        assert late._deliver_one(s, found, build_snapshot([])) == "stale"
+        assert late._deliver_one(s, found, build_snapshot([]), late._rule_params()) == "stale"
     assert (await _state(db, rid))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED
     assert await _used(db, business_user) == used
 

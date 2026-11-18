@@ -369,6 +369,10 @@ class Settings(BaseSettings):
     # (src/workers/cv_late_delivery.py): each is delivered and billed once, against the
     # quota window it is delivered in. Kill switch: False delivers and bills nothing.
     CV_LATE_DELIVERY_ENABLED: bool = True
+    # Same module, other hold: a non-code-violation row a run held for having no address
+    # (plan_cap.mark_no_address_rows) is delivered and billed once when a sweep gives it a
+    # property or mailing address (owner, 2026-11-15). Kill switch: False delivers and bills none.
+    NO_ADDRESS_LATE_DELIVERY_ENABLED: bool = True
     # Background sweep that fills King property addresses a job could not look up
     # (src/workers/property_recovery.py): condo extract first, then eRealProperty under the
     # shared lease. Kill switch: False stops it before any request.

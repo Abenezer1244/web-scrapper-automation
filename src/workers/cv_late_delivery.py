@@ -9,6 +9,12 @@ pierce_cv_owner_recovery.py, late-delivery Phase A), so a held row can become co
 hours later. Before this module it then waited for the account's NEXT run to take its
 claim; now it is delivered as soon as it passes the policy.
 
+The same pipeline delivers a second hold (owner, 2026-11-15): a row of any other record
+type its run held for having no address (delivery_excluded_reason = no_address), once a
+sweep gives it a property or mailing address. Its own kill switch
+(NO_ADDRESS_LATE_DELIVERY_ENABLED); the proof's policy is "no_address". A row with no
+claim (NULL dedup_hash, or a weak claim dedup released) is never delivered late.
+
 WHAT A LATE DELIVERY IS
 -----------------------
 One transaction per row, under the locks of everything it reads, in the order
@@ -46,11 +52,15 @@ from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import (
+    ADDRESS_PLACEHOLDER,
     DELIVERY_EXCLUDED_KEY,
+    NO_ADDRESS,
     NOT_QUALIFIED,
+    address_actionable_sql,
     not_privacy_suppressed_sql,
 )
 from src.api.lead_qualification import POLICY_CODE_VIOLATION, POLICY_KEY, qualified_sql
+from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.config import settings
 from src.utils.logger import setup_logger
 
@@ -97,15 +107,35 @@ _BATCH_ROWS = 200
 _PER_ACCOUNT_ROWS = 20
 _STATEMENT_TIMEOUT_MS = 10000
 
-_HELD = (f"r.enrichment_data::jsonb->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}' "
-         f"AND r.enrichment_data::jsonb->>'{DELIVERY_EXCLUDED_KEY}' = '{NOT_QUALIFIED}' "
-         f"AND NOT (r.enrichment_data::jsonb ? '{LATE_KEY}')")
+# Two holds are delivered late, each behind its own kill switch:
+#   * a code violation the qualification gate held (not_qualified), once it qualifies;
+#   * any other record type held for having no address at its run (no_address, plan_cap
+#     mark_no_address_rows), once a sweep gives it a property or mailing address
+#     (owner, 2026-11-15: "promote and bill"). Rows with no claim (NULL dedup_hash, or a
+#     weak claim released by dedup) are never delivered late: there is no property to bill once.
+_HELD_CV = (f"r.enrichment_data::jsonb->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}' "
+            f"AND r.enrichment_data::jsonb->>'{DELIVERY_EXCLUDED_KEY}' = '{NOT_QUALIFIED}'")
+_HELD_NO_ADDRESS = f"r.enrichment_data::jsonb->>'{DELIVERY_EXCLUDED_KEY}' = '{NO_ADDRESS}'"
+_NOT_LATE = f"NOT (r.enrichment_data::jsonb ? '{LATE_KEY}')"
+_HELD = f"({_HELD_CV} OR {_HELD_NO_ADDRESS}) AND {_NOT_LATE}"
+
+
+def _eligible(record_type: str) -> str:
+    """The delivery rule for a row whose run's record type is the SQL expression
+    ``record_type``. Binds _rule_params(): the two kill switches (:cv_on, :na_on) and
+    today's tax cap year."""
+    return (f"r.is_duplicate = false AND r.duplicate_reason IS NULL "
+            f"AND jsonb_typeof(r.enrichment_data::jsonb) = 'object' AND {_NOT_LATE} "
+            f"AND {qualified_sql('r')} AND {not_privacy_suppressed_sql('r')} "
+            # The standing tax recency cap (Codex, phase 2): a capped tax row is hidden from
+            # every list, export and dialer, so it is never charged either.
+            f"AND {tax_cap_sql('r')} "
+            f"AND ((CAST(:cv_on AS boolean) AND {record_type} = 'code_violation' AND {_HELD_CV}) "
+            f"  OR (CAST(:na_on AS boolean) AND {record_type} <> 'code_violation' "
+            f"      AND {_HELD_NO_ADDRESS} AND {address_actionable_sql('r')}))")
 # Not withheld by a privacy rule (migration 126): a held row a person asked to be removed
 # from must never be delivered or billed late. In discovery AND under the row lock, so a
 # row flagged between the two is skipped as stale.
-_ELIGIBLE = (f"r.is_duplicate = false AND r.duplicate_reason IS NULL "
-             f"AND jsonb_typeof(r.enrichment_data::jsonb) = 'object' AND {_HELD} "
-             f"AND {qualified_sql('r')} AND {not_privacy_suppressed_sql('r')}")
 
 # Discovery only (ids, on the system session: it spans accounts). Round-robin across
 # accounts, oldest first within each. Every condition is decided again under the locks,
@@ -118,24 +148,29 @@ _CANDIDATES_SQL = f"""
       FROM results r
       JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
       JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
-                             AND sc.record_type = 'code_violation'
       JOIN delivered_records dr ON dr.user_id = r.user_id AND dr.dedup_hash = r.dedup_hash
                                AND dr.first_result_id = r.id
-      WHERE {_ELIGIBLE}
+      WHERE {_eligible('sc.record_type')}
     ) c
     WHERE rn <= :per_account
     ORDER BY rn, created_at, id
     LIMIT :batch
 """  # noqa: S608 -- splices only module constants; every value is bound
 
-_LOCK_JOB_SQL = ("SELECT sc.skip_trace_enabled, sc.deliver FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
+_LOCK_JOB_SQL = ("SELECT sc.skip_trace_enabled, sc.deliver, sc.record_type "
+                 "FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
                  "WHERE j.id = CAST(:jid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
-                 "AND sc.user_id = j.user_id AND sc.record_type = 'code_violation' "
-                 "AND j.status = 'done' FOR UPDATE OF j")
+                 "AND sc.user_id = j.user_id AND j.status = 'done' FOR UPDATE OF j")
+# has_situs: a paid skip trace looks a lead up by its property address, so a row promoted on
+# a mailing address alone is never asked (Codex, phase 2).
 _LOCK_ROW_SQL = f"""
-    SELECT r.dedup_hash FROM results r
+    SELECT r.dedup_hash,
+           (r.enrichment_data::jsonb->>'{DELIVERY_EXCLUDED_KEY}') AS held,
+           (r.property_address IS NOT NULL AND btrim(r.property_address) <> ''
+            AND btrim(r.property_address) <> '{ADDRESS_PLACEHOLDER}') AS has_situs
+    FROM results r
     WHERE r.id = CAST(:rid AS uuid) AND r.user_id = CAST(:uid AS uuid)
-      AND r.job_id = CAST(:jid AS uuid) AND {_ELIGIBLE}
+      AND r.job_id = CAST(:jid AS uuid) AND {_eligible('CAST(:rtype AS text)')}
     FOR UPDATE OF r
 """  # noqa: S608 -- splices only module constants; every value is bound
 _LOCK_CLAIM_SQL = ("SELECT first_result_id::text FROM delivered_records "
@@ -147,15 +182,25 @@ _DELIVER_SQL = f"""
 """  # noqa: S608 -- splices only module constants; every value is bound
 
 
+def _rule_params() -> dict:
+    """The delivery rule's bound values: the two kill switches and today's tax cap year."""
+    return {"cv_on": bool(settings.CV_LATE_DELIVERY_ENABLED),
+            "na_on": bool(settings.NO_ADDRESS_LATE_DELIVERY_ENABLED),
+            TAX_CAP_BIND: tax_cap_min_year(datetime.now(UTC).date())}
+
+
 def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
     """One bounded tick. Returns counts (also read by the tests); never raises for one row."""
     from src.db.session import rls_sync_session, system_sync_session
 
     stats = {"candidates": 0, "delivered": 0, "no_quota": 0, "blocked": 0, "stale": 0,
              "errors": 0, "privacy_withheld": 0, "skipped": ""}
-    if not settings.CV_LATE_DELIVERY_ENABLED:
-        stats["skipped"] = "CV_LATE_DELIVERY_ENABLED is off"
-        return stats
+    switches = _rule_params()
+    if not (switches["cv_on"] or switches["na_on"]):
+        # No new delivery or charge; rows already delivered still get their contact
+        # request, dialer decision and notice below (Codex, phase 2).
+        stats["skipped"] = "CV_LATE_DELIVERY_ENABLED and NO_ADDRESS_LATE_DELIVERY_ENABLED are off"
+        return {**stats, **_after_delivery()}
     from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
 
     with system_sync_session() as db:
@@ -171,7 +216,7 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
             return {**stats, "skipped": "privacy rules unavailable",
                     "contacts_requested": 0, "dialer_pushed": 0, "notified_accounts": 0}
         rows = db.execute(sa_text(_CANDIDATES_SQL),
-                          {"batch": batch, "per_account": _PER_ACCOUNT_ROWS}).mappings().all()
+                          {"batch": batch, "per_account": _PER_ACCOUNT_ROWS, **switches}).mappings().all()
         db.rollback()
     stats["candidates"] = len(rows)
     by_account: dict[str, list] = {}
@@ -182,7 +227,7 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
     for user_id, account_rows in by_account.items():
         with rls_sync_session(user_id) as db:
             for row in account_rows:
-                outcome = _deliver_one(db, row, privacy)
+                outcome = _deliver_one(db, row, privacy, switches)
                 stats[outcome] += 1
                 if outcome in ("no_quota", "blocked"):
                     break                        # the rest of this account cannot be charged either
@@ -190,7 +235,13 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
         _logger.info("Late delivery: %d candidate(s): %d delivered, %d no quota, %d blocked, "
                      "%d stale, %d error(s)", stats["candidates"], stats["delivered"],
                      stats["no_quota"], stats["blocked"], stats["stale"], stats["errors"])
-    # Every tick: also picks up rows a crashed tick delivered and never asked or announced.
+    return {**stats, **_after_delivery()}
+
+
+def _after_delivery() -> dict:
+    """Every tick: contact requests, dialer decisions and notices for delivered rows,
+    including rows a crashed tick delivered and never asked or announced."""
+    stats = {"contacts_requested": 0, "dialer_pushed": 0, "notified_accounts": 0}
     try:
         stats["contacts_requested"] = request_late_contacts()
     except (SoftTimeLimitExceeded, TimeLimitExceeded):
@@ -212,8 +263,8 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
     return stats
 
 
-# Rows delivered but not announced yet, in the same scope as discovery (done code-violation
-# jobs of the row's own account), so neither query reaches across record types or accounts.
+# Rows delivered but not announced yet: done jobs of the row's own account, any record type
+# (only this module writes the late_delivery marker), so no query reaches across accounts.
 # A row withheld by a privacy rule after its late delivery is neither announced nor sent for
 # contacts (here and _CONTACTS_PENDING_SQL). The filter is in the WHERE, before any LIMIT,
 # so withheld rows take no batch slot; their markers stay pending, so lifting a rule would
@@ -222,7 +273,6 @@ _PENDING_SCOPE = f"""
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
-                           AND sc.record_type = 'code_violation'
     WHERE r.enrichment_data::jsonb->'{LATE_KEY}'->>'notified' = 'false'
       AND {not_privacy_suppressed_sql('r')}
 """  # noqa: S608 -- splices only module constants
@@ -253,7 +303,6 @@ _CONTACTS_PENDING_SQL = f"""
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
-                           AND sc.record_type = 'code_violation'
     WHERE r.is_duplicate = false
       AND r.enrichment_data::jsonb->'{LATE_KEY}'->>'{CONTACTS_KEY}' = '{CONTACTS_PENDING}'
       AND {not_privacy_suppressed_sql('r')}
@@ -333,7 +382,6 @@ _DIALER_PENDING_SQL = f"""
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
-                           AND sc.record_type = 'code_violation'
     WHERE r.is_duplicate = false
       AND r.enrichment_data::jsonb->'{LATE_KEY}'->>'{DIALER_KEY}' = '{DIALER_PENDING}'
     ORDER BY r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at', r.id
@@ -563,7 +611,7 @@ def notify_late_deliveries() -> int:
     return announced
 
 
-def _deliver_one(db, row, privacy) -> str:
+def _deliver_one(db, row, privacy, switches) -> str:
     """Deliver and charge one row in its own transaction; the stats key for the outcome.
 
     The row is authorized under `privacy` while locked and BEFORE any charge: a row a
@@ -579,7 +627,8 @@ def _deliver_one(db, row, privacy) -> str:
         if run is None:
             db.rollback()
             return "stale"
-        locked = db.execute(sa_text(_LOCK_ROW_SQL), params).first()
+        locked = db.execute(sa_text(_LOCK_ROW_SQL),
+                            {**params, **switches, "rtype": run.record_type}).first()
         if locked is None or not locked.dedup_hash:
             db.rollback()
             return "stale"
@@ -598,10 +647,16 @@ def _deliver_one(db, row, privacy) -> str:
             return "blocked" if block else "no_quota"
         late = {LATE_KEY: {"delivered_at": at.isoformat(), "quota_period_start":
                            window_start.isoformat() if window_start else None,
-                           "policy": POLICY_CODE_VIOLATION,
+                           # Which hold this charge released: the code-violation gate
+                           # (its policy, unchanged) or the run's no-address hold.
+                           "policy": NO_ADDRESS if locked.held == NO_ADDRESS else POLICY_CODE_VIOLATION,
                            # Announced by notify_late_deliveries, exactly once.
                            "notified": False}}
-        if run.skip_trace_enabled:
+        if run.skip_trace_enabled and not locked.has_situs:
+            # Skip trace looks a lead up by its property address: a row delivered on a
+            # mailing address alone is never asked.
+            late[LATE_KEY][CONTACTS_KEY] = "not_requested"
+        elif run.skip_trace_enabled:
             # The run would have traced it: request_late_contacts asks the same enqueue,
             # for this row only, once (late delivery D1).
             late[LATE_KEY][CONTACTS_KEY] = CONTACTS_PENDING

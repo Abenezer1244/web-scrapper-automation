@@ -412,3 +412,23 @@ class TestPunctuationAndSpacing:
     def test_road_number_with_directional_is_not_an_ordinal(self):
         f = compute_owner_flags("123 23 ROAD WEST, SEATTLE, WA 98101", "123 23RD W, SEATTLE, WA 98101")
         assert f["absentee_owner"] is True
+
+    def test_north_e_without_suffix_is_not_ne_street(self):
+        f = compute_owner_flags("123 NORTH E, SEATTLE, WA 98101", "123 NE ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_road_word_never_becomes_an_ordinal(self):
+        f = compute_owner_flags("123 23 ROAD AVE, SEATTLE, WA 98101", "123 23RD AVE, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_lettered_house_range_keeps_its_dash(self):
+        f = compute_owner_flags("1508 - 1510A MAIN ST, SEATTLE, WA 98101", "1508 1510A MAIN ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_spaced_house_letter_matches(self):
+        f = compute_owner_flags("8337A 12TH AVE NW, SEATTLE, WA 98117", "8337-A 12TH AVE NW, SEATTLE, WA 98117")
+        assert f["absentee_owner"] is False
+
+    def test_unit_after_spaced_dash(self):
+        f = compute_owner_flags("14703 NE 35th St - Unit D-33, Bellevue WA 98007", "14703 NE 35TH ST, BELLEVUE, WA 98007")
+        assert f["absentee_owner"] is False

@@ -151,25 +151,25 @@ _MARKED_UNIT_RE = re.compile(
 )
 
 
+def _compare_street(street: str | None) -> str:
+    s = _normalize_street(_DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    return re.sub(r"\s+-$", "", s)  # "ST - UNIT D-33" loses the unit, then the dash
+
+
 # Punctuation/spacing variants of one street, measured on King leads 2026-11-17 (210
 # rows flagged absentee with identical letters and digits on both sides):
-# "1508-E SW WEBSTER" / "1508E", "BEL-RED RD" / "BEL RED RD", "AVE. S.W." / "AVE SW",
-# "19 TH AVE" / "19TH AVE", "WAY - UNIT 35" / "WAY UNIT 35".
-# Every rule is positional and narrow (Codex review): a different street must never be
-# merged by a spacing rule.
-_HOUSE_HYPHEN_LETTER_RE = re.compile(r"^\s*(\d+)-([A-Z])\b", re.IGNORECASE)
-# Word-word hyphen, both words 2+ letters ("BEL-RED"); kept when the left word is a unit
-# designator ("LOT-AB RD" must not turn into a strippable "LOT AB"), and single-letter
-# unit ids like "A-B" / "C-22" keep their hyphen for _same_street_modulo_unit_spelling.
-_WORD_HYPHEN_RE = re.compile(r"\b([A-Za-z]{2,})-(?=[A-Za-z]{2,}\b)")
-# Every designator _UNIT_STRIP_RE strips, so no hyphen split can create one (Codex).
+# "BEL-RED RD" / "BEL RED RD", "AVE. S.W." / "AVE SW", "19 TH AVE" / "19TH AVE",
+# "1508-E" / "1508E". PAIRWISE on the raw streets (Codex, after three rounds of
+# one-sided rules that kept merging different streets): both sides must carry the
+# same letters and digits, and every place where only one side has a break must be a
+# break that cannot change the meaning.
+_SEP_RE = re.compile(r"[\s.\-]+")
+_COMPASS = frozenset("NSEW")
+_STREET_TYPE_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values())
+# Every designator _UNIT_STRIP_RE strips: a break after one is never just spacing.
 _UNIT_WORD_SET = frozenset(re.findall(r"[A-Z]+", _UNIT_STRIP_RE.pattern.split(r")\b")[0]))
-# A free-standing " - " ("WAY - UNIT 35", "1817 - 29TH AVE"), except between two bare
-# numbers, which is a house-number range ("1508 - 1510").
-_SPACED_DASH_RE = re.compile(r"(\S+)\s+-\s+(?=(\S+))")
 _ORDINALS = {"1": "ST", "2": "ND", "3": "RD"}
-# A street-type word, not a directional: "23 RD W" is 23 Road West, never "23RD W".
-_STREET_SUFFIXES = frozenset(_SUFFIX.values())
+_HOUSE_LIKE_RE = re.compile(r"\d+[A-Z]?")
 
 
 def _ordinal_ok(num: str, suffix: str) -> bool:
@@ -178,44 +178,68 @@ def _ordinal_ok(num: str, suffix: str) -> bool:
     return suffix == _ORDINALS.get(num[-1], "TH")
 
 
-def _join_split_tokens(tokens: list[str]) -> list[str]:
-    """'S W' -> 'SW' and '19 TH' -> '19TH', only where the position proves it.
+def _chunks(street: str) -> tuple[list[str], list[str], list[str]]:
+    """(raw chunks, canonical chunks, separators) split on space / dot / hyphen."""
+    s = street.upper().strip(" .-")
+    raw = _SEP_RE.split(s) if s else []
+    canon = [_SUFFIX.get(c, _DIRECTIONAL.get(c, c)) for c in raw]
+    return raw, canon, _SEP_RE.findall(s)
 
-    Compass pair: only when nothing follows (post-directional, "AVE S W") or a real
-    street name follows ("S W WEBSTER"); "N E ST" is North E Street and stays split.
-    Ordinal: never the house number, the suffix must fit the number, and a street
-    suffix must follow ("19 TH AVE"), so "23 RD" alone (23 Road) stays as it is.
-    """
-    out: list[str] = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
-        after = tokens[i + 2] if i + 2 < len(tokens) else None
-        if (t in ("N", "S") and nxt in ("E", "W")
-                and (after is None or after not in _TRAILING_OPTIONAL_TOKENS)):
-            out.append(t + nxt)
-            i += 2
+
+def _break_is_spacing(raw: list[str], canon: list[str], i: int, dash: bool) -> bool:
+    """A break between chunk i and i+1 that the other address does not have."""
+    left, right = canon[i], canon[i + 1]
+    prev = canon[i - 1] if i > 0 else None
+    nxt = canon[i + 2] if i + 2 < len(canon) else None
+    if (left.isalpha() and right.isalpha() and len(left) >= 2 and len(right) >= 2
+            and left not in _UNIT_WORD_SET and left not in _COMPASS):
+        return True  # BEL|RED, CARNATION|DUVALL
+    if (i > 0 and left.isdigit() and raw[i + 1] in ("ST", "ND", "RD", "TH")
+            and _ordinal_ok(left, raw[i + 1]) and nxt in _STREET_TYPE_WORDS):
+        return True  # 19|TH AVE; never the house number, never "23 ROAD"
+    if left in ("N", "S") and right in ("E", "W"):
+        # Post-directional after a street type (AVE S.W.), or a pre-directional before
+        # a real name (S.E. 272ND). "N E ST" / "123 N E" may be North E Street.
+        return prev in _STREET_TYPE_WORDS or (
+            prev is not None and nxt is not None and nxt not in _STREET_TYPE_WORDS)
+    if i == 0 and left.isdigit() and len(raw[i + 1]) == 1 and right.isalpha():
+        # House letter: "8337 A" / "8337-A" vs "8337A". A compass letter only when the
+        # hyphen proves it ("1508-E"); "1508 E" may be East (Codex). A real street name
+        # must follow: "2651 B ST" may be B Street.
+        return ((right not in _COMPASS or dash)
+                and any(t not in _TRAILING_OPTIONAL_TOKENS for t in canon[i + 2:]))
+    return False
+
+
+def _same_street_modulo_punctuation(a: str, b: str) -> bool:
+    ra, ca, sa = _chunks(a)
+    rb, cb, sb = _chunks(b)
+    if not ca or "".join(ca) != "".join(cb):
+        return False
+
+    def breaks(canon, seps):
+        out, pos = {}, 0
+        for i, sep in enumerate(seps):
+            pos += len(canon[i])
+            out[pos] = (i, "-" in sep)
+        return out
+
+    ba, bb = breaks(ca, sa), breaks(cb, sb)
+    for pos in set(ba) | set(bb):
+        if pos in ba and pos in bb:
+            (ia, dash_a), (_, dash_b) = ba[pos], bb[pos]
+            # A dash between two house-like numbers is a range ("1508 - 1510A").
+            if (dash_a != dash_b and _HOUSE_LIKE_RE.fullmatch(ca[ia])
+                    and _HOUSE_LIKE_RE.fullmatch(ca[ia + 1])):
+                return False
+            # "1508-E" is house 1508E; "1508 E" is 1508 East.
+            if dash_a != dash_b and ia == 0 and ca[1] in _COMPASS:
+                return False
             continue
-        if (i > 0 and t.isdigit() and nxt in ("ST", "ND", "RD", "TH")
-                and _ordinal_ok(t, nxt) and after in _STREET_SUFFIXES):
-            out.append(t + nxt)
-            i += 2
-            continue
-        out.append(t)
-        i += 1
-    return out
-
-
-def _compare_street(street: str | None) -> str:
-    s = _DESIGNATOR_HASH_RE.sub(r"\1 ", street or "")
-    s = _HOUSE_HYPHEN_LETTER_RE.sub(r"\1\2", s)
-    s = _WORD_HYPHEN_RE.sub(
-        lambda m: m.group(0) if m.group(1).upper() in _UNIT_WORD_SET else m.group(1) + " ", s)
-    s = _SPACED_DASH_RE.sub(
-        lambda m: m.group(0) if m.group(1).isdigit() and m.group(2).isdigit() else m.group(1) + " ", s)
-    s = _normalize_street(s)
-    return " ".join(_join_split_tokens(s.split(" "))) if s else s
+        raw, canon, (idx, dash) = (ra, ca, ba[pos]) if pos in ba else (rb, cb, bb[pos])
+        if not _break_is_spacing(raw, canon, idx, dash):
+            return False
+    return True
 
 
 def _marked_unit(street: str | None) -> str | None:
@@ -335,6 +359,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
         and not _same_street_modulo_trailing_tokens(p_street, m_street)
         and not _street_absorbed_city(p, m, p_street, m_street)
         and not _same_street_modulo_unit_spelling(p["street"] or "", m["street"] or "", p_street, m_street)
+        and not _same_street_modulo_punctuation(p["street"] or "", m["street"] or "")
     ):
         return True
 

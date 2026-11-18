@@ -122,8 +122,13 @@ def test_the_cli_does_not_re_read_when_the_crawl_stored_apns(c, db, tmp_path, mo
     ("APN 222014846080 SEC TWP RGE 12 23 20", ["222014846080"]),    # numbers after words are not APNs
     ("APN 222014846080 NORTH ENTIAT LOT 2 BLK 2", ["222014846080"]),  # 2629393's shape
     ("SP 2019-008 LOT 7", []),                                      # no APN label: none listed
+    ("APN 222014846080 &amp; 252104 732030", None),                 # split APN after a separator
+    ("APN: 252104 732030", None),                                   # colon, then a split APN
+    ("APN: 222014846080, 252104732030 LOT 7", ["222014846080", "252104732030"]),
+    ("APN 222014846080 AND 252104732030", ["222014846080", "252104732030"]),
 ], ids=["clean", "two-clean", "nine-digit", "spaced-second", "spaced-only", "two-groups",
-        "nbsp", "sec-twp-rge", "2629393-shape", "no-label"])
+        "nbsp", "sec-twp-rge", "2629393-shape", "no-label", "amp-split", "colon-split",
+        "comma-list", "and-list"])
 def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, legal, expected):
     page = _DETAIL.replace("APN 222014846080", legal)
     monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())

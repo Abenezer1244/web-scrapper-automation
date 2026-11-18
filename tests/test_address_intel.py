@@ -353,9 +353,6 @@ class TestPunctuationAndSpacing:
         for prop, mail in (
             ("5639 16TH AVE SW, SEATTLE WA 98106", "5639 16TH AVE. S.W., SEATTLE, WA 98106"),
             ("5233 19TH AVE SW, SEATTLE WA 98106", "5233 19 TH AVE SW, SEATTLE, WA 98106"),
-            ("17050 Northup Way - Unit 35, Bellevue WA 98008", "17050 NORTHUP WAY UNIT 35, BELLEVUE, WA 98008"),
-            ("13570 BEL RED RD, BELLEVUE, WA 98005", "13570 BEL-RED RD, BELLEVUE, WA 98005"),
-            ("6410 CARNATION DUVALL RD NE, CARNATION, WA 98014", "6410 CARNATION-DUVALL RD NE, CARNATION, WA 98014"),
         ):
             assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
 
@@ -491,3 +488,13 @@ class TestPunctuationAndSpacing:
         f = compute_owner_flags("22218 SE 272ND PL, MAPLE VALLEY, WA 98038-0001",
                                 "22218 S.E. 272ND PL., MAPLE VALLEY, WA 98038-0002")
         assert f["absentee_owner"] is True
+
+    def test_hyphen_vs_space_keeps_todays_answer(self):
+        # Owner decision 2026-11-17 after Codex: "OLD-MILL RD" may not be "OLD MILL RD",
+        # so no hyphen re-spelling is matched, even for real same-place shapes.
+        for a, b in (
+            ("13570 BEL RED RD, BELLEVUE, WA 98005", "13570 BEL-RED RD, BELLEVUE, WA 98005"),
+            ("123 OLD-MILL RD, SEATTLE, WA 98144", "123 OLD MILL RD, SEATTLE, WA 98144"),
+        ):
+            assert compute_owner_flags(a, b)["absentee_owner"] is True, a
+            assert compute_owner_flags(b, a)["absentee_owner"] is True, a

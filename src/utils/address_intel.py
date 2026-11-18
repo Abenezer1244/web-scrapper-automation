@@ -270,6 +270,10 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
             (ia, kind_a), (ib, kind_b) = ba[pos], bb[pos]
             if kind_a == kind_b:
                 continue
+            # A hyphen is never just spacing: "OLD-MILL RD" may not be "OLD MILL RD"
+            # (Codex; owner decision 2026-11-17), so "BEL-RED" keeps today's answer.
+            if "-" in kind_a + kind_b:
+                return False
             for canon, k in ((ca, ia), (cb, ib)):  # both sides, so order never matters
                 # Never re-spell a break beside a number: "1508 1/2-1510A" may be a
                 # range, "12-34" a compound house id (Codex).
@@ -278,11 +282,9 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
                 # "LOT-AB RD" / "LOT.AB RD" is a street name; "LOT AB" is a unit.
                 if canon[k] in _UNIT_WORD_SET:
                     return False
-                # A single letter beside a re-spelled break may be a unit, a house letter
-                # or a lettered street ("123 A-B ST" vs "123 A B ST"). A dotted
-                # compass pair after a type ("AVE. S.W.") has no dash and stays allowed.
-                if len(canon[k]) == 1 or (
-                        len(canon[k + 1]) == 1 and "-" in (kind_a + kind_b)):
+                # A single letter before a re-spelled break may be a unit, a house letter
+                # or a lettered street. "AVE. S.W." (letter after) stays allowed.
+                if len(canon[k]) == 1:
                     return False
             continue
         raw, canon, seps, (idx, kind) = ((ra, ca, sa, ba[pos]) if pos in ba

@@ -9,15 +9,15 @@ existing post-save owner lookups, and leads without one are not delivered.
 This only appends to the Douglas connector's record_types (a JSON array, edited as
 157 does for Chelan). Idempotent: the WHERE guard skips a row that already offers it.
 
-Revision ID: 170
-Revises: 169
+Revision ID: 171
+Revises: 170
 Create Date: 2026-11-15
 """
 
 from alembic import op
 
-revision = "170"
-down_revision = "169"
+revision = "171"
+down_revision = "170"
 branch_labels = None
 depends_on = None
 

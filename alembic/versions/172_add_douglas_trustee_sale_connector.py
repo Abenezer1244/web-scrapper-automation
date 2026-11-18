@@ -10,15 +10,15 @@ Inserted INACTIVE: turned on by hand once the crawl has run in production and it
 notices have been checked (owner decision). health_status is seeded 'healthy' like 167
 (connectors hides unknown rows). Data INSERT only, idempotent.
 
-Revision ID: 171
-Revises: 170
+Revision ID: 172
+Revises: 171
 Create Date: 2026-11-17
 """
 
 from alembic import op
 
-revision = "171"
-down_revision = "170"
+revision = "172"
+down_revision = "171"
 branch_labels = None
 depends_on = None
 

@@ -1,4 +1,4 @@
-"""Douglas auction leads: migration 171 wiring, and the crawl task end to end on the test
+"""Douglas auction leads: migration 172 wiring, and the crawl task end to end on the test
 DB with only the portal replaced (the recorder's detail pages, derived from the live
 3286111 page in tests/fixtures/douglas_nts)."""
 import importlib
@@ -18,12 +18,12 @@ from src.workers import nts_crawler
 from src.workers.nts_matcher_task import NTS_MATCH_COUNTIES
 
 _ROOT = Path(__file__).resolve().parents[1]
-_MIG = _ROOT / "alembic" / "versions" / "171_add_douglas_trustee_sale_connector.py"
+_MIG = _ROOT / "alembic" / "versions" / "172_add_douglas_trustee_sale_connector.py"
 _NTS = (_ROOT / "tests" / "fixtures" / "douglas_nts" / "detail_nts_3286111.html").read_text(encoding="utf-8")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_mig171", _MIG)
+    spec = importlib.util.spec_from_file_location("_mig172", _MIG)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -31,7 +31,7 @@ def _load():
 
 def test_chain_and_county():
     mig = _load()
-    assert (mig.revision, mig.down_revision, mig._COUNTY) == ("171", "170", "douglas")
+    assert (mig.revision, mig.down_revision, mig._COUNTY) == ("172", "171", "douglas")
 
 
 def test_connector_points_at_the_douglas_reader_and_is_inactive():
@@ -43,10 +43,10 @@ def test_connector_points_at_the_douglas_reader_and_is_inactive():
     assert "'{_HEALTH_STATUS}',\n            false" in _MIG.read_text(encoding="utf-8")
 
 
-def test_douglas_notices_are_crawled_but_not_matched_until_activation():
-    # Stored automatically, so they must not stamp customers' pre-foreclosure leads
-    # before the owner switches the connector on (Codex): added at activation.
-    assert "douglas" not in NTS_MATCH_COUNTIES
+def test_douglas_notices_reach_the_matcher_and_the_beat():
+    # Switched on by the owner 2026-11-18 (the connector itself is seeded inactive and
+    # turned on in production after the first crawl is checked).
+    assert "douglas" in NTS_MATCH_COUNTIES
     from src.workers.scheduler import app
 
     entry = app.conf.beat_schedule["crawl-nts-douglas-recorder"]

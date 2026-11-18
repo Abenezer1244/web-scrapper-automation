@@ -19,17 +19,16 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
-<<<<<<< HEAD
 ## 2026-11-15..17 — Douglas County: parcel-key regression, death certificates, auction leads (branch `feat/douglas-wa-seven-record-types`, local)
 
 **Built / Shipped (local commits, not pushed):**
 - 5935c17b: Douglas leads keyed on the recording's own 11-digit grid parcel again (`DouglasAcclaimWebScraper`); TaxSifter
   owner-name fill only from a page that echoes the lead's own parcel; `RELEASE LIS PENDENS` is a cancellation; Douglas
   probate matches HEIRSHIP / TESTAMENTARY.
-- 3bb24e41: death_certificate (recorder DEATH CERTIFICATE; migration 170); unpaged twin rows collapse; a one-day window is
+- 3bb24e41: death_certificate (recorder DEATH CERTIFICATE; migration 171); unpaged twin rows collapse; a one-day window is
   always searched; kendo single-picker steps a day.
 - 356e6e5d, 22e74053: auction leads from the recorder's typed Remarks (`nts_douglas_recorder`, `collect_by_doc_type`,
-  `crawl_nts_douglas_recorder`, migration 171 INACTIVE, beat 09:30 UTC; not in `NTS_MATCH_COUNTIES` until activation).
+  `crawl_nts_douglas_recorder`, migration 172 INACTIVE, beat 09:30 UTC; Douglas added to `NTS_MATCH_COUNTIES` at switch-on).
 
 **Tried / Decided:**
 - Prod baseline (read-only, migrate role, owner OK): 3 Douglas jobs ever, 6 leads delivered and billed to one customer.
@@ -61,14 +60,14 @@ to understand *why* the code is the way it is and *what's been attempted before*
   trust with the LIVE notice 3286111 (a later foreclosure) — "cancel everything on the deed" would have killed it.
 - Migration renumber commit 59f2a53d staged the rename but not the revision edits (fixed in 356e6e5d).
 
-**Pending / Handoff:** owner: push/PR and deploy (migrations 170, 171; hold Douglas dispatch until old workers stop);
+**Pending / Handoff:** owner: push/PR and deploy (migrations 171, 172; hold Douglas dispatch until old workers stop);
 activate auction leads after checking the first prod crawls (connector on + "douglas" in `NTS_MATCH_COUNTIES`);
 tax decision; rotate the exposed Postgres password; counsel on GR 31 for court-index types.
 
 **Facts learned:** Douglas parcels are 11 digits; detail pages need a session; Remarks hold the NTS sale; 5 of 16
 discontinuances link only the deed of trust; recorder banner "Released through 09/16/2026"; Douglas TaxSifter footer
 "Data current as of 6/3/2026"; the bridgeleads-web BFF session route accepts only localhost:3000/3005 in development.
-=======
+
 ## 2026-11-17 — Asotin nwmarket crawl runs twice a day (branch `fix/nwmarket-twice-daily`)
 
 **Built / Shipped:** `crawl-nts-nwmarket-asotin` now runs at 10:00 and 22:00 UTC
@@ -82,7 +81,6 @@ barren alerts can fire twice a day (12 h apart, beyond the 6 h cooldown).
 **Pending / Handoff:** NTS found at 22:00 waits for the next 11:00 matcher; probate is ingested
 during the crawl itself. The Asotin lis pendens connector was switched on in prod the same day
 (owner).
->>>>>>> origin/main
 
 ## 2026-11-17 — Asotin lis pendens through the CAPTCHA-gated recorder (branch `feat/asotin-helion-recorder`)
 

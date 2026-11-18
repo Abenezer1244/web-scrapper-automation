@@ -55,10 +55,10 @@ _RECENT_DAYS = 180
 # a notice only ever matches a lead in the SAME county — so a same street+zip in a
 # different county can never cross-match (the address key isn't county-unique).
 # Cowlitz and Chelan: recorded notices, each approved by an operator against its image.
-# Douglas is deliberately NOT here yet: its notices are stored automatically, so they
-# would stamp customers' pre-foreclosure leads before the owner has checked them and
-# switched its trustee_sale connector on (Codex). Add "douglas" at that activation.
-NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark", "asotin", "benton", "chelan", "cowlitz")
+# Douglas: the sale its recorder typed into each recorded notice's free detail page,
+# stored automatically (owner switched Douglas auction leads on 2026-11-18).
+NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark", "asotin", "benton", "chelan", "cowlitz",
+                      "douglas")
 
 # Transaction-scoped advisory lock between a recorded-Discontinuance cancellation
 # (exclusive, nts_crawler.crawl_nts_benton_recorder) and every writer that stamps a

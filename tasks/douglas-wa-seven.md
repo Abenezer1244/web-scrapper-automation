@@ -130,7 +130,7 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
   discontinuance resolution), `DouglasAcclaimWebScraper.collect_by_doc_type` (one doc-type search per code; the portal's
   own form post must carry the requested type and dates; every row the requested type; cap on the reported total),
   `crawl_nts_douglas_recorder` (all-or-nothing, Pacific dates, 365-day window, heartbeat only after a complete write),
-  beat 09:30 UTC, migration 171. NOCONT is the RCW 84.34 current-use continuance (no remarks, 2-10 APNs): ignored.
+  beat 09:30 UTC, migration 172. NOCONT is the RCW 84.34 current-use continuance (no remarks, 2-10 APNs): ignored.
   - Live end-to-end crawl into the test DB (2026-11-17): 33 NTS + 16 NDTS read; 27 notices stored (12 active, 11
     inactive, 4 cancelled), 6 held (2 no_date, 3 no_sale_language, 1 several_parcels), 2 inferred ends, 3 unmatched
     discontinuances (3279193, 3280146, 3282060: their notices predate the window). A first run hit a portal timeout and
@@ -190,7 +190,7 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
 | tax_delinquent | Treasurer 2026 summons (scanned, REDEEMED stamps) | public PDF | ~16 | Not implemented: owner decision (operator review vs hold) |
 | code_violation | none found | - | 0 | Blocked by source access |
 | divorce | court index (GR 31(g)(4)) | case index only | 0 recorded | Blocked by legal/data restrictions |
-| death_certificate | Recorder DEATH CERTIFICATE | public index | 21 | Implemented, verified live (3/3); offered on deploy (migration 170) |
+| death_certificate | Recorder DEATH CERTIFICATE | public index | 21 | Implemented, verified live (3/3); offered on deploy (migration 171) |
 
 ## Review (2026-11-16, interim)
 - Full suite on 3bb24e41, fresh test DB (bl-douglas-pg recreated, alembic 164): 8,970 passed, 53 skipped, 1 failed +
@@ -210,5 +210,5 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
   768/1024/1440/1920 px; no page errors. Dark mode NOT exercised: the app ignores the OS colour scheme (own toggle).
   Not exercised locally: job runs, results, exports (need a worker and live scrapes).
 - Next.js dev server printed a known-vulnerability upgrade notice for bridgeleads-web's Next 16.4.3 (not acted on).
-- Deploy order: migrations 170 + 171; Phase 2 precondition (no queued/running Douglas job; hold Douglas dispatch until
+- Deploy order: migrations 171 + 172 (renumbered after #667 took 170); Phase 2 precondition (no queued/running Douglas job; hold Douglas dispatch until
   old workers stop); trustee_sale stays inactive until the activation steps above.

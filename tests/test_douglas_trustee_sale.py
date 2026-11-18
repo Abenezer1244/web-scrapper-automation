@@ -43,8 +43,9 @@ def test_connector_points_at_the_douglas_reader_and_is_inactive():
     assert "'{_HEALTH_STATUS}',\n            false" in _MIG.read_text(encoding="utf-8")
 
 
-def test_douglas_notices_are_crawled_but_not_matched_until_the_first_crawl_is_checked():
-    assert "douglas" not in NTS_MATCH_COUNTIES
+def test_douglas_notices_reach_the_matcher_and_the_beat():
+    # Switched on 2026-11-18 after the first production crawl was checked.
+    assert "douglas" in NTS_MATCH_COUNTIES
     from src.workers.scheduler import app
 
     entry = app.conf.beat_schedule["crawl-nts-douglas-recorder"]

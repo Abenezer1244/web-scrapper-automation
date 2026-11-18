@@ -109,3 +109,16 @@ def test_the_cli_does_not_re_read_when_the_crawl_stored_apns(c, db, tmp_path, mo
     _run(c, _operator(c), "approve", "--doc", doc_id, "--sale-date", _SALE.isoformat(),
          "--parcel", _APN, "--grantor", "DOE, JANE")
     assert c.execute(text("SELECT parcel FROM nts_notices WHERE ts_number = 'REC-2630004'")).scalar() == _APN
+
+
+@pytest.mark.parametrize("legal,expected", [
+    ("APN 222014846080", ["222014846080"]),                         # the clean, whole answer
+    ("APN 222014846080 252104732030", ["222014846080", "252104732030"]),
+    ("APN 123456789 SP 2019-008", None),                            # 9 digits: not a Chelan APN
+    ("APN 222014846080 2521 0473 2030", None),                      # a second APN in spaced groups
+    ("APN 2220 1484 6080", []),                                     # nothing the parser could read
+], ids=["clean", "two-clean", "nine-digit", "spaced-second", "spaced-only"])
+def test_the_live_answer_is_trusted_only_when_whole_and_clean(monkeypatch, legal, expected):
+    page = _DETAIL.replace("APN 222014846080", legal)
+    monkeypatch.setattr(crawler, "_bounded_fetch", lambda *a, **k: page.encode())
+    assert chelan_live_recording_apns("1") == expected

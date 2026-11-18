@@ -137,12 +137,15 @@ def cmd_approve(db, op, args) -> None:
         "trustee": args.trustee, "beneficiary": args.beneficiary,
     }
     # Before approval takes its lock: network reads must not hold it (Codex).
+    # Plain values, not an ORM object, and the read always ended: a cached object here
+    # could hand approval a stale 'pending_review' after another reviewer decided the
+    # row (Codex High). Approval re-reads the row under its lock.
     live_apns = None
-    d = db.get(Doc, args.doc)
-    if d is not None and (d.county, d.state) == ("chelan", "WA") and (d.fields or {}).get("recording_apns") == []:
-        item = d.transaction_item_id
-        db.rollback()  # end the read before the network fetch
-        live_apns = chelan_live_recording_apns(item)
+    pre = db.execute(select(Doc.county, Doc.state, Doc.transaction_item_id, Doc.fields)
+                     .where(Doc.id == args.doc)).one_or_none()
+    db.rollback()
+    if pre is not None and (pre.county, pre.state) == ("chelan", "WA")             and (pre.fields or {}).get("recording_apns") == []:
+        live_apns = chelan_live_recording_apns(pre.transaction_item_id)
         print(f"the crawl stored no APN; the recorder page lists now: {live_apns}")
     situs = lookup_parcel_situs("chelan", "WA", args.parcel) if not args.keep_notice_address else None
     notice = approve_recorder_document(db, args.doc, reviewer=op, values=values,

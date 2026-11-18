@@ -432,9 +432,11 @@ class TestPunctuationAndSpacing:
             assert compute_owner_flags(f"{x}, SEATTLE, WA 98117", f"{y}, SEATTLE, WA 98117")["absentee_owner"] is True, x
             assert compute_owner_flags(f"{y}, SEATTLE, WA 98117", f"{x}, SEATTLE, WA 98117")["absentee_owner"] is True, x
 
-    def test_unit_after_spaced_dash(self):
+    def test_unit_after_spaced_dash_keeps_todays_answer(self):
+        # The " -" left after the unit strip is not cleaned up: "MAIN ST - LOT A RD" may
+        # be a street name (Codex), so this pair keeps today's answer.
         f = compute_owner_flags("14703 NE 35th St - Unit D-33, Bellevue WA 98007", "14703 NE 35TH ST, BELLEVUE, WA 98007")
-        assert f["absentee_owner"] is False
+        assert f["absentee_owner"] is True
 
     def test_range_guard_is_order_independent(self):
         a, b = "1508-A - 1510 MAIN ST, SEATTLE, WA 98101", "1508A 1510 MAIN ST, SEATTLE, WA 98101"
@@ -472,6 +474,8 @@ class TestPunctuationAndSpacing:
             ("12.5 MAIN ST, SEATTLE, WA 98101", "12 5 MAIN ST, SEATTLE, WA 98101"),
             ("123 NORTH-STAR RD, SEATTLE, WA 98101", "123 N-STAR RD, SEATTLE, WA 98101"),
             ("123 22-ND AVE, SEATTLE, WA 98144", "123 22ND AVE, SEATTLE, WA 98144"),
+            ("12 - 22 ND AVE, SEATTLE, WA 98144", "12 - 22ND AVE, SEATTLE, WA 98144"),
+            ("123 MAIN ST - LOT A RD, SEATTLE, WA 98144", "123 MAIN ST, SEATTLE, WA 98144"),
             ("1817 29TH AVE W, SEATTLE, WA 98199", "1817 - 29TH AVENUE WEST, SEATTLE, WA 98199"),
             ("123 MAIN AVE N E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
             ("123 MAIN AVE N. E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),

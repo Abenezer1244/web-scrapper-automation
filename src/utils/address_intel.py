@@ -157,8 +157,8 @@ _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.(?=\d)")
 
 def _compare_street(street: str | None) -> str:
     s = _DIGIT_DOT_RE.sub("_", _DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
-    s = _normalize_street(s)
-    return re.sub(r"\s+-$", "", s)  # "ST - UNIT D-33" loses the unit, then the dash
+    # No trailing " -" cleanup: "MAIN ST - LOT A RD" may be a street name (Codex).
+    return _normalize_street(s)
 
 
 # Punctuation/spacing variants of one street, measured on King leads 2026-11-17 (210
@@ -251,6 +251,10 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
     ha, hb = _split_house(a), _split_house(b)
     # Same house id, same punctuation after it ("1508 - 1510A" is a range).
     if ha is None or hb is None or ha[:2] != hb[:2]:
+        return False
+    # Punctuation after the house id ("12 - 22 ND AVE") may make the next number part
+    # of a range, so only identical streets pass then (Codex).
+    if ha[1] and ha[2] != hb[2]:
         return False
     ra, ca, sa = _chunks(ha[2])
     rb, cb, sb = _chunks(hb[2])

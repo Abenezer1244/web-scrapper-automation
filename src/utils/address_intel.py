@@ -151,8 +151,13 @@ _MARKED_UNIT_RE = re.compile(
 )
 
 
+# A dot between digits is part of the number ("12.5 MAIN" is not "12 5 MAIN", Codex).
+_DIGIT_DOT_RE = re.compile(r"(?<=\d)\.(?=\d)")
+
+
 def _compare_street(street: str | None) -> str:
-    s = _normalize_street(_DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _DIGIT_DOT_RE.sub("_", _DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _normalize_street(s)
     return re.sub(r"\s+-$", "", s)  # "ST - UNIT D-33" loses the unit, then the dash
 
 
@@ -179,10 +184,16 @@ def _ordinal_ok(num: str, suffix: str) -> bool:
 
 def _chunks(street: str) -> tuple[list[str], list[str], list[str]]:
     """(raw chunks, canonical chunks, separators) split on space / dot / hyphen."""
-    s = street.upper().strip(" .-")
+    s = _DIGIT_DOT_RE.sub("_", street.upper()).strip(" .-")
     raw = _SEP_RE.split(s) if s else []
-    canon = [_SUFFIX.get(c, _DIRECTIONAL.get(c, c)) for c in raw]
-    return raw, canon, _SEP_RE.findall(s)
+    seps = _SEP_RE.findall(s)
+    # Abbreviate only free-standing words: "NORTH-STAR RD" is a name, not "N-STAR" (Codex).
+    canon = [
+        c if "-" in (seps[i - 1] if i > 0 else "") + (seps[i] if i < len(seps) else "")
+        else _SUFFIX.get(c, _DIRECTIONAL.get(c, c))
+        for i, c in enumerate(raw)
+    ]
+    return raw, canon, seps
 
 
 def _sep_kind(sep: str) -> str:
@@ -306,7 +317,7 @@ def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_s
 
 
 def _normalize_full(addr: str) -> str:
-    s = _PUNCT_RE.sub(" ", addr).upper()
+    s = _PUNCT_RE.sub(" ", _DIGIT_DOT_RE.sub("_", addr)).upper()
     return _WS_RE.sub(" ", s).strip()
 
 

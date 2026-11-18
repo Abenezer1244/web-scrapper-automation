@@ -19,6 +19,55 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15..17 — Douglas County: parcel-key regression, death certificates, auction leads (branch `feat/douglas-wa-seven-record-types`, local)
+
+**Built / Shipped (local commits, not pushed):**
+- 5935c17b: Douglas leads keyed on the recording's own 11-digit grid parcel again (`DouglasAcclaimWebScraper`); TaxSifter
+  owner-name fill only from a page that echoes the lead's own parcel; `RELEASE LIS PENDENS` is a cancellation; Douglas
+  probate matches HEIRSHIP / TESTAMENTARY.
+- 3bb24e41: death_certificate (recorder DEATH CERTIFICATE; migration 170); unpaged twin rows collapse; a one-day window is
+  always searched; kendo single-picker steps a day.
+- 356e6e5d, 22e74053: auction leads from the recorder's typed Remarks (`nts_douglas_recorder`, `collect_by_doc_type`,
+  `crawl_nts_douglas_recorder`, migration 171 INACTIVE, beat 09:30 UTC; not in `NTS_MATCH_COUNTIES` until activation).
+
+**Tried / Decided:**
+- Prod baseline (read-only, migrate role, owner OK): 3 Douglas jobs ever, 6 leads delivered and billed to one customer.
+  All 12 stored parcels equal the grid ParcelNumber and every delivered dedup_hash includes it, so restoring the parcel
+  keeps the billed keys (no repair); main's November grid rewrite had dropped it, which would have re-billed them.
+- Transfer-on-death legacy flag: 3 inactive configs, 0 in Douglas, 68 explicit opt-ins: rule left unchanged.
+- Auction leads: images are SOLD (no viewer, "Error 5001"), so the Chelan/Cowlitz OCR path was dropped; the free
+  detail page's typed Remarks carry trustee, sale date/time and place. A sale date counts only from an explicit sale
+  construction on a lawful RCW 61.24.040 sale day (Friday, or the Monday after a Friday holiday, observed holidays).
+- NOTICE OF CONTINUANCE (50/yr) is the RCW 84.34 current-use continuance, not a sale postponement: ignored.
+- Tax: owner chose "ship as of the summons date"; build stopped as unsafe (below); left for an explicit operator-review
+  decision.
+
+**Failed / Blocked:**
+- Tax: the Treasurer's 2026 Notice and Summons is a scan the county re-stamps "REDEEMED" with a strike line; tesseract
+  reads neither and the strike destroys the redeemed rows' parcel numbers. TaxSifter's data is "current as of 6/3/2026".
+  WIP saved on `wip/douglas-tax-ocr-unsafe` (its OCR-child JPEG support is superseded by #658).
+- Code violation: no case-level source. Divorce: recorder 0/yr; court index blocked by GR 31(g)(4) (as Ferry).
+- The Douglas portal throttled browser sessions for hours after repeated probes (curl fine, browser loads time out).
+- A prod DSN (with password) reached the transcript through a psycopg2 error: owner told to rotate it.
+
+**Caught & fixed:**
+- Codex: retry identity across deploy (deploy precondition), TaxSifter echo, shared estate-caption change would re-key
+  other counties (made Douglas-only), kendo stepping, wrong-search rows, partial-read publishing, amended-notice
+  supersession, sale-date context, holiday calendar, blank/malformed links, matcher activation gate, two loans on one
+  parcel, cap before twin collapse.
+- Live: a 2 KB interim page stalls the doc-type form (reload once); the form's async submit binds after load; a
+  months-long doc-type search can take >30 s (90 s for that search only); discontinuance 3279193 shares its deed of
+  trust with the LIVE notice 3286111 (a later foreclosure) — "cancel everything on the deed" would have killed it.
+- Migration renumber commit 59f2a53d staged the rename but not the revision edits (fixed in 356e6e5d).
+
+**Pending / Handoff:** owner: push/PR and deploy (migrations 170, 171; hold Douglas dispatch until old workers stop);
+activate auction leads after checking the first prod crawls (connector on + "douglas" in `NTS_MATCH_COUNTIES`);
+tax decision; rotate the exposed Postgres password; counsel on GR 31 for court-index types.
+
+**Facts learned:** Douglas parcels are 11 digits; detail pages need a session; Remarks hold the NTS sale; 5 of 16
+discontinuances link only the deed of trust; recorder banner "Released through 09/16/2026"; Douglas TaxSifter footer
+"Data current as of 6/3/2026"; the bridgeleads-web BFF session route accepts only localhost:3000/3005 in development.
+
 ## 2026-11-17 — Asotin lis pendens through the CAPTCHA-gated recorder (branch `feat/asotin-helion-recorder`)
 
 **Built / Shipped:**

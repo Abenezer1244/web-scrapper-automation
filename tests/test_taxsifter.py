@@ -166,6 +166,7 @@ class _Portal(BaseHTTPRequestHandler):
     redirect_to = "/default.aspx"
     fail_results = 0
     results_html = _results(_card("DOE, JANE Q", "101", "90000000001"))
+    assessor_html: str | None = None  # None -> the standard page (echoes 90000000001)
     hits: list[str] = []
 
     def log_message(self, *args):  # keep test output quiet
@@ -196,7 +197,7 @@ class _Portal(BaseHTTPRequestHandler):
         elif url.path == "/Assessor.aspx":
             assert parse_qs(url.query) == {"keyId": ["101"], "parcelNumber": ["90000000001"],
                                            "typeID": ["1"]}
-            self._send(_assessor())
+            self._send(type(self).assessor_html or _assessor())
         else:
             self._send("nope", status=404)
 
@@ -232,13 +233,14 @@ def _client(origin: str) -> TaxSifterClient:
     return client
 
 
-def test_a_lookup_returns_address_mailing_and_value_and_never_a_parcel(portal, monkeypatch):
+def test_a_lookup_returns_address_mailing_value_and_the_matched_parcel(portal, monkeypatch):
     monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
     client = _client(portal)
     result = client.lookup("DOE JANE Q")
+    # "parcel" says WHICH parcel the owner matched, so a caller can check it against the
+    # lead's own; the fill never copies it to parcel_id (tests below).
     assert result == {"address": "12 SAMPLE LN", "mailing": "PO BOX 77, SAMPLETON, WA 98800",
-                      "value": "$250,500"}
-    assert not {"parcel", "parcel_id", "parcelNumber"} & set(result)
+                      "value": "$250,500", "parcel": "90000000001"}
     # The form's own (hostile) action was ignored: the POST went to the fixed path.
     assert _Portal.hits == ["/Disclaimer.aspx", "POST /Disclaimer.aspx",
                             "/Search/Results.aspx", "/Assessor.aspx"]
@@ -314,6 +316,61 @@ async def test_fill_stamps_its_source_and_the_situs_state(portal, monkeypatch):
     assert "property_state" not in rec.to_dict()
 
 
+@pytest.mark.parametrize("own,filled", [("90000000001", True), ("9000-0000-001", True),
+                                        ("90000000002", False)])
+async def test_a_lead_with_its_own_parcel_is_filled_only_from_that_parcel(portal, monkeypatch, own, filled):
+    """A unique owner match can be another of the owner's properties: a lead whose
+    recording names a parcel takes the TaxSifter answer only when it is that parcel."""
+    from src.scrapers.base_scraper import ScrapedRecord
+
+    monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
+    monkeypatch.setattr(taxsifter, "TaxSifterClient", lambda county: _client(portal))
+    rec = ScrapedRecord(party_name="DOE JANE Q", parcel_id=own)
+    assert await taxsifter.fill_addresses_by_owner("douglas", [rec]) == (1 if filled else 0)
+    assert rec.parcel_id == own  # never rewritten
+    if filled:
+        assert rec.property_address == "12 SAMPLE LN" and rec.mailing_address
+    else:
+        assert rec.property_address is None and rec.mailing_address is None
+        assert rec.enrichment_data["taxsifter_owner_match"] == "other_parcel"
+        assert "assessed_value" not in rec.enrichment_data
+
+
+@pytest.mark.parametrize("echo", ["90000000002", None])
+async def test_an_assessor_page_not_naming_the_linked_parcel_never_fills_a_parcelled_lead(
+        portal, monkeypatch, echo):
+    """The parcel the guard trusts is the one the page itself names, not the search link's."""
+    from src.scrapers.base_scraper import ScrapedRecord
+
+    page = _assessor()
+    page = page.replace(">90000000001<", f">{echo}<") if echo else page.replace(
+        '<span id="cphContent_ParcelOwnerInfo1_lbParcelNumber">90000000001</span>', "")
+    monkeypatch.setattr(_Portal, "assessor_html", page)
+    monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
+    monkeypatch.setattr(taxsifter, "TaxSifterClient", lambda county: _client(portal))
+    parcelled, bare = ScrapedRecord(party_name="DOE JANE Q", parcel_id="90000000001"), \
+        ScrapedRecord(party_name="DOE JANE Q")
+    await taxsifter.fill_addresses_by_owner("douglas", [parcelled, bare])
+    assert parcelled.property_address is None
+    assert parcelled.enrichment_data["taxsifter_owner_match"] == "other_parcel"
+    # A lead with no parcel of its own keeps the old owner-name behaviour.
+    assert bare.property_address == "12 SAMPLE LN"
+
+
+def test_a_matching_fill_keeps_the_billing_signature_of_a_delivered_douglas_lead():
+    """Production shape (2026-11-15): delivered Douglas leads were hashed parcel|address,
+    the address being TaxSifter's situs or blank. The same parcel and situs give the
+    same frozen signature, so a re-scrape is recognised as already delivered."""
+    from src.workers.property_identity import legacy_strong_signature
+
+    delivered_taxsifter = legacy_strong_signature("90000000001", "12 SAMPLE LN")
+    delivered_blank = legacy_strong_signature("90000000001", "")
+    assert legacy_strong_signature("90000000001", "12 SAMPLE LN") == delivered_taxsifter
+    assert legacy_strong_signature("90000000001", None) == delivered_blank
+    # Control: the parcel-less hash current main computes would NOT match either.
+    assert legacy_strong_signature("", "12 SAMPLE LN") not in (delivered_taxsifter, delivered_blank)
+
+
 async def test_fill_never_overwrites_a_situs_or_state_the_record_already_had(portal, monkeypatch):
     from src.scrapers.base_scraper import ScrapedRecord
 
@@ -348,4 +405,5 @@ def test_a_failed_results_page_is_not_cached_so_the_name_is_retried(portal, monk
         client.lookup("DOE JANE Q")
     assert client.lookup("DOE JANE Q") == {
         "address": "12 SAMPLE LN", "mailing": "PO BOX 77, SAMPLETON, WA 98800", "value": "$250,500",
+        "parcel": "90000000001",
     }

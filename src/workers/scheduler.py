@@ -326,6 +326,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_columbian_clark",
         "schedule": crontab(hour=10, minute=35, day_of_week="*"),  # 10:35 UTC daily
     },
+    "crawl-nts-douglas-recorder": {
+        # NTS (Douglas): the recorder sells its images, but each recording's free detail
+        # page carries the sale in its typed remarks. Daily, before the 11:00 matcher;
+        # re-reading a year of recordings keeps recorded Discontinuances applied.
+        "task": "src.workers.nts_crawler.crawl_nts_douglas_recorder",
+        "schedule": crontab(hour=9, minute=30),  # 09:30 UTC daily
+    },
     "crawl-nts-benton-recorder": {
         # NTS Tier 1 (Benton): no legal-newspaper source; notices are read off the
         # Benton Auditor's recorded images. Daily, before the 11:00 matcher. Re-reading

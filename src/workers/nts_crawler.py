@@ -1319,20 +1319,126 @@ def crawl_nts_benton_recorder() -> dict:
     return summary
 
 
-def _cancel_notices(db, source: str, keys: list[str]) -> int:
+@app.task(name="src.workers.nts_crawler.crawl_nts_douglas_recorder",
+          soft_time_limit=50 * 60, time_limit=55 * 60)
+def crawl_nts_douglas_recorder() -> dict:
+    """Crawl Douglas County's recorded Notices of Trustee's Sale into nts_notices.
+
+    Douglas sells its recording images, but the free detail page carries the sale in
+    the recorder's typed remarks (src/scrapers/sources/nts_douglas_recorder.py). One
+    document-type search per code over every recording that could still name an
+    upcoming sale, then each detail page. ALL OR NOTHING: a search or page that fails,
+    or a page that does not parse, writes nothing (no notice can go live while its
+    discontinuance went unread) and alerts; the next run retries. Held notices (no
+    clear sale date, several parcels, an amended notice) are never stored and alert.
+    """
+    import asyncio
+    from zoneinfo import ZoneInfo
+
+    from src.db.models import NtsNotice
+    from src.db.session import system_sync_session
+    from src.scrapers.sources import nts_douglas_recorder as rec
+    from src.scrapers.templates.acclaimweb import DouglasAcclaimWebScraper
+
+    today = datetime.now(ZoneInfo("America/Los_Angeles")).date()  # the county's sale day
+    start = today - timedelta(days=rec.WINDOW_DAYS)
+    summary = {"source": rec.SOURCE, "discovered": 0, "upserted": 0, "held": {},
+               "discontinuances": 0, "cancelled": 0}
+
+    async def _collect() -> list[dict]:
+        s = DouglasAcclaimWebScraper(_DOUGLAS_RECORDER, "douglas", "wa",
+                                     record_types=["pre_foreclosure"], record_type="pre_foreclosure")
+        async with s:
+            return await s.collect_by_doc_type(start.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"),
+                                               rec.NOTICE_CODES, rec.parse_detail)
+
+    try:
+        docs = asyncio.run(_collect())
+        parsed = []
+        for d in docs:
+            p = rec.parse_detail(d["html"])
+            # The page must be the very recording the grid listed (Codex): its code,
+            # instrument and record date, not merely a page of the same type.
+            if (p is None or p["doc_code"] != d["code"] or p["instrument"] != d["instrument"]
+                    or p["record_date"].strftime("%m/%d/%Y") != d["record_date"]):
+                raise RuntimeError(f"detail page {d['item_id']} is not the recording the grid listed")
+            parsed.append((d["code"], p, f"{_DOUGLAS_RECORDER}/details/documentdetails/{d['item_id']}/1/1/11"))
+        # Raises when a discontinuance's link cannot be read.
+        ended, inferred, unmatched = rec.discontinued([p for code, p, _ in parsed if code == "NDTS"],
+                                                      [p for code, p, _ in parsed if code != "NDTS"])
+    except Exception as exc:  # noqa: BLE001 -- reported, never a partial write
+        _alert_recorder("crawl failed, nothing written", f"{type(exc).__name__}: {str(exc)[:200]}",
+                        county="douglas")
+        return {**summary, "error": type(exc).__name__}
+
+    summary["discontinuances"] = sum(code == "NDTS" for code, _, _ in parsed)
+    held: dict[str, int] = {}
+    held_keys: list[str] = []
+    rows = []
+    for code, p, url in parsed:
+        if code == "NDTS":
+            continue
+        summary["discovered"] += 1
+        row, why = rec.notice_to_row(p, url, today, ended)
+        if row is None:
+            held[why] = held.get(why, 0) + 1
+            held_keys.append(rec.ts_key(p["instrument"]))
+            continue
+        if p["instrument"] in inferred:
+            continue  # withdrawn below: never stored while a discontinuance implies it ended
+        row["fetched_at"] = datetime.now(UTC)  # the past-sale matcher pass reads it
+        rows.append(row)
+    with system_sync_session() as db:
+        for row in rows:
+            _upsert_notice(db, NtsNotice, row)
+        if ended:
+            # Every stored notice a discontinuance in the window names; never cleared.
+            summary["cancelled"] = _cancel_notices(db, rec.SOURCE, [rec.ts_key(i) for i in sorted(ended)])
+        down = sorted({rec.ts_key(i) for i in inferred} | set(held_keys))
+        if down:
+            # Withdrawn, not cancelled for good: a notice a discontinuance only implies
+            # (same deed of trust or parcel), or one published before that no longer
+            # reads cleanly. Its row is removed (no matcher pass can attach it, past
+            # sale or not; Codex) and comes back if a later run reads it as live again.
+            summary["withdrawn"] = _cancel_notices(db, rec.SOURCE, down, permanent=False)
+        db.commit()
+        _record_crawl_heartbeat(db, rec.COUNTY)  # the whole window was read
+    summary["upserted"], summary["held"] = len(rows), held
+    summary["inferred_ends"], summary["unmatched_discontinuances"] = len(inferred), unmatched
+    if held:
+        _alert_recorder("notices held for a person", ", ".join(f"{n} {k}" for k, n in sorted(held.items())),
+                        county="douglas", topic="held")
+    if unmatched:
+        # Legitimate when the notice it ends predates the window; a person checks.
+        _alert_recorder("discontinuances matched no notice in the window",
+                        "instruments " + ", ".join(unmatched), county="douglas", topic="unmatched")
+    _logger.info("Douglas recorder NTS crawl: %s", summary)
+    return summary
+
+
+_DOUGLAS_RECORDER = "https://edocs.douglascountywa.gov/AcclaimWeb"
+
+
+def _cancel_notices(db, source: str, keys: list[str], *, permanent: bool = True) -> int:
     """The sales these notices announced are off (a recorded discontinuance, or a
     later notice that replaces them): cancelled_at set once and never cleared, inactive,
     and leads already stamped with them cleared so the matcher can attach a live notice
-    (Codex P1). Exclusive against the matcher/finalizer's shared NTS_CANCEL_LOCK_KEY
+    (Codex P1). ``permanent=False`` WITHDRAWS them instead (stamps cleared, rows deleted,
+    no cancelled_at), for a notice that cannot be published with confidence today; the
+    crawl re-creates it if it later reads as live. A deleted row cannot be re-attached
+    by either matcher pass, which an inactive one could once its sale date passed
+    (Codex). Exclusive against the matcher/finalizer's shared NTS_CANCEL_LOCK_KEY
     (re-entrant within one transaction). Returns the notices changed. Caller commits."""
     from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
 
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
-    res = db.execute(
-        _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
-                 "WHERE source = :source AND ts_number = ANY(:keys)"),
-        {"source": source, "keys": keys},
-    )
+    res = None
+    if permanent:
+        res = db.execute(
+            _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
+                     "WHERE source = :source AND ts_number = ANY(:keys)"),
+            {"source": source, "keys": keys},
+        )
     # A later statement, so its snapshot sees an attachment that committed while we waited.
     db.execute(
         _sa_text("""
@@ -1346,6 +1452,13 @@ def _cancel_notices(db, source: str, keys: list[str]) -> int:
         """),
         {"source": source, "keys": keys},
     )
+    if not permanent:
+        # Never a cancelled row: a recorded discontinuance's cancellation stays on record.
+        res = db.execute(
+            _sa_text("DELETE FROM nts_notices WHERE source = :source AND ts_number = ANY(:keys) "
+                     "AND cancelled_at IS NULL"),
+            {"source": source, "keys": keys},
+        )
     return res.rowcount or 0
 
 
@@ -2580,14 +2693,18 @@ def _bounded_fetch(url: str, max_bytes: int, wall_s: float, headers: dict) -> by
             pass
 
 
-def _alert_recorder(what: str, detail: str, county: str = "chelan") -> None:
+def _alert_recorder(what: str, detail: str, county: str = "chelan", topic: str = "") -> None:
+    """``topic`` gives a recurring, informational alert its own cooldown bucket, so it can
+    never hold back a run-failure alert for the same county."""
     from src.workers.ops_alerts import send_ops_alert
 
     name = county.title()
     send_ops_alert(
-        kind="nts_recorder", key=f"nts_recorder:{county}",
+        kind="nts_recorder", key=f"nts_recorder:{county}" + (f":{topic}" if topic else ""),
         subject=f"{name} NTS recorder crawl: {what}",
         body=(f"The {name} County NTS recorder crawl: {what} ({detail}).\n\n"
-              "Staged notices await operator review; nothing reaches customers from here. "
-              "Check the crawler logs and nts_recorder_documents."),
+              + ("Douglas notices are written to nts_notices automatically from the recorder's typed "
+                 "remarks; check the crawler logs." if county == "douglas" else
+                 "Staged notices await operator review; nothing reaches customers from here. "
+                 "Check the crawler logs and nts_recorder_documents.")),
     )

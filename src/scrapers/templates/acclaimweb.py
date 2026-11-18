@@ -144,6 +144,17 @@ _CHELAN_DOC_TYPE_MAP = {
 }
 
 
+# Douglas's grid shows the description text ("AFFIT OF HEIRSHIP", "LETTER OF
+# TESTAMENTARY"), which the shared multi-word probate phrases miss (live list
+# 2026-11-15). Pre-foreclosure stays the shared map: doc_types.py partitions it.
+_DOUGLAS_DOC_TYPE_MAP = {
+    **_DOC_TYPE_MAP,
+    "probate": [*_DOC_TYPE_MAP["probate"], "HEIRSHIP", "TESTAMENTARY"],
+    # Recorded death certificates alone (21 in the 12 months to 2026-11-15; 6 carry a parcel).
+    "death_certificate": ["DEATH CERTIFICATE"],
+}
+
+
 def _grid_date(value: object) -> str | None:
     """GridResults RecordDate -> MM/DD/YYYY, or None when it is not a date.
 
@@ -164,12 +175,33 @@ def _grid_date(value: object) -> str | None:
         return None  # not a real date: the caller treats it as schema drift
 
 
+def _same_day(sent: str | None, wanted: str) -> bool:
+    """A form date ("1/7/2026" or "01/07/2026") is the MM/DD/YYYY day wanted."""
+    try:
+        return datetime.strptime((sent or "").strip(), "%m/%d/%Y") == datetime.strptime(wanted, "%m/%d/%Y")
+    except ValueError:
+        return False
+
+
+def _only_twins(rows: list) -> bool:
+    """True when every repeated TransactionItemId repeats an identical row (but for GUID)."""
+    first: dict = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            return False
+        key = r.get("TransactionItemId")
+        bare = {k: v for k, v in r.items() if k != "GUID"}
+        if first.setdefault(key, bare) != bare:
+            return False
+    return True
+
+
 def _grid_item(row: dict) -> dict:
     """One GridResults row in the shape _records_from_raw reads.
 
     Chelan names the code DocType ("NTS"); Douglas names the text DocTypeDescription
-    ("DEED OF TRUST"). Douglas also sends ParcelNumber, deliberately not read here:
-    parcel_id is a dedup/billing key, and Douglas leads were keyed without it.
+    ("DEED OF TRUST"). Douglas also sends the recording's ParcelNumber, carried as
+    grid_parcel and read only by a scraper that declares its shape (GRID_PARCEL_SHAPE).
     """
     return {
         "instrument": str(row.get("InstrumentNumber") or "").strip(),
@@ -179,6 +211,7 @@ def _grid_item(row: dict) -> dict:
         "grantee": str(row.get("IndirectName") or ""),
         "legal": str(row.get("DocLegalDescription") or ""),
         "parcel": "",
+        "grid_parcel": str(row.get("ParcelNumber") or "").strip(),
         "item_id": str(row.get("TransactionItemId") or ""),
     }
 
@@ -194,6 +227,9 @@ _DOC_LEGAL_RE = re.compile(
 _APN_NUMBER_RE = re.compile(r"\d(?:-?\d){8,}")
 _APN_LOOKUP_KEY = "recording_apn_lookup"
 _DETAIL_PACE_S = 1.5
+# A document-type search answering this many rows may be the portal's limit, not the
+# whole window (Douglas records ~33 NTS a year).
+_DOC_TYPE_ROW_CAP = 500
 
 
 def parse_detail_apns(html_text: str) -> list[str] | None:
@@ -231,10 +267,24 @@ class AcclaimWebScraper(BridgeScraper):
     # and the shape a single APN must have to become the lead's parcel.
     READS_DETAIL_APN = False
     APN_SHAPE = re.compile(r"\d{12}")
+    # The grid's own ParcelNumber is the lead's parcel when it has exactly this shape.
+    GRID_PARCEL_SHAPE: re.Pattern | None = None
 
     @classmethod
     def collection_scope(cls, record_type: str):
-        """SHOW descriptor derived from this site's own DOC_TYPE_MAP."""
+        """SHOW descriptor derived from this site's own DOC_TYPE_MAP.
+
+        The shared keyword presentation has no death_certificate entry; a site that
+        collects it (Chelan, Douglas) uses the recorder's own DEATH CERTIFICATE document
+        type, shown as King's is."""
+        if record_type == "death_certificate" and record_type in cls.DOC_TYPE_MAP:
+            from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+            return CollectionScope(
+                kind="document_type",
+                items=(DocTypeItem(label="Death Certificate", exact=False),),
+                note="Recorded death certificates (the recorder's own death certificate document type).",
+            )
         from src.scrapers.doc_scope import from_keyword_map
 
         return from_keyword_map(cls.DOC_TYPE_MAP, record_type)
@@ -328,7 +378,11 @@ class AcclaimWebScraper(BridgeScraper):
         # scheduler re-runs it) — we never swallow a bad chunk and continue, which
         # would silently under-deliver a partial date window under a DONE job.
         # A single-date site searches one day per chunk, so date_to itself is a chunk.
-        while chunk_start < end or (self._single_date_mode and chunk_start == end):
+        # A one-day window is always searched once: without that, a site whose single
+        # date field was not yet on the page at pre-detection (Douglas, live 2026-11-15)
+        # ran no search at all and reported a verified-looking zero.
+        searched = False
+        while chunk_start < end or (chunk_start == end and (self._single_date_mode or not searched)):
             # Use 1-day chunks in single-date mode, 7-day chunks otherwise
             effective_days = 1 if self._single_date_mode else chunk_days
             chunk_end = min(chunk_start + timedelta(days=effective_days), end)
@@ -344,6 +398,7 @@ class AcclaimWebScraper(BridgeScraper):
 
             await self._fill_dates(cf, ct)
             chunk_records = await self._search_and_read(cf, ct)
+            searched = True
 
             new_count = self.dedupe_extend(chunk_records, seen_hashes, all_records)
 
@@ -567,6 +622,9 @@ class AcclaimWebScraper(BridgeScraper):
             _logger.info("Kendo fill result: %s", filled)
 
             if filled in ('kendo_ok', 'kendo_single'):
+                if filled == 'kendo_single':
+                    # One date was searched: the loop must step a day, not a week (Codex).
+                    self._single_date_mode = True
                 await self.page.wait_for_timeout(1_000)
                 return
 
@@ -675,7 +733,7 @@ class AcclaimWebScraper(BridgeScraper):
         rows = await self._search_rows(date_from, date_to)
         return self._records_from_raw([_grid_item(r) for r in rows])
 
-    async def _search_rows(self, date_from: str, date_to: str) -> list[dict]:
+    async def _search_rows(self, date_from: str, date_to: str, shell_timeout_s: float = 30) -> list[dict]:
         """Run the filled-in search and return every grid row it found, of every page.
 
         Only requests issued after our click count: a late answer to an earlier
@@ -717,7 +775,7 @@ class AcclaimWebScraper(BridgeScraper):
         try:
             try:
                 async with self.page.expect_response(
-                    lambda r: _ours(r, "GET", _GRID_SHELL_PATH), timeout=30_000,
+                    lambda r: _ours(r, "GET", _GRID_SHELL_PATH), timeout=shell_timeout_s * 1000,
                 ) as shell_info:
                     await self._submit_search()
                 shell = await shell_info.value
@@ -837,6 +895,14 @@ class AcclaimWebScraper(BridgeScraper):
         if not all(isinstance(r, dict) for r in rows):
             raise _fail("grid row is not an object (schema drift)")
         ids = {r.get("TransactionItemId") for r in rows}
+        self._last_grid_total = total  # as the portal reported it, before any twin collapse
+        if len(rows) == total and len(ids) != total and "page" not in form and _only_twins(rows):
+            # Douglas's one unpaged answer can list a recording twice, identical but for
+            # its row GUID, and count both (10/19/2026: a SURVEYS FOR AUDITOR). Every row
+            # was read; the twin is the same document. A paged grid stays strict: there a
+            # repeat can be a repeated page hiding missed rows.
+            rows = list({r.get("TransactionItemId"): r for r in rows}.values())
+            total = len(rows)
         if len(rows) != total or len(ids) != total:
             raise _fail(f"read {len(rows)} grid rows ({len(ids)} distinct) of {total}")
         lo = datetime.strptime(date_from, "%m/%d/%Y").date()
@@ -964,6 +1030,13 @@ class AcclaimWebScraper(BridgeScraper):
 
                 # Parcel ID
                 parcel = item.get("parcel", "").strip()
+                grid_parcel = item.get("grid_parcel", "")
+                if not parcel and self.GRID_PARCEL_SHAPE and grid_parcel:
+                    if self.GRID_PARCEL_SHAPE.fullmatch(grid_parcel):
+                        parcel = grid_parcel
+                    else:
+                        # Not a parcel of this county's shape: kept for review, never keyed.
+                        record.enrichment_data["grid_parcel_unmatched"] = grid_parcel
                 if parcel:
                     record.parcel_id = parcel
 
@@ -1017,38 +1090,7 @@ class AcclaimWebScraper(BridgeScraper):
         for i, (doc_id, recs) in enumerate(by_doc.items()):
             if i:
                 await asyncio.sleep(_DETAIL_PACE_S)
-            url = f"{self.base_url}/details/documentdetails/{doc_id}/1/1/11"
-            apns: list[str] | None = None
-            why = ""
-            for attempt in (1, 2):
-                if attempt == 2:
-                    await asyncio.sleep(_DETAIL_PACE_S * 2)
-                try:
-                    # From the page, not page.request: an in-page fetch passes the
-                    # context's SSRF route guard and carries the portal session.
-                    status, page_html = await asyncio.wait_for(self.page.evaluate(
-                        """async ([url, ms]) => {
-                            const r = await fetch(url, {signal: AbortSignal.timeout(ms)});
-                            return [r.status, await r.text()];
-                        }""",
-                        [url, _PORTAL_TIMEOUT_S * 1000],
-                    ), _PORTAL_TIMEOUT_S + 5)
-                except Exception as exc:  # noqa: BLE001 -- retried, then raised below
-                    status, page_html, why = 0, "", type(exc).__name__
-                if status in (403, 429):
-                    raise ScraperBlockedError(
-                        self.county, "AcclaimWeb", f"recording detail page refused (HTTP {status})",
-                        record_type=self.active_record_type,
-                    )
-                apns = parse_detail_apns(page_html) if status == 200 else None
-                if apns is not None:
-                    break
-                why = "not a detail page" if status == 200 else (why or f"HTTP {status}")
-            if apns is None:
-                raise TransientScrapeError(
-                    self.county, "AcclaimWeb", f"recording detail page unreadable ({why})",
-                    record_type=self.active_record_type,
-                )
+            apns = parse_detail_apns(await self._detail_page(doc_id, parse_detail_apns))
             if not apns:
                 outcome = "none"
             elif len(apns) == 1 and self.APN_SHAPE.fullmatch(apns[0]):
@@ -1064,6 +1106,40 @@ class AcclaimWebScraper(BridgeScraper):
         if by_doc:
             outcomes = [r.enrichment_data[_APN_LOOKUP_KEY] for rs in by_doc.values() for r in rs]
             _logger.info("Recording APN: %s", {o: outcomes.count(o) for o in sorted(set(outcomes))})
+
+    async def _detail_page(self, doc_id: str, readable) -> str:
+        """One recording's detail page, from this session. ``readable(html)`` is None for
+        a page that is not the detail page. One retry; a page still unreadable RAISES
+        TransientScrapeError (the run is retried), a 403/429 ScraperBlockedError."""
+        url = f"{self.base_url}/details/documentdetails/{doc_id}/1/1/11"
+        why = ""
+        for attempt in (1, 2):
+            if attempt == 2:
+                await asyncio.sleep(_DETAIL_PACE_S * 2)
+            try:
+                # From the page, not page.request: an in-page fetch passes the
+                # context's SSRF route guard and carries the portal session.
+                status, page_html = await asyncio.wait_for(self.page.evaluate(
+                    """async ([url, ms]) => {
+                        const r = await fetch(url, {signal: AbortSignal.timeout(ms)});
+                        return [r.status, await r.text()];
+                    }""",
+                    [url, _PORTAL_TIMEOUT_S * 1000],
+                ), _PORTAL_TIMEOUT_S + 5)
+            except Exception as exc:  # noqa: BLE001 -- retried, then raised below
+                status, page_html, why = 0, "", type(exc).__name__
+            if status in (403, 429):
+                raise ScraperBlockedError(
+                    self.county, "AcclaimWeb", f"recording detail page refused (HTTP {status})",
+                    record_type=self.active_record_type,
+                )
+            if status == 200 and readable(page_html) is not None:
+                return page_html
+            why = "not a detail page" if status == 200 else (why or f"HTTP {status}")
+        raise TransientScrapeError(
+            self.county, "AcclaimWeb", f"recording detail page unreadable ({why})",
+            record_type=self.active_record_type,
+        )
 
     async def _lookup_addresses_by_owner(self, records: list[ScrapedRecord]) -> None:
         """In-scrape owner-name address lookup, for a TerraScan TaxSifter county (Douglas).
@@ -1093,26 +1169,133 @@ class AcclaimWebScraper(BridgeScraper):
         await fill_addresses_by_owner(self.county, records)
 
 
+class DouglasAcclaimWebScraper(AcclaimWebScraper):
+    """Douglas County's AcclaimWeb: its grid names each recording's 11-digit parcel.
+
+    Douglas leads were keyed (billing dedup_hash = parcel|address) with that parcel
+    until the 2026-11 grid rewrite dropped it; reading it again restores the keys of
+    the leads already delivered (all 12 production rows equal the grid's ParcelNumber,
+    checked 2026-11-15).
+    """
+
+    DOC_TYPE_MAP = _DOUGLAS_DOC_TYPE_MAP
+    GRID_PARCEL_SHAPE = re.compile(r"\d{11}")
+
+    async def _submit_search(self) -> None:
+        """On the document-type form, its own #btnSearch (the generic lookup can land on
+        another "Search" control there); the record-date form keeps the shared click."""
+        if "SearchTypeDocType" in self.page.url and await self.page.locator("#btnSearch").count():
+            await self.page.locator("#btnSearch").click()
+            return
+        await super()._submit_search()
+
+    async def collect_by_doc_type(self, date_from: str, date_to: str,
+                                  descriptions: dict[str, str], readable) -> list[dict]:
+        """Every recording of each document type in the window, with its detail page:
+        [{code, item_id, instrument, record_date, html}]. For the NTS crawler.
+
+        One document-type search per code (not one record-date search per day), read
+        through the same response-driven _search_rows as a lead scrape, so a partial or
+        stale grid raises. Every row must be the type asked for. Detail pages come from
+        this session (Douglas refuses them without one). Call inside ``async with``.
+        """
+        search_url = f"{self.base_url}/search/SearchTypeDocType"
+        await self.navigate(search_url)
+        await self._accept_disclaimer()
+        found: list[dict] = []
+        for n, (code, desc) in enumerate(descriptions.items()):
+            if n or "SearchTypeDocType" not in self.page.url:  # a fresh form for each search
+                await self.page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
+                await self._accept_disclaimer()
+            # The URL changes before the form's DOM does (after the disclaimer, live).
+            for attempt in (1, 2):
+                try:
+                    await self.page.wait_for_selector("#DocTypes", state="attached",
+                                                      timeout=_PORTAL_TIMEOUT_S * 1000)
+                    break
+                except Exception as exc:  # noqa: BLE001 -- reloaded once, then the run is retried
+                    # Live: a load can stall on a 2 KB interim page; a fresh load serves the form.
+                    if attempt == 2:
+                        raise TransientScrapeError(self.county, "AcclaimWeb", "document-type form never loaded",
+                                                   record_type=self.active_record_type) from exc
+                    await self.page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
+                    await self._accept_disclaimer()
+            m = re.search(r'\{"Text":"' + re.escape(f"{desc} ({code})") + r'","Value":"(\d+)"\}',
+                          await self.page.content())
+            if m is None:
+                raise ScraperExecutionError(self.county, "AcclaimWeb",
+                                            f"document type {code} is not offered (list changed)",
+                                            context=urlparse(self.page.url).path[:120])
+            set_ok = await self.page.evaluate(
+                """([v, f, t]) => {
+                    const box = document.querySelector('#DocTypes');
+                    const from = window.jQuery && jQuery('#RecordDateFrom').data('kendoDatePicker');
+                    const to = window.jQuery && jQuery('#RecordDateTo').data('kendoDatePicker');
+                    if (!box || !from || !to) return false;
+                    box.value = v; from.value(f); to.value(t);
+                    return box.value === v;
+                }""", [m.group(1), date_from, date_to])
+            if not set_ok:
+                raise ScraperExecutionError(self.county, "AcclaimWeb", "document-type search form changed")
+            # The form's async-submit script binds after load; a click before it sends nothing.
+            await self.page.wait_for_load_state("load", timeout=_PORTAL_TIMEOUT_S * 1000)
+            await self.page.wait_for_timeout(2_000)
+            # The search the portal ran must be the one asked for (Codex): its own form
+            # post names this type and these dates, so a zero is about THIS search.
+            posts: list[str] = []
+
+            def _form_post(req, posts: list[str] = posts) -> None:
+                if req.method == "POST" and urlparse(req.url).path.lower().endswith("/search/searchtypedoctype"):
+                    posts.append(req.post_data or "")
+
+            self.page.on("request", _form_post)
+            try:
+                # A months-long document-type search answers slower than one day's.
+                rows = await self._search_rows(date_from, date_to, shell_timeout_s=90)
+            finally:
+                self.page.remove_listener("request", _form_post)
+            sent = [dict(parse_qsl(p)) for p in posts]
+            if len(sent) != 1 or sent[0].get("DocTypes") != m.group(1) \
+                    or not _same_day(sent[0].get("RecordDateFrom"), date_from) \
+                    or not _same_day(sent[0].get("RecordDateTo"), date_to):
+                raise ScraperExecutionError(self.county, "AcclaimWeb",
+                                            f"the {code} search the portal ran is not the one asked for")
+            # The portal's own count, before twin collapse could lower it (Codex).
+            reported = getattr(self, "_last_grid_total", 0) if rows else 0
+            if max(len(rows), reported) >= _DOC_TYPE_ROW_CAP:
+                raise ScraperExecutionError(self.county, "AcclaimWeb",
+                                            f"{max(len(rows), reported)} {code} rows: at or past the portal's cap")
+            for r in rows:
+                if " ".join(str(r.get("DocTypeDescription") or "").split()).upper() != desc:
+                    raise ScraperExecutionError(self.county, "AcclaimWeb",
+                                                f"a {code} search returned another document type")
+                found.append({"code": code, "item_id": str(r.get("TransactionItemId") or "").strip(),
+                              "instrument": str(r.get("InstrumentNumber") or "").strip(),
+                              "record_date": _grid_date(r.get("RecordDate"))})
+            await asyncio.sleep(_DETAIL_PACE_S)
+        for i, doc in enumerate(found):
+            if i:
+                await asyncio.sleep(_DETAIL_PACE_S)
+            doc["html"] = await self._detail_page(doc["item_id"], readable)
+        return found
+
+    def _records_from_raw(self, raw: list[dict]) -> list[ScrapedRecord]:
+        """Douglas indexes a death certificate's decedent as "<NAME> ESTATE OF"."""
+        records = super()._records_from_raw(raw)
+        if self.active_record_type in ("probate", "death_certificate"):
+            from src.scrapers.probate import strip_inverted_estate_caption
+
+            for r in records:
+                r.party_name = strip_inverted_estate_caption(r.party_name)
+        return records
+
+
 class ChelanAcclaimWebScraper(AcclaimWebScraper):
     """Chelan County's AcclaimWeb: same portal, its own document codes."""
 
     DOC_TYPE_MAP = _CHELAN_DOC_TYPE_MAP
     READS_DETAIL_APN = True
     APN_SHAPE = re.compile(r"\d{12}")  # Chelan parcel numbers: 12 digits
-
-    @classmethod
-    def collection_scope(cls, record_type: str):
-        """The shared keyword presentation has no death_certificate entry; Chelan's is
-        the recorder's own DEATH CERTIFICATE (DC) document type, shown as King's is."""
-        if record_type != "death_certificate":
-            return super().collection_scope(record_type)
-        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
-
-        return CollectionScope(
-            kind="document_type",
-            items=(DocTypeItem(label="Death Certificate", exact=False),),
-            note="Recorded death certificates (the recorder's DC document code).",
-        )
 
     async def discover(self, date_from: str, date_to: str, codes: set[str]) -> list[dict]:
         """Every recorded document with one of ``codes`` in the window (MM/DD/YYYY,

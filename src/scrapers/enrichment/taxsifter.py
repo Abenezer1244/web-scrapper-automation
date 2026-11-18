@@ -193,6 +193,13 @@ def parse_taxsifter_assessor(html: str) -> dict[str, str] | None:
     return result
 
 
+def _echoed_parcel(html: str) -> str | None:
+    """The parcel an Assessor.aspx page names (lbParcelNumber), digits only; None without one."""
+    el = BeautifulSoup(html, "html.parser").find(id="cphContent_ParcelOwnerInfo1_lbParcelNumber")
+    digits = re.sub(r"\D", "", el.get_text(" ")) if el else ""
+    return digits or None
+
+
 class TaxSifterClient:
     """One run's serialized, cached TaxSifter lookups for one county.
 
@@ -277,6 +284,10 @@ class TaxSifterClient:
             if not self._html_ok(page):
                 raise RuntimeError("TaxSifter assessor page was not served")
             result = parse_taxsifter_assessor(page.text)
+            if result is not None and _echoed_parcel(page.text) == parcel:
+                # Only when the page itself names the parcel the search linked to: lets
+                # the caller check it against the lead's own. No echo, no "parcel".
+                result["parcel"] = parcel
         # Only a definite answer (found, or no unique owner match) is cached; a
         # transport or page failure raised above, so that name can be retried.
         self._cache[query] = result
@@ -315,6 +326,13 @@ async def fill_addresses_by_owner(county: str, records: list) -> int:
                 break
             continue
         if not result:
+            continue
+        # A unique owner match can be another of the owner's properties: when the
+        # recording names its parcel, only that parcel's page may fill the lead.
+        own = (getattr(record, "parcel_id", None) or "").replace("-", "").strip()
+        if own and result.get("parcel") != own:
+            record.enrichment_data = record.enrichment_data or {}
+            record.enrichment_data["taxsifter_owner_match"] = "other_parcel"
             continue
         # Fill-only on both addresses: a value the recorder document itself carried
         # outranks one inferred from an owner name (Codex P2). Every value written

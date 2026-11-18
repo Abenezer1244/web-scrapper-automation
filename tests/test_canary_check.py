@@ -401,25 +401,33 @@ def test_new_and_down_connectors_share_the_priority_slots():
     units = health._canary_units([*new, *down, *(_row(i) for i in range(60))])
     assert len(units) == health.CANARY_UNITS_PER_TICK
     priority = health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
-    assert sum(c in new for c, _ in units[:priority]) == priority - 1
-    assert units[priority - 1][0] in down
+    assert sum(c in new for c, _ in units) == priority - 1
+    assert units[-1][0] in down   # recovery runs last
     only_down = health._canary_units([*down, *(_row(i) for i in range(60))])
-    assert all(c in down for c, _ in only_down[:priority])
+    assert all(c in down for c, _ in only_down[-priority:])
 
 
-def test_no_down_connector_is_always_first():
+def test_recovery_probes_run_after_the_routine_ones():
+    """Codex P2: a recovery probe that times out every tick must not stop the routine probes."""
+    down = _down("d")
+    units = health._canary_units([down, *(_row(i) for i in range(60))])
+    assert units[-1] == (down, "probate")
+    assert len(units) == health.CANARY_UNITS_PER_TICK
+
+
+def test_no_down_connector_is_always_the_one_recovered():
     """Codex P2: a probe that times out records no verdict, so an oldest-first order
-    would put it first every tick and stop each run before the rest."""
+    would pick it every tick ahead of the rest."""
     down = [_down(f"d{i}", hours_ago=i + 2) for i in range(10)]
-    firsts = {health._canary_units(down)[0][0].id for _ in range(50)}
-    assert len(firsts) > 1
+    picked = {c.id for _ in range(50) for c, _ in health._canary_units(down)[-1:]}
+    assert len(picked) > 1
 
 
 def test_a_down_connectors_other_types_stay_in_the_rotation():
     waiting_turn = _down("w", ("probate", "pre_foreclosure", "divorce"), hours_ago=1)
     older = [_down(f"o{i}", hours_ago=10 + i) for i in range(3)]   # take the recovery slots
     units = health._canary_units([waiting_turn, *older])
-    assert {c.id for c, _ in units[:3]} == {c.id for c in older}
+    assert {c.id for c, _ in units[-3:]} == {c.id for c in older}
     mine = [rt for c, rt in units if c is waiting_turn]   # the rotation slots are all it
     assert len(mine) == len(set(mine)) == health.CANARY_ROUTINE_SLOTS
 

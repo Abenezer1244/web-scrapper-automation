@@ -474,8 +474,9 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     if its marker says so. One
     transient failure used to hide a working source until the rotation came back to it,
     30+ hours (Clallam tax_delinquent, 2026-11-16). Each group keeps a slot while the
-    other has a backlog. A recovering connector sits out the rest of its tick and is
-    due again after CANARY_RECOVERY_INTERVAL; its other types rotate in between."""
+    other has a backlog. Recovery probes run last in the tick; a recovering connector's
+    other types sit that tick out and rotate in until it is due again
+    (CANARY_RECOVERY_INTERVAL)."""
     import random
 
     pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
@@ -490,18 +491,20 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     # verdict, so an oldest-first order would put it first again and stop each run (Codex P2).
     recovering = random.sample(down, min(len(down), slots - n_first))
     marked = _down_marked_types(recovering)
-    first += [(c, random.choice(marked.get(c.id) or c.record_types)) for c in recovering]
+    last = [(c, random.choice(marked.get(c.id) or c.record_types)) for c in recovering]
     # Pending connectors stay out of the rotation, so a stuck backlog gets only the
     # priority slots; their other types rotate in once a probe certifies them. A
     # recovering connector sits out the rest of this tick: a sibling probed after it
     # would write the one shared status over its still-broken type (Codex P2).
     skip = waiting | {c.id for c in recovering}
     rest = [(c, rt) for c in connectors if c.id not in skip for rt in (c.record_types or [])]
-    units = first + random.sample(rest, min(k - len(first), len(rest)))
+    # Recovery probes run last: one that times out every tick then costs only itself, never
+    # the routine probes (Codex P2), and its own verdict is the last written in its tick.
+    units = first + random.sample(rest, min(k - len(first) - len(last), len(rest)))
     # Slots the rotation cannot fill go to the rest of the pending pairs.
     chosen = {(c.id, rt) for c, rt in units}
     spare = [(c, rt) for c in pending for rt in c.record_types if (c.id, rt) not in chosen]
-    return units + random.sample(spare, min(k - len(units), len(spare)))
+    return units + random.sample(spare, min(k - len(units) - len(last), len(spare))) + last
 
 
 def _down_marked_types(connectors) -> dict:

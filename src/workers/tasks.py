@@ -2047,38 +2047,50 @@ def run_scrape_job(self, job_id: str) -> None:
         # Fatal before billing, like the cap: billing would otherwise charge rows the
         # hold was meant to exclude (the belt in actionable_sql still refuses them, so
         # failing here costs the customer nothing but a re-run).
-        if config.record_type == "code_violation":
-            from src.workers.tasks_helpers.plan_cap import mark_not_qualified_rows
+        # Every other record type holds its rows with no address the same way (and every
+        # plan, before the cap): a sweep that finds an address later must not turn them
+        # into leads of this finished run that were never billed or sent (owner, 2026-11-15).
+        from src.workers.tasks_helpers.plan_cap import (
+            mark_no_address_rows,
+            mark_not_qualified_rows,
+        )
 
-            try:
+        _is_cv = config.record_type == "code_violation"
+        _held = 0
+        try:
+            if _is_cv:
                 _held = mark_not_qualified_rows(db, job_id=job_id, user_id=str(job.user_id))
+            else:
+                mark_no_address_rows(db, job_id=job_id, user_id=str(job.user_id))
+            db.commit()
+        except Exception as exc:
+            reraise_time_limit(exc)
+            db.rollback()
+            _logger.error("Job %s: holding %s failed: %s", job_id,
+                          "unqualified code violations" if _is_cv else "no-address rows",
+                          type(exc).__name__)
+            try:
+                release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                 db.commit()
-            except Exception as exc:
-                reraise_time_limit(exc)
+            except Exception as cleanup_exc:
                 db.rollback()
-                _logger.error("Job %s: holding unqualified code violations failed: %s",
-                              job_id, type(exc).__name__)
-                try:
-                    release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
-                    db.commit()
-                except Exception as cleanup_exc:
-                    db.rollback()
-                    _alert_dedup_release_failed(job_id, _boot_user_id, "qualification_hold",
-                                                cleanup_exc)
-                _fail_attempt(
-                    "Lead checks could not be completed, so no file was delivered and you "
-                    "were not charged. Please run the scraper again."
-                )
-                return
-            if _held:
-                _publish_log(
-                    r, job_id, "warning",
-                    f"{_held:,} code violation record{'s' if _held != 1 else ''} held back: "
-                    "not delivered and not billed, because the verified property owner, "
-                    "parcel or owner mailing address could not be confirmed. A later run "
-                    "delivers them once the county records confirm the owner.",
-                    db=db,
-                )
+                _alert_dedup_release_failed(job_id, _boot_user_id,
+                                            "qualification_hold" if _is_cv else "no_address_hold",
+                                            cleanup_exc)
+            _fail_attempt(
+                "Lead checks could not be completed, so no file was delivered and you "
+                "were not charged. Please run the scraper again."
+            )
+            return
+        if _held:  # code violations only: no-address rows already have their own log line
+            _publish_log(
+                r, job_id, "warning",
+                f"{_held:,} code violation record{'s' if _held != 1 else ''} held back: "
+                "not delivered and not billed, because the verified property owner, "
+                "parcel or owner mailing address could not be confirmed. A later run "
+                "delivers them once the county records confirm the owner.",
+                db=db,
+            )
 
         # ── APPLY THE PLAN CAP (after enrichment, before delivery) ───────────
         # Every scraped row was persisted and enriched, so actionability is now

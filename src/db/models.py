@@ -2025,6 +2025,9 @@ class NtsRecorderDocument(Base):
     county = Column(String(64), nullable=False)
     state = Column(String(2), nullable=False)
     transaction_item_id = Column(String(32), nullable=False)
+    # The recording's full entry name where the recorder's ids are not stable (Cowlitz
+    # Laserfiche re-indexed 2026-11-17): unique per county when set (migration 170).
+    entry_name = Column(String(64), nullable=True)
     instrument_number = Column(String(32), nullable=False)
     doc_code = Column(String(16), nullable=False)
     record_date = Column(Date, nullable=False)

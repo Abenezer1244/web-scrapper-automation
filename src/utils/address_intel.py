@@ -169,7 +169,6 @@ _STREET_TYPE_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values())
 # Every designator _UNIT_STRIP_RE strips: a break after one is never just spacing.
 _UNIT_WORD_SET = frozenset(re.findall(r"[A-Z]+", _UNIT_STRIP_RE.pattern.split(r")\b")[0]))
 _ORDINALS = {"1": "ST", "2": "ND", "3": "RD"}
-_HOUSE_LIKE_RE = re.compile(r"\d+[A-Z]?")
 
 
 def _ordinal_ok(num: str, suffix: str) -> bool:
@@ -261,8 +260,9 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
             if kind_a == kind_b:
                 continue
             for canon, k in ((ca, ia), (cb, ib)):  # both sides, so order never matters
-                # A dash between two house-like numbers is a range ("1508 - 1510A").
-                if _HOUSE_LIKE_RE.fullmatch(canon[k]) and _HOUSE_LIKE_RE.fullmatch(canon[k + 1]):
+                # Never re-spell a break beside a number: "1508 1/2-1510A" may be a
+                # range, "12-34" a compound house id (Codex).
+                if any(ch.isdigit() for ch in canon[k] + canon[k + 1]):
                     return False
                 # "LOT-AB RD" / "LOT.AB RD" is a street name; "LOT AB" is a unit.
                 if canon[k] in _UNIT_WORD_SET:

@@ -821,7 +821,8 @@ def gis_mailing_source_counties(state: str = "WA") -> list[str]:
 
 
 def batch_enrich_parcels_gis(
-    parcel_ids: list[str], county: str, state: str, stats: dict | None = None
+    parcel_ids: list[str], county: str, state: str, stats: dict | None = None, *,
+    mailing: bool = True,
 ) -> dict[str, dict[str, str | None]]:
     """Batch enrich multiple parcels via GIS API.
 
@@ -836,6 +837,9 @@ def batch_enrich_parcels_gis(
     ArcGIS error body). For a county with a mailing source those parcels were never
     looked up, which is different from "looked up, no mailing address", so the caller
     can defer them to background recovery instead of leaving a silent NULL.
+
+    ``mailing=False`` skips the bulk owner-mailing source (a situs-only caller, the
+    NTS review's site-address lookup, must not set off owner-mailing requests).
     """
     if stats is not None:
         stats.setdefault("county_unreached", [])
@@ -904,7 +908,7 @@ def batch_enrich_parcels_gis(
     # FEATURE SET, or a future revision that keeps situs and drops only the taxpayer
     # block, leaves a parcel with no mailing and no unreached marker, and those are
     # exactly the parcels this source exists to answer (Codex).
-    if has_bulk_mailing_source(county, state):
+    if mailing and has_bulk_mailing_source(county, state):
         needs_mail = [
             pid for pid in dict.fromkeys(parcel_ids)
             if pid and not (results.get(pid) or {}).get("mailing_address")

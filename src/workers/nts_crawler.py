@@ -1575,10 +1575,17 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     said 170 Hill Street; the assessor and the parcel layer give 62 Village Vista Ln for
     the same legal description). Network: call it OUTSIDE any transaction holding
     NTS_CANCEL_LOCK_KEY, and freeze what it returns (Codex): a lookup per scrape would let
-    a layer outage flip the address, and with it the lead's dedup hash, between runs."""
-    from src.scrapers.enrichment.county_gis import enrich_parcel_gis
+    a layer outage flip the address, and with it the lead's dedup hash, between runs.
 
-    found = enrich_parcel_gis(parcel, county, state).get("property_address")
+    The BATCH lookup pre-foreclosure enrichment runs, not the single one: the two differ
+    (the single one falls back to the statewide layer for a parcel the county matched
+    with no street, and for a 5-character Cowlitz parcel), and a different address for
+    the same parcel is a different lead identity, so a second charge (Codex, Cowlitz)."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    if not cg.settings.GIS_ENRICHMENT_ENABLED:
+        return None
+    found = (cg.batch_enrich_parcels_gis([parcel], county, state, mailing=False).get(parcel) or {}).get("property_address")
     return " ".join((found or "").split())[:512] or None
 
 

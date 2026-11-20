@@ -359,6 +359,130 @@ def test_a_priority_backlog_never_takes_the_routine_slots():
     assert len({c.id for c, _ in units if c in stuck}) == health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
 
 
+def _down(n, record_types=("probate",), hours_ago=1):
+    row = _row(n, record_types, status="down")
+    row.id = f"down-{uuid.uuid4().hex}"  # its own Redis marker keys
+    row.last_checked = datetime.now(UTC) - timedelta(hours=hours_ago)
+    return row
+
+
+def test_a_down_connector_is_probed_again_on_the_next_tick():
+    """Clallam tax_delinquent: one unreadable page took it down, hidden 30+ h waiting for the rotation."""
+    routine = [_row(i) for i in range(60)]
+    down = _down("d")
+    for _ in range(20):
+        assert (down, "probate") in health._canary_units([*routine, down])
+
+
+def test_the_type_paged_down_is_the_one_probed_again(redis_client):
+    down = _down("d", ("probate", "tax_delinquent"))
+    redis_client.set(health._bad_key(down, "tax_delinquent"), "canary")
+    try:
+        for _ in range(20):
+            units = health._canary_units([*(_row(i) for i in range(60)), down])
+            assert (down, "tax_delinquent") in units
+    finally:
+        redis_client.delete(health._bad_key(down, "tax_delinquent"))
+
+
+def test_unreadable_markers_still_probe_the_down_connector(monkeypatch):
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:1/15")  # nothing listens
+    down = _down("d")
+    assert (down, "probate") in health._canary_units([*(_row(i) for i in range(60)), down])
+
+
+def test_new_and_down_connectors_share_the_priority_slots():
+    """Codex: a down backlog must not starve a new connector, nor the other way round,
+    and neither takes the routine slots."""
+    new = [_row(f"n{i}", status="unknown", checked=False) for i in range(10)]
+    down = [_down(f"d{i}", hours_ago=i + 2) for i in range(10)]
+    units = health._canary_units([*new, *down, *(_row(i) for i in range(60))])
+    assert len(units) == health.CANARY_UNITS_PER_TICK
+    priority = health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
+    assert sum(c in new for c, _ in units) == priority - 1
+    assert units[-1][0] in down   # recovery runs last
+    only_down = health._canary_units([*down, *(_row(i) for i in range(60))])
+    assert all(c in down for c, _ in only_down[-priority:])
+
+
+def test_recovery_probes_run_after_the_routine_ones():
+    """Codex P2: a recovery probe that times out every tick must not stop the routine probes."""
+    down = _down("d")
+    units = health._canary_units([down, *(_row(i) for i in range(60))])
+    assert units[-1] == (down, "probate")
+    assert len(units) == health.CANARY_UNITS_PER_TICK
+
+
+def test_no_down_connector_is_always_the_one_recovered():
+    """Codex P2: a probe that times out records no verdict, so an oldest-first order
+    would pick it every tick ahead of the rest."""
+    down = [_down(f"d{i}", hours_ago=i + 2) for i in range(10)]
+    picked = {c.id for _ in range(50) for c, _ in health._canary_units(down)[-1:]}
+    assert len(picked) > 1
+
+
+def test_a_down_connectors_other_types_stay_in_the_rotation():
+    down = _down("w", ("probate", "pre_foreclosure", "divorce"))
+    units = health._canary_units([down], k=100)
+    assert sorted(rt for _, rt in units) == ["divorce", "pre_foreclosure", "probate"]
+
+
+def test_a_sibling_probed_in_the_same_tick_runs_before_the_recovery_probe():
+    """Codex P2: probed after it, a working sibling would write the shared status over
+    the still-broken type's verdict."""
+    down = _down("d", ("probate", "pre_foreclosure", "divorce"))
+    for _ in range(20):
+        units = health._canary_units([down], k=100)
+        assert len(units) == 3 and len({rt for _, rt in units}) == 3
+        assert units[-1][0] is down
+
+
+def test_a_down_connector_stays_hidden_until_its_recovery_probe_has_run(connector, monkeypatch):
+    """Codex P2: a sibling probed first relisted it, and a tick stopped before the recovery
+    probe left it listed with the broken type unchecked."""
+    c = connector(record_types=("probate", "pre_foreclosure"), status="down")
+    seen: list = []
+
+    async def fetch(_cls, _f, _t, record_type=None):
+        seen.append((record_type, _status(c)))
+        return ["r"]
+    monkeypatch.setattr(health, "_canary_scrape", fetch)
+    _run_only(monkeypatch, [(c, "pre_foreclosure"), (c, "probate")])
+
+    health._canary_check_impl()
+
+    assert seen == [("pre_foreclosure", "down"), ("probate", "down")]   # still hidden mid-tick
+    assert _status(c) == "healthy"
+
+
+def test_a_hung_redis_read_is_bounded_whatever_the_url_says(monkeypatch):
+    from src.config import settings
+
+    url = settings.REDIS_URL
+    monkeypatch.setattr(settings, "REDIS_URL", f"{url}{'&' if '?' in url else '?'}socket_timeout=60")
+    r = health._redis(timeout_s=2)
+    try:
+        kw = r.connection_pool.connection_kwargs
+        assert kw["socket_timeout"] == 2 and kw["socket_connect_timeout"] == 2
+        r.ping()
+    finally:
+        r.close()
+
+
+def test_a_type_that_failed_this_tick_keeps_its_connector_down(connector, monkeypatch):
+    """Codex P2: the recovery probe runs last, so its success used to relist a connector
+    whose other type had just failed in the same tick."""
+    c = connector(record_types=("probate", "pre_foreclosure"), status="down")
+    _portal(monkeypatch, now=lambda rt: RuntimeError("x") if rt == "probate" else ["r"], history=[])
+    _run_only(monkeypatch, [(c, "probate"), (c, "pre_foreclosure")])
+
+    health._canary_check_impl()
+
+    assert _status(c) == "down"
+
+
 def test_no_pair_is_probed_twice_in_a_tick():
     rows = [_row(i, ("probate", "divorce"), status="unknown", checked=False) for i in range(2)]
     units = health._canary_units(rows, k=100)

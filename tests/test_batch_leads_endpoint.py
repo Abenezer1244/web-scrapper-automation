@@ -682,9 +682,10 @@ class TestBatchLeadParity:
         batch, _ = parity_batch
         resp = await client.get(f"/batches/{batch.id}/download", headers=_auth(starter_token))
         header = next(csv.reader(io.StringIO(resp.text)))
-        # default_amount_type came after the batch extras, so it is last here.
-        assert header[:len(OVERLAP_LEAD_COLUMNS) - 1] == OVERLAP_LEAD_COLUMNS[:-1]
-        assert header[-1] == OVERLAP_LEAD_COLUMNS[-1] == "default_amount_type"
+        # default_amount_type and foreclosure_minimum_bid came after the batch extras,
+        # so they are last here.
+        assert header[:len(OVERLAP_LEAD_COLUMNS) - 2] == OVERLAP_LEAD_COLUMNS[:-2]
+        assert header[-2:] == OVERLAP_LEAD_COLUMNS[-2:] == ["default_amount_type", "foreclosure_minimum_bid"]
         assert set(header) == set(OVERLAP_LEAD_COLUMNS) | (set(LEAD_CSV_COLUMNS) - {"date_recorded"})
         assert len(header) == len(set(header))
 
@@ -778,3 +779,39 @@ class TestBatchLeadGroupsWithoutSource:
         assert csv_resp.status_code == 200
         rows = {r["party_name"]: r for r in csv.DictReader(io.StringIO(csv_resp.text))}
         assert set(rows) == set(leads)
+
+
+@pytest.fixture
+async def bid_only_batch(db, starter_user):
+    """A probate row with contacts represents the property; a Cowlitz bid-only tax row
+    (no balance, no year: the listing publishes only its minimum bid) stands behind it."""
+    t0 = datetime(2026, 11, 10, 12, tzinfo=UTC)
+    batch = await _batch(db, starter_user.id, "Bid only")
+    probate = await _child_at(db, starter_user.id, batch.id, "probate", t0 + timedelta(hours=2))
+    tax = await _child_at(db, starter_user.id, batch.id, "tax_delinquent", t0)
+    common = {"user_id": starter_user.id, "property_key": "pk-bid-only", "parcel_id": "WL2408005",
+              "property_address": "10 BID ST", "party_name": "BID OWNER"}
+    db.add(Result(id=str(uuid.uuid4()), job_id=probate.id, date_recorded="11/01/2026",
+                  phone="2535550199", **common))
+    db.add(Result(id=str(uuid.uuid4()), job_id=tax.id, date_recorded=None,
+                  enrichment_data={"source": "cowlitz_county_tax_foreclosure",
+                                   "foreclosure_minimum_bid": "22912.46", "bill_year": None},
+                  **common))
+    db.add(BatchRun(id=str(uuid.uuid4()), batch_id=batch.id, user_id=starter_user.id,
+                    status="done", child_job_ids=[probate.id, tax.id]))
+    await db.commit()
+    return batch
+
+
+async def test_a_bid_only_tax_row_reaches_the_csv_and_the_api_behind_another_type(
+        client, starter_token, bid_only_batch):
+    resp = await client.get(f"/batches/{bid_only_batch.id}/download", headers=_auth(starter_token))
+    assert resp.status_code == 200
+    (row,) = list(csv.DictReader(io.StringIO(resp.text)))
+    assert (row["foreclosure_minimum_bid"], row["delinquent_amount"]) == ("22912.46", "")
+    resp = await client.get(f"/batches/{bid_only_batch.id}/leads", headers=_auth(starter_token))
+    assert resp.status_code == 200
+    (lead,) = resp.json()["leads"]
+    assert lead["enrichment_data"]["foreclosure_minimum_bid"] == "22912.46"
+    assert lead["delinquent_amount"] is None
+    assert resp.json()["quality"]["with_tax_balance"] == 0      # a bid is not a balance

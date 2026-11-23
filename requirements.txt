@@ -25,13 +25,13 @@ pyotp==2.9.0                 # TOTP (MFA, H2)
 cryptography==50.0.0         # Fernet field encryption (MFA secret; H3 PII). 2026-09-02: PYSEC-2026-3552 (pkcs7_decrypt_* outcome oracle; fixed 50.0.0). 2026-06-15: GHSA-537c-gmf6-5ccf (bundled OpenSSL secadv 2026-06-09)
 
 # Task queue
-celery[redis]==5.6.3
+celery[redis]==5.7.0
 # LOAD-BEARING PIN — do not bump past 6.5. kombu (5.6.2, latest) declares
 # `redis!=4.5.5,!=5.0.2,<6.5,>=4.5.2 ; extra == "redis"`, so redis 8.x breaks the
 # broker/result backend. Re-verified against kombu's PyPI metadata 2026-07-31 after
 # dependabot proposed redis 8.0.1 (#103, closed). A matching ignore rule now lives
 # in .github/dependabot.yml so it stops being re-proposed.
-redis==5.2.1
+redis==6.4.0
 
 # Scraping
 # 1.60 bundles Chromium 148 (was 131 on 1.49). Canary-verified against a live

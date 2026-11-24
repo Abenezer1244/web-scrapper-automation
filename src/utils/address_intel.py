@@ -239,7 +239,7 @@ def _unit_ids(street: str | None) -> str | None:
     # ("F-203" == "F203").
     groups: list[list[str]] = []
     expecting_id = False
-    for tok in re.findall(r"#|[A-Z0-9_]+(?:-[A-Z0-9_]+)*", s[m.start():]):
+    for tok in re.findall(r"#|[A-Z0-9_]+(?:[-/][A-Z0-9_]+)*", s[m.start():]):
         is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
         if is_marker and not expecting_id:
             groups.append([_UNIT_KIND.get(tok, "U"), ""])
@@ -249,7 +249,11 @@ def _unit_ids(street: str | None) -> str | None:
         else:
             if not groups:
                 groups.append(["U", ""])
-            groups[-1][1] += _unit_id(tok)
+            prev = groups[-1][1]
+            # Only a lone letter glues to the number after it ("G 304" == "G304"); any
+            # other pieces stay apart ("1/2" != "12", Codex).
+            sep = "" if not prev or (len(prev) == 1 and prev.isalpha() and tok[0].isdigit()) else " "
+            groups[-1][1] = prev + sep + _unit_id(tok)
             expecting_id = False
     ids = "|".join(sorted(f"{k}:{v}" for k, v in groups if v))
     return ids or None

@@ -270,10 +270,12 @@ class TestSourceAgeCeiling:
         # A format change must not take a working source out of service.
         assert roll._source_is_too_old(bad) is False
 
-    def test_the_live_revision_is_inside_the_ceiling(self):
+    def test_a_month_old_revision_is_inside_the_ceiling(self):
         # Guards against the ceiling being set so tight it disables the source.
-        # 1787655906000 = 2026-08-25, the revision live when this was written.
-        assert roll._source_is_too_old("1787655906000") is False
+        # Relative, not a fixed stamp: a fixed one ages past the ceiling and fails
+        # every build (the 2026-08-25 stamp did on 2026-11-23).
+        month_old = str(int((time.time() - 30 * 86400) * 1000))
+        assert roll._source_is_too_old(month_old) is False
 
     def test_an_expired_index_is_not_served_by_the_revision_branch(self, tmp_path, monkeypatch):
         # The ceiling used to reject `prior` and then hand back the very same file

@@ -490,6 +490,8 @@ class TestPunctuationAndSpacing:
             ("120 SH #5, WA 98001", "120 SH #6, WA 98001"),
             ("123 C.R. #5, WA 98801", "123 C.R. #6, WA 98801"),
             ("123 S.R. #5, WA 98801", "123 S.R. #6, WA 98801"),
+            ("123 TOWNSHIP ROAD #5, WA 98801", "123 TOWNSHIP ROAD #6, WA 98801"),
+            ("123 COUNTY ROAD NO. #5, WA 98801", "123 COUNTY ROAD NO. #6, WA 98801"),
             ("120 OLD LOT 5 WY, TACOMA, WA 98402", "120 OLD LOT 6 WY, TACOMA, WA 98402"),
             ("123 COUNTY ROAD #5.5 ACCESS ALY, TACOMA, WA 98402", "123 COUNTY ROAD #5.6 ACCESS ALY, TACOMA, WA 98402"),
             ("123 N.E. MAIN ST, SEATTLE, WA 98101", "123 N E MAIN ST, SEATTLE, WA 98101"),

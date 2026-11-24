@@ -19,6 +19,36 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-24 — Absentee owner, part 2: punctuation, explicit units, and 47 Codex rounds (#679)
+
+**Built / Shipped:** #679 merged as `65319b8e`, deployed. Comparison-only (`address_match_key` untouched):
+- Pairwise punctuation match on raw streets: same letters and digits, only meaning-free breaks (dot vs space between words, dotted `S.W.`, `19 TH AVE`). House ids must match raw.
+- Owner decisions: two different explicit units are two places (`#809` vs `#712`); a unit omitted on one side is still the same place. Hyphen-vs-space in a street name never matches. The spaced house letter from #645 (`2651 B` vs `2651B`) is removed.
+- Backfill `--recompute-not-absentee` re-checks rows an older rule cleared; legacy suffixless mode removed; the all-NULL sweep is keyset-paged, guarded and uses the structured situs.
+- Production correction: 42 leads absentee -> not, 13 -> unknown, 396 not -> absentee (219 spaced house letters, the rest different explicit units, some typo noise the owner accepted). Re-run dry run afterwards: 0 changes either way.
+
+**What failed / was learned:**
+- One-sided normalization rules (joining tokens, dropping hyphens) kept merging different streets; Codex failed them three times running. Switching to a pairwise, raw-string comparison was the turn.
+- Codex reviewed 47 rounds, each finding a rarer edge case (road-number lists never end: CR, SH, FSR, NFD...). Replacing the road-word list with the owner's "different explicit units differ" rule ended that whole class.
+- Production dry runs caught three regressions tests missed: apartments on roads (`OLD REDMOND RD UNIT 321` vs `#321`, 56 leads), a comma-less situs carrying its own ZIP (`#409 98122`, 52 leads), and Codex's own `APT 5 != SPC 5` rule, rejected on evidence (`SPC 91` vs `UNIT 91`, 17 mobile homes).
+- Accepted limits: a unit whose last part equals its own ZIP (shared-parser limit); `F-203` == `F203` (intended).
+
+---
+
+## 2026-11-15 — Absentee owner said "yes" for owners living in the house (#645)
+
+**Found:** checking two Chelan test runs, both leads were flagged absentee with the mailing address equal to the property. Measured in prod: 647 delivered leads with identical normalized addresses still flagged absentee (644 King, 3 Chelan), ~3 customers.
+
+**Root causes:** (1) Chelan stores a comma-less full situs ("609 LYNN ST WENATCHEE, WA 98801"); compose_situs appended the structured city again, hiding it from `_street_absorbed_city`. (2) King unit spellings: "UNIT #27" left a dangling "UNIT" after the hash strip; bare "C22" vs "#C22"; "2651B" vs "2651 B".
+
+**Fix:** compose_situs no longer re-adds a city the street already ends with. Unit rules are comparison-only (`_compare_street`, `_same_street_modulo_unit_spelling`) so `address_match_key` (stored on NTS notices) and parcel-locate keys are untouched. Pairwise only: a bare trailing token is dropped only when the other side marks that same unit id.
+
+**Codex:** consult rejected blind trailing-token stripping ("123 E AVENUE A") and house-letter joining before "B ST"; review FAILed on "123N MAIN" vs "123 N MAIN" (directional read as a house letter) and hyphen units; both fixed, re-review PASS.
+
+**Backfill:** `scripts/backfill_owner_flags.py --recompute-absentee` writes absentee_owner only, keyset-paged, guarded on unchanged inputs. Prod dry run: 57,653 TRUE rows, 715 -> False, 84 -> None (property side has no ZIP/city to confirm).
+
+---
+
 ## 2026-11-15..17 — Douglas County: parcel-key regression, death certificates, auction leads (branch `feat/douglas-wa-seven-record-types`, local)
 
 **Built / Shipped (local commits, not pushed):**

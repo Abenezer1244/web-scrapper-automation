@@ -246,6 +246,22 @@ def test_one_unreadable_portal_page_is_retried_and_logged_without_page_text(monk
     assert status == parse_portal_status(_portal())
     assert "PortalPageUnreadableError" in caplog.text
     assert "JANE" not in caplog.text and "ELM" not in caplog.text
+    assert "markers=unavailable" in caplog.text   # the busy page's shape, for diagnosis
+
+
+def test_a_page_shape_names_the_labels_never_the_owner_or_address():
+    """A recurring unreadable page (PID 17038, 2026-11-16 and 11-24) is logged by its shape only."""
+    from src.scrapers.clallam_wa_tax_delinquent import page_shape
+
+    html = _portal()
+    status = parse_portal_status(html)
+    shape = page_shape(200, html)
+    assert "markers=as_of,due_table,total_due" in shape and "Year - Statement ID" in shape
+    changed = html.replace("<th", "<th>JANE Q DOE 12 ELM ST</th><th", 1)   # a name in a header
+    assert "JANE" not in page_shape(200, changed) and "'?'" in page_shape(200, changed)
+    for private in (status["owner"], status["mailing"], status["situs"]):
+        assert private and private not in shape
+        assert not any(len(w) > 3 and w in shape for w in private.split())
 
 
 def test_a_dropped_connection_is_retried(monkeypatch):

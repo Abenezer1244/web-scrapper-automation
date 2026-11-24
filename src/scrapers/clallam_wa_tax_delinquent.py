@@ -166,6 +166,32 @@ def _parse_tax_due(soup: BeautifulSoup) -> dict[int, Decimal]:
     return balances
 
 
+# Fixed page labels whose presence tells an error, busy or changed page from a normal one.
+_SHAPE_MARKERS = {"as_of": "Property Tax Information as of", "due_table": "Year - Statement ID",
+                  "total_due": "Total Due", "no_amount_due": _NO_AMOUNT_DUE, "pay_tax": "Pay Tax Due",
+                  "error": "error", "unavailable": "unavailable", "maintenance": "maintenance",
+                  "moved": "Object moved"}
+
+
+# The table header labels a parcel page carries (captured 2026-11-12).
+_KNOWN_HEADER_RE = re.compile(
+    r"Year - Statement ID|Year|Levy Code|Type|#|Improvement #\d{1,2}:|Statement ID|Total Due")
+
+
+def page_shape(status: int, html: str) -> str:
+    """A portal page's shape for logs: sizes, which fixed labels it carries, and its tables'
+    first header labels. Never its text: a parcel page names its owner and address."""
+    soup = BeautifulSoup(html, "html.parser")
+    text = " ".join(soup.get_text(" ").split()).lower()
+    found = ",".join(k for k, label in _SHAPE_MARKERS.items() if label.lower() in text) or "none"
+    heads = [" ".join(th.get_text(" ").split()) for t in soup.find_all("table")
+             for th in t.find_all("th")[:1]]
+    # Known labels only: a changed page could put a name in a header (Codex P2).
+    heads = list(dict.fromkeys(h if _KNOWN_HEADER_RE.fullmatch(h) else "?" for h in heads if h))[:8]
+    return (f"status={status} bytes={len(html)} text={len(text)} "
+            f"tables={len(soup.find_all('table'))} markers={found} headers={heads}")
+
+
 def parse_portal_status(html: str) -> dict:
     """One portal page -> {geo_ids, owner, mailing, situs, as_of, balances}.
 
@@ -322,6 +348,7 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
         must not fail the whole snapshot. Still raises once every attempt has failed."""
         attempts = max(1, settings.MAX_RETRIES)
         for attempt in range(1, attempts + 1):
+            page = None
             try:
                 page = safe_get(_PORTAL, require_allowlisted=True, headers=_HEADERS,
                                 params={"cid": "0", "year": str(year), "prop_id": pid},
@@ -331,9 +358,12 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
             except Exception as exc:
                 if not _retryable(exc):
                     raise
-                # Class only: exception text can carry page content (owner data).
-                _logger.warning("PID %s portal read attempt %d/%d failed: %s",
-                                pid, attempt, attempts, type(exc).__name__)
+                # Class only: exception text can carry page content (owner data). An unreadable
+                # page adds its shape, so a recurring one can be diagnosed (2026-11-24).
+                shape = (f" {page_shape(page.status_code, page.text)}"
+                         if isinstance(exc, PortalPageUnreadableError) and page is not None else "")
+                _logger.warning("PID %s portal read attempt %d/%d failed: %s%s",
+                                pid, attempt, attempts, type(exc).__name__, shape)
                 if attempt == attempts:
                     raise
                 wait = _RETRY_WAITS_S[min(attempt, len(_RETRY_WAITS_S)) - 1]

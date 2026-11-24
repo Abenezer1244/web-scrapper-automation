@@ -215,8 +215,24 @@ def _unit_ids(street: str | None) -> str | None:
     m = _UNIT_START_RE.search(s)
     if not m:
         return None
-    tokens = re.findall(r"[A-Z0-9]+", s[m.start():])
-    ids = "".join(t for t in tokens if t not in _UNIT_DESIGNATOR_WORDS)
+    # One group per marker, so "BLDG 1 UNIT 23" ("1|23") never equals "BLDG 12 UNIT 3"
+    # ("12|3"); the token right after a marker is always an id, so "UNIT FL" keeps "FL"
+    # (Codex). Ids inside a group are joined: "UNIT G 304" == "#G304".
+    groups: list[str] = []
+    expecting_id = False
+    for tok in re.findall(r"#|[A-Z0-9]+", s[m.start():]):
+        is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
+        if is_marker and not expecting_id:
+            groups.append("")
+            expecting_id = True
+        elif tok == "#":
+            continue  # "UNIT #5": the "#" belongs to the marker
+        else:
+            if not groups:
+                groups.append("")
+            groups[-1] += tok
+            expecting_id = False
+    ids = "|".join(g for g in groups if g)
     return ids or None
 
 

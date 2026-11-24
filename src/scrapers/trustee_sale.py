@@ -454,6 +454,26 @@ class BentonWATrusteeSaleScraper(_TrusteeSaleScraper):
         )
 
 
+class DouglasWATrusteeSaleScraper(_TrusteeSaleScraper):
+    """Douglas County (WA) auction leads — the sale date the recorder typed into each
+    recorded notice's free detail page (src/scrapers/sources/nts_douglas_recorder.py);
+    the recorded images themselves are sold, not read."""
+
+    COUNTY = "douglas"
+
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type != RECORD_TYPE:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
+            note="Recorded trustee-sale notices from the Douglas County Auditor's recording index.",
+        )
+
+
 class ChelanWATrusteeSaleScraper(_TrusteeSaleScraper):
     """Chelan County (WA) auction leads — recorded notices (scan-only, OCR'd), each one
     checked by an operator against its recorded image before it is a notice

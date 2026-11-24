@@ -114,6 +114,31 @@ _COVER_SHEET_PARCEL_TYPES = frozenset({"probate", "death_certificate"})
 _COVER_SHEET_BUDGET_S = 15 * 60
 
 
+def _recorded_document_url(portal_host: str | None, attach_href: str | None) -> str | None:
+    """The download URL of a recording's image, from its index attachment link, or None.
+
+    Only on the portal's own host, and only names of safe characters: the parts go
+    into a URL on that host. Benton names most attachments "2026_021430", but some
+    "Deed" (2026-021430, live 2026-11-17); those were rejected, so the document went
+    unread. Only the first attachment (".A0") is the recording: a ".A1" may be a
+    supplemental PDF whose parcel is not the recording's (Codex P2).
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    try:
+        href = urlparse(attach_href or "")
+        host = href.hostname  # a malformed authority raises here (Codex P2)
+    except ValueError:
+        return None
+    q = parse_qs(href.query)
+    name, doc_id, parent = (q.get(k, [""])[0] for k in ("docName", "id", "parent"))
+    if not portal_host or host != portal_host or not (
+            re.fullmatch(r"[A-Za-z0-9_]{1,40}", name) and re.fullmatch(r"DOC\w{1,40}\.A0", doc_id)
+            and re.fullmatch(r"DOC\w{1,40}", parent)):
+        return None
+    return f"https://{portal_host}/recorder/eagleweb/downloads/{name}.pdf?id={doc_id}&parent={parent}"
+
+
 def _pdf_page_count(data: bytes) -> int:
     from io import BytesIO
 
@@ -363,7 +388,7 @@ class EagleWebScraper(BridgeScraper):
         session, same origin as the portal) and read with the recorded-NTS parser.
         A document naming several properties is quarantined, never pinned to one.
         """
-        from urllib.parse import parse_qs, urlparse
+        from urllib.parse import urlparse
 
         from src.scrapers.sources.nts_benton_recorder import parse_recorded_nts
         from src.scrapers.sources.nts_pdf import extract_pdf_text
@@ -377,15 +402,11 @@ class EagleWebScraper(BridgeScraper):
             )
         counts = {"filled": 0, "multi_property": 0, "too_long": 0, "no_parcel": 0, "failed": 0}
         for i, record in enumerate(todo):
-            href = urlparse(record._document_href)
-            q = parse_qs(href.query)
-            name, doc_id, parent = (q.get(k, [""])[0] for k in ("docName", "id", "parent"))
-            well_formed = (re.fullmatch(r"\d{4}_\d{6}", name) and re.fullmatch(r"DOC\w+\.A0", doc_id)
-                           and re.fullmatch(r"DOC\w+", parent))
-            if href.hostname != portal_host or not well_formed:
+            url = _recorded_document_url(portal_host, record._document_href)
+            if url is None:
                 counts["failed"] += 1
                 continue
-            url = f"https://{portal_host}/recorder/eagleweb/downloads/{name}.pdf?id={doc_id}&parent={parent}"
+            name = url.rsplit("/", 1)[-1].split(".pdf")[0]
             if i:
                 await self.polite_delay()
             try:
@@ -435,7 +456,7 @@ class EagleWebScraper(BridgeScraper):
           for a shorter window (retrying the same window cannot help).
         """
         import time
-        from urllib.parse import parse_qs, urlparse
+        from urllib.parse import urlparse
 
         from src.scrapers.reliability import ScraperExecutionError, TransientScrapeError
         from src.scrapers.sources.recording_cover_sheet import CoverSheetParcel
@@ -449,21 +470,19 @@ class EagleWebScraper(BridgeScraper):
                 "per run; run a shorter date range", record_type=self.active_record_type)
         deadline = time.monotonic() + _COVER_SHEET_BUDGET_S
         for i, record in enumerate(todo):
-            href = urlparse(getattr(record, "_document_href", None) or "")
-            q = parse_qs(href.query)
-            name, doc_id, parent = (q.get(k, [""])[0] for k in ("docName", "id", "parent"))
-            if href.hostname != portal_host or not (
-                    re.fullmatch(r"\d{4}_\d{6}", name) and re.fullmatch(r"DOC\w+\.A0", doc_id)
-                    and re.fullmatch(r"DOC\w+", parent)):
+            url = _recorded_document_url(portal_host, getattr(record, "_document_href", None))
+            if url is None:
                 got = CoverSheetParcel("unreadable", evidence="no document link in the index row")
             else:
                 if time.monotonic() > deadline:
                     raise TransientScrapeError(self.county, "EagleWeb",
                                                f"cover-sheet reads ran past {_COVER_SHEET_BUDGET_S}s",
                                                record_type=self.active_record_type)
+                own = _INSTRUMENT_RE.search(record.doc_type or "")
                 got = await self._read_cover_sheet(
-                    f"https://{portal_host}/recorder/eagleweb/downloads/{name}.pdf?id={doc_id}&parent={parent}",
-                    name, getattr(record, "_index_parcel_prefix", None), delay_first=bool(i))
+                    url, url.rsplit("/", 1)[-1].split(".pdf")[0],
+                    getattr(record, "_index_parcel_prefix", None), delay_first=bool(i),
+                    instrument=own.group(1) if own else None)
             record.enrichment_data["recording_apn_lookup"] = got.outcome
             record.enrichment_data["recording_apn_evidence"] = got.evidence
             if got.outcome == "found":
@@ -475,7 +494,8 @@ class EagleWebScraper(BridgeScraper):
         _logger.info("%s: cover-sheet parcels %s", self.county,
                      {o: outcomes.count(o) for o in sorted(set(outcomes))})
 
-    async def _read_cover_sheet(self, url: str, name: str, prefix: str | None, *, delay_first: bool):
+    async def _read_cover_sheet(self, url: str, name: str, prefix: str | None, *, delay_first: bool,
+                                instrument: str | None = None):
         """One recording's cover-sheet outcome. A transit failure twice raises
         TransientScrapeError; a document that is not usable is "unreadable"."""
         from src.scrapers.reliability import TransientScrapeError
@@ -514,7 +534,7 @@ class EagleWebScraper(BridgeScraper):
             return CoverSheetParcel("unreadable", evidence=f"document unusable ({type(exc).__name__})")
         if len(text.strip()) < _RECORDED_DOCUMENT_MIN_TEXT:
             return CoverSheetParcel("unreadable", evidence="document unusable (no text layer)")
-        return read_cover_sheet_parcel(text, prefix)
+        return read_cover_sheet_parcel(text, prefix, instrument)
 
     async def _fetch_document(self, url: str) -> bytes:
         """One recorded-document PDF, fetched inside the portal page (its session)."""

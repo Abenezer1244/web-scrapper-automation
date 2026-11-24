@@ -1319,20 +1319,126 @@ def crawl_nts_benton_recorder() -> dict:
     return summary
 
 
-def _cancel_notices(db, source: str, keys: list[str]) -> int:
+@app.task(name="src.workers.nts_crawler.crawl_nts_douglas_recorder",
+          soft_time_limit=50 * 60, time_limit=55 * 60)
+def crawl_nts_douglas_recorder() -> dict:
+    """Crawl Douglas County's recorded Notices of Trustee's Sale into nts_notices.
+
+    Douglas sells its recording images, but the free detail page carries the sale in
+    the recorder's typed remarks (src/scrapers/sources/nts_douglas_recorder.py). One
+    document-type search per code over every recording that could still name an
+    upcoming sale, then each detail page. ALL OR NOTHING: a search or page that fails,
+    or a page that does not parse, writes nothing (no notice can go live while its
+    discontinuance went unread) and alerts; the next run retries. Held notices (no
+    clear sale date, several parcels, an amended notice) are never stored and alert.
+    """
+    import asyncio
+    from zoneinfo import ZoneInfo
+
+    from src.db.models import NtsNotice
+    from src.db.session import system_sync_session
+    from src.scrapers.sources import nts_douglas_recorder as rec
+    from src.scrapers.templates.acclaimweb import DouglasAcclaimWebScraper
+
+    today = datetime.now(ZoneInfo("America/Los_Angeles")).date()  # the county's sale day
+    start = today - timedelta(days=rec.WINDOW_DAYS)
+    summary = {"source": rec.SOURCE, "discovered": 0, "upserted": 0, "held": {},
+               "discontinuances": 0, "cancelled": 0}
+
+    async def _collect() -> list[dict]:
+        s = DouglasAcclaimWebScraper(_DOUGLAS_RECORDER, "douglas", "wa",
+                                     record_types=["pre_foreclosure"], record_type="pre_foreclosure")
+        async with s:
+            return await s.collect_by_doc_type(start.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"),
+                                               rec.NOTICE_CODES, rec.parse_detail)
+
+    try:
+        docs = asyncio.run(_collect())
+        parsed = []
+        for d in docs:
+            p = rec.parse_detail(d["html"])
+            # The page must be the very recording the grid listed (Codex): its code,
+            # instrument and record date, not merely a page of the same type.
+            if (p is None or p["doc_code"] != d["code"] or p["instrument"] != d["instrument"]
+                    or p["record_date"].strftime("%m/%d/%Y") != d["record_date"]):
+                raise RuntimeError(f"detail page {d['item_id']} is not the recording the grid listed")
+            parsed.append((d["code"], p, f"{_DOUGLAS_RECORDER}/details/documentdetails/{d['item_id']}/1/1/11"))
+        # Raises when a discontinuance's link cannot be read.
+        ended, inferred, unmatched = rec.discontinued([p for code, p, _ in parsed if code == "NDTS"],
+                                                      [p for code, p, _ in parsed if code != "NDTS"])
+    except Exception as exc:  # noqa: BLE001 -- reported, never a partial write
+        _alert_recorder("crawl failed, nothing written", f"{type(exc).__name__}: {str(exc)[:200]}",
+                        county="douglas")
+        return {**summary, "error": type(exc).__name__}
+
+    summary["discontinuances"] = sum(code == "NDTS" for code, _, _ in parsed)
+    held: dict[str, int] = {}
+    held_keys: list[str] = []
+    rows = []
+    for code, p, url in parsed:
+        if code == "NDTS":
+            continue
+        summary["discovered"] += 1
+        row, why = rec.notice_to_row(p, url, today, ended)
+        if row is None:
+            held[why] = held.get(why, 0) + 1
+            held_keys.append(rec.ts_key(p["instrument"]))
+            continue
+        if p["instrument"] in inferred:
+            continue  # withdrawn below: never stored while a discontinuance implies it ended
+        row["fetched_at"] = datetime.now(UTC)  # the past-sale matcher pass reads it
+        rows.append(row)
+    with system_sync_session() as db:
+        for row in rows:
+            _upsert_notice(db, NtsNotice, row)
+        if ended:
+            # Every stored notice a discontinuance in the window names; never cleared.
+            summary["cancelled"] = _cancel_notices(db, rec.SOURCE, [rec.ts_key(i) for i in sorted(ended)])
+        down = sorted({rec.ts_key(i) for i in inferred} | set(held_keys))
+        if down:
+            # Withdrawn, not cancelled for good: a notice a discontinuance only implies
+            # (same deed of trust or parcel), or one published before that no longer
+            # reads cleanly. Its row is removed (no matcher pass can attach it, past
+            # sale or not; Codex) and comes back if a later run reads it as live again.
+            summary["withdrawn"] = _cancel_notices(db, rec.SOURCE, down, permanent=False)
+        db.commit()
+        _record_crawl_heartbeat(db, rec.COUNTY)  # the whole window was read
+    summary["upserted"], summary["held"] = len(rows), held
+    summary["inferred_ends"], summary["unmatched_discontinuances"] = len(inferred), unmatched
+    if held:
+        _alert_recorder("notices held for a person", ", ".join(f"{n} {k}" for k, n in sorted(held.items())),
+                        county="douglas", topic="held")
+    if unmatched:
+        # Legitimate when the notice it ends predates the window; a person checks.
+        _alert_recorder("discontinuances matched no notice in the window",
+                        "instruments " + ", ".join(unmatched), county="douglas", topic="unmatched")
+    _logger.info("Douglas recorder NTS crawl: %s", summary)
+    return summary
+
+
+_DOUGLAS_RECORDER = "https://edocs.douglascountywa.gov/AcclaimWeb"
+
+
+def _cancel_notices(db, source: str, keys: list[str], *, permanent: bool = True) -> int:
     """The sales these notices announced are off (a recorded discontinuance, or a
     later notice that replaces them): cancelled_at set once and never cleared, inactive,
     and leads already stamped with them cleared so the matcher can attach a live notice
-    (Codex P1). Exclusive against the matcher/finalizer's shared NTS_CANCEL_LOCK_KEY
+    (Codex P1). ``permanent=False`` WITHDRAWS them instead (stamps cleared, rows deleted,
+    no cancelled_at), for a notice that cannot be published with confidence today; the
+    crawl re-creates it if it later reads as live. A deleted row cannot be re-attached
+    by either matcher pass, which an inactive one could once its sale date passed
+    (Codex). Exclusive against the matcher/finalizer's shared NTS_CANCEL_LOCK_KEY
     (re-entrant within one transaction). Returns the notices changed. Caller commits."""
     from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
 
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
-    res = db.execute(
-        _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
-                 "WHERE source = :source AND ts_number = ANY(:keys)"),
-        {"source": source, "keys": keys},
-    )
+    res = None
+    if permanent:
+        res = db.execute(
+            _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
+                     "WHERE source = :source AND ts_number = ANY(:keys)"),
+            {"source": source, "keys": keys},
+        )
     # A later statement, so its snapshot sees an attachment that committed while we waited.
     db.execute(
         _sa_text("""
@@ -1346,6 +1452,13 @@ def _cancel_notices(db, source: str, keys: list[str]) -> int:
         """),
         {"source": source, "keys": keys},
     )
+    if not permanent:
+        # Never a cancelled row: a recorded discontinuance's cancellation stays on record.
+        res = db.execute(
+            _sa_text("DELETE FROM nts_notices WHERE source = :source AND ts_number = ANY(:keys) "
+                     "AND cancelled_at IS NULL"),
+            {"source": source, "keys": keys},
+        )
     return res.rowcount or 0
 
 
@@ -1484,7 +1597,9 @@ def stage_recorder_document(db, *, county: str, state: str, doc: dict, detail_ht
                       decision_note=str(out["reason"])[:500],
                       fields={"recording_apns": apns, "related_deeds_of_trust": dts})
 
-    stmt = pg_insert(Doc).values(id=str(uuid4()), **values)
+    # entry_name only on a new row: never in the update below, so a retry from a stored
+    # failure (no entry) cannot erase it (Codex).
+    stmt = pg_insert(Doc).values(id=str(uuid4()), entry_name=doc.get("entry"), **values)
     retryable = and_(Doc.status == "failed",
                      Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
     stmt = stmt.on_conflict_do_update(
@@ -1575,17 +1690,109 @@ def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
     said 170 Hill Street; the assessor and the parcel layer give 62 Village Vista Ln for
     the same legal description). Network: call it OUTSIDE any transaction holding
     NTS_CANCEL_LOCK_KEY, and freeze what it returns (Codex): a lookup per scrape would let
-    a layer outage flip the address, and with it the lead's dedup hash, between runs."""
-    from src.scrapers.enrichment.county_gis import enrich_parcel_gis
+    a layer outage flip the address, and with it the lead's dedup hash, between runs.
 
-    found = enrich_parcel_gis(parcel, county, state).get("property_address")
+    The BATCH lookup pre-foreclosure enrichment runs, not the single one: the two differ
+    (the single one falls back to the statewide layer for a parcel the county matched
+    with no street, and for a 5-character Cowlitz parcel), and a different address for
+    the same parcel is a different lead identity, so a second charge (Codex, Cowlitz)."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    if not cg.settings.GIS_ENRICHMENT_ENABLED:
+        return None
+    found = (cg.batch_enrich_parcels_gis([parcel], county, state, mailing=False).get(parcel) or {}).get("property_address")
     return " ".join((found or "").split())[:512] or None
+
+
+_MORE_PARCELS_RE = re.compile(
+    r"\b(?:ADDITIONAL|SEE|ATTACHED|EXHIBIT|SCHEDULE|CONT(?:INUED)?|PAGE|PG|ETC|OTHERS?|MORE|REMAINING)\b", re.I
+)
+_APN_LIST_WORD = re.compile(r"(?:NO|NOS|AND|APNS?)\.?", re.I)
+_CHELAN_APN_RE = re.compile(r"\d{12}")
+
+
+
+def _doc_legal_lines(html_text: str) -> list[str] | None:
+    """The text lines of a recording detail page's DocLegal value, or None when the page
+    has no such block."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    label = next((d for d in soup.find_all("div", class_="detailLabel")
+                  if " ".join(d.get_text().split()).rstrip(":").upper() == "DOCLEGAL"), None)
+    value = label.find_next_sibling("div", class_="listDocDetails") if label else None
+    if value is None:
+        return None
+    # Every text line in the block, inside a <span> or not (Codex): a line outside a
+    # span would otherwise go unchecked.
+    for hidden in value.find_all(class_="expandDown"):
+        hidden.decompose()
+    # Lines are the page's own <br> breaks, not text nodes: a number split across
+    # inline tags reads as the one number it renders as (Codex).
+    for br in value.find_all("br"):
+        br.replace_with("\n")
+    return [" ".join(x.split()) for x in value.get_text("").split("\n") if x.strip()]
+
+
+def chelan_live_recording_apns(transaction_item_id: str) -> list[str] | None:
+    """The APNs the recording's detail page lists NOW, or None when the page cannot be
+    read. Chelan indexes a recording's APN some time after recording it: 2629393 was
+    crawled the day after it was recorded with no APN on its page, and the page has
+    listed APN 252104732030 since. Network: call it OUTSIDE any transaction holding
+    NTS_CANCEL_LOCK_KEY."""
+    from src.scrapers.templates.acclaimweb import parse_detail_apns
+
+    try:
+        html_text = _bounded_fetch(
+            f"{_CHELAN_RECORDER}/details/documentdetails/{transaction_item_id}/1/1/11",
+            _DETAIL_MAX_BYTES, _DETAIL_FETCH_S, {"User-Agent": _PDF_BROWSER_UA},
+        ).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 -- unreadable: nothing is re-read
+        _logger.warning("Chelan detail page %s unreadable for the APN re-read", transaction_item_id)
+        return None
+    apns = parse_detail_apns(html_text)
+    if apns is None:
+        return None
+    lines = _doc_legal_lines(html_text)
+    if lines is None:  # no DocLegal block to check against
+        return apns if not apns else None
+    # Trusted only when it is the whole, clean answer, judged without guessing where an
+    # APN sits on the page (Codex found a new layout for every heuristic): in the
+    # DocLegal block every number of 3+ digits (dash-joined) must be a whole 12-digit
+    # Chelan APN, and every APN label must be followed by one. A split APN always
+    # leaves such a piece, so it can never yield a shorter list. The cost: a legal that
+    # also carries plat or volume numbers ("SP 2019-008") is unknown here, which only
+    # matters when the crawl stored no APN and an operator then rejects or waits.
+    block = re.sub(r"(?<=\d)-\s*(?=\d)", "", " ".join(lines))
+    # Chelan's recording guide lets the first page list the parcels that fit and refer
+    # elsewhere for the rest (Codex): a pointer to more parcels makes the list unknown.
+    if _MORE_PARCELS_RE.search(block):
+        return None
+    found: list[str] = []
+    for number in re.findall(r"\d+", block):
+        if _CHELAN_APN_RE.fullmatch(number):
+            found.append(number)
+        elif len(number) >= 3:
+            return None
+    # Numbers side by side (only spaces or punctuation between) must all be whole APNs:
+    # an APN in short pieces ("25 21 04 73 20 30") is never read as fewer APNs. A lone
+    # short number after a word ("LOT 2", "SEC 12") is the legal description.
+    for run in re.finditer(r"\d+(?:[^\w]+\d+)+", block):
+        if any(not _CHELAN_APN_RE.fullmatch(g) for g in re.findall(r"\d+", run.group(0))):
+            return None
+    for label in re.finditer(r"\bAPNS?\b", block, re.I):
+        after = re.sub(r"[&/+,;:#()]", " ", block[label.end():]).split()
+        first = next((t for t in after if not _APN_LIST_WORD.fullmatch(t)), "")
+        if not _CHELAN_APN_RE.fullmatch(first):
+            return None  # a label whose APN is not the next thing on the page
+    return apns if list(dict.fromkeys(found)) == apns else None
 
 
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
                               supersedes: str | None = None, independent: bool = False,
                               discontinued_by: str | None = None, not_discontinued: bool = False,
-                              situs: str | None = None, today=None) -> str:
+                              situs: str | None = None, live_apns: list[str] | None = None,
+                              today=None) -> str:
     """The operator has compared the staged read with the recorded image: write the
     notice they confirmed. Returns the nts_notices id. Caller commits.
 
@@ -1610,6 +1817,11 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     resolved by the caller before this takes the lock. When given it becomes the
     notice's property_address (address_source 'assessor_situs') and the printed address
     is kept as address_on_notice; without it the printed address stands ('notice').
+
+    ``live_apns`` is what the recording's detail page lists now
+    (:func:`chelan_live_recording_apns`, read by the caller before the lock). It is used
+    only when the crawl stored NO APN (an empty list, never an unknown one): the county
+    had not indexed it yet. The parcel must then be one of those, and they are stored.
     """
     import hashlib
     from decimal import Decimal
@@ -1625,6 +1837,8 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         raise ReviewError("--supersedes and --independent contradict each other")
     db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
     doc = _recorder_doc_for_review(db, doc_id)
+    if live_apns is not None and (doc.county, doc.state) != ("chelan", "WA"):
+        raise ReviewError("a re-read of the recording's APNs is for Chelan recordings only")
     prof = _profile(doc.county, doc.state)
     if doc.doc_code not in prof["nts_codes"]:
         raise ReviewError("this is a discontinuance, not a notice: use resolve-nod")
@@ -1633,7 +1847,11 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     today = today or datetime.now(UTC).date()
 
     parcel = (values.get("parcel") or "").strip()
-    if parcel not in (_recording_facts(doc)["recording_apns"] or []):
+    recording_apns = _recording_facts(doc)["recording_apns"]
+    reread = recording_apns == [] and bool(live_apns)
+    if reread:
+        recording_apns = list(dict.fromkeys(live_apns))
+    if parcel not in (recording_apns or []):
         raise ReviewError("the parcel is not one of this recording's own APNs")
     auction = values.get("auction_date")
     if auction is None:
@@ -1747,8 +1965,12 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     notes = [f"supersedes {supersedes}" if supersedes
              else "independent of other notices on its deed of trust" if independent else None,
              f"discontinued by {ending.instrument_number}" if ending is not None else None,
-             "not discontinued by the loan's discontinuance(s) on file" if not_discontinued else None]
+             "not discontinued by the loan's discontinuance(s) on file" if not_discontinued else None,
+             "APNs re-read from the recorder page at approval" if reread else None]
     doc.decision_note = "; ".join(n for n in notes if n) or None
+    if reread:
+        doc.fields = {**(doc.fields or {}), "recording_apns": recording_apns}
+        doc.recording_apn = recording_apns[0] if len(recording_apns) == 1 else None
     doc.fields = {**_recording_facts(doc), "approved": approved}  # no grantor, no OCR text
     return str(notice_id)
 
@@ -1930,7 +2152,9 @@ def stage_discontinuance(db, *, county: str, state: str, doc: dict, detail_html:
             values.update(status="discontinuance", fields=fields,
                           decision_note="matches no approved notice yet (kept for later approvals)")
 
-    stmt = pg_insert(Doc).values(id=str(uuid4()), **values)
+    # entry_name only on a new row: never in the update below, so a retry from a stored
+    # failure (no entry) cannot erase it (Codex).
+    stmt = pg_insert(Doc).values(id=str(uuid4()), entry_name=doc.get("entry"), **values)
     retryable = and_(Doc.status == "failed", Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
     stmt = stmt.on_conflict_do_update(
         constraint="uq_nts_recorder_documents_county_item",
@@ -2212,6 +2436,61 @@ _COWLITZ_DOC_RESERVE_S = 60 + 120 + 180 + 5 + _COWLITZ_STAGE_RESERVE_S
 _COWLITZ_PACE_S = 3.0
 
 
+def relocate_recorder_entries(db, county: str, state: str, docs: list[dict]) -> int:
+    """Move staged rows to the recorder's current ids before anything is filtered or
+    staged, for a recorder whose ids are not stable (Cowlitz re-indexed 2026-11-17 and
+    every recording was staged twice). Returns the rows changed. Caller commits.
+
+    A row is found by its entry name; a row without one yet (staged before migration
+    170) is claimed by the id it still has, and given the name. Either way the row must
+    be the same recording (instrument, code, date), or this raises: the run fails loud
+    rather than bind one recording's decisions to another. Plain updates of the id and
+    the name only: status, fields and decisions are untouched, so no staging or
+    cancellation path runs again (Codex). An approved notice's published link moves
+    with it. Takes approval's lock first, so the two never lock rows in opposite orders
+    and an approval never publishes an id this is moving (Codex)."""
+    from sqlalchemy import select, update
+
+    from src.db.models import NtsNotice
+    from src.db.models import NtsRecorderDocument as Doc
+    from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
+
+    db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
+    prof = _profile(county, state)
+    now = datetime.now(UTC)
+    changed = 0
+    for d in docs:
+        entry, item = d.get("entry"), d.get("item_id")
+        if not entry or not item:
+            continue
+        row = db.execute(select(Doc).where(Doc.county == county, Doc.entry_name == entry)
+                         .with_for_update()).scalar_one_or_none()
+        holder = db.execute(select(Doc).where(Doc.county == county, Doc.transaction_item_id == item)
+                            .with_for_update()).scalar_one_or_none()
+        if row is None:
+            if holder is None or holder.entry_name == entry:
+                continue                      # a new recording: staged as usual
+            if holder.entry_name is not None:
+                raise ValueError(f"{county} id {item} is held by entry {holder.entry_name}, not {entry}")
+            row = holder
+        elif holder is not None and holder.id != row.id:
+            raise ValueError(f"{county} entry {entry}: id {item} is held by another row")
+        same = (row.instrument_number, row.doc_code, row.record_date.strftime("%m/%d/%Y")) == (
+            d["instrument"], d["doc_code"], d["record_date"])
+        if not same:
+            raise ValueError(f"{county} entry {entry} (id {item}) is not the staged recording "
+                             f"{row.instrument_number} {row.doc_code}")
+        if row.entry_name != entry or row.transaction_item_id != item:
+            if row.transaction_item_id != item and row.nts_notice_id is not None:
+                # The notice THIS row was approved into: by its link, never by instrument,
+                # which a second entry under the same recording shares (Codex).
+                db.execute(update(NtsNotice).where(NtsNotice.id == row.nts_notice_id)
+                           .values(source_url=prof["url"](item)))
+            row.entry_name, row.transaction_item_id, row.updated_at = entry, item, now
+            changed += 1
+    return changed
+
+
 def _cowlitz_doc_url(item_id: str) -> str:
     return _RECORDER_PROFILES[("cowlitz", "WA")]["url"](item_id)
 
@@ -2258,21 +2537,6 @@ def crawl_nts_cowlitz_recorder() -> dict:
         with system_sync_session() as db:
             summary["expired"] = purge_stale_recorder_documents(db)
             db.commit()
-            retry = and_(Doc.status == "failed",
-                         Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
-            settled = {r[0] for r in db.execute(
-                select(Doc.transaction_item_id).where(Doc.county == "cowlitz", ~retry))}
-            # A failed notice is retried even once it is outside the window, from what
-            # staging kept of its recording (its parcels and related numbers).
-            stored_failures = [
-                {"item_id": r.transaction_item_id, "instrument": r.instrument_number,
-                 "doc_code": r.doc_code, "record_date": r.record_date.strftime("%m/%d/%Y"),
-                 "recording_apns": (r.fields or {}).get("recording_apns") or [],
-                 "related": (r.fields or {}).get("related_deeds_of_trust") or [],
-                 "href": _cowlitz_doc_url(r.transaction_item_id)}
-                for r in db.execute(select(Doc).where(Doc.county == "cowlitz", retry,
-                                                      Doc.doc_code != "NOD")
-                                    .order_by(Doc.updated_at)).scalars()]
             last_read = (get_source_state(db, nts_crawl_heartbeat_key("cowlitz")) or {}).get("last_success_at")
 
         today = datetime.now(UTC).date()
@@ -2282,6 +2546,38 @@ def crawl_nts_cowlitz_recorder() -> dict:
         # Past the reach limit the gap is not read at all: never call the cache fresh,
         # and say so every run until an operator backfills it (Codex 3b r2 P1).
         gap = recorder_gap_beyond_reach(today, last_read)
+
+        def _relocate_and_snapshot(docs: list[dict]) -> tuple[set[str], list[dict]]:
+            """Rows moved to the live ids (committed), then what is settled and what is
+            to retry, read AFTER the move (Codex): before it, a re-index would make
+            every recording look new and every stored failure point at a dead id."""
+            with system_sync_session() as db:
+                try:
+                    moved = relocate_recorder_entries(db, "cowlitz", "WA", docs)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                if moved:
+                    _logger.info("Cowlitz NTS: %d staged recording(s) moved to the recorder's current ids", moved)
+                retry = and_(Doc.status == "failed",
+                             Doc.decision_note.is_distinct_from(RECORDER_EXPIRED_NOTE))
+                settled = {r[0] for r in db.execute(
+                    select(Doc.transaction_item_id).where(Doc.county == "cowlitz", ~retry))}
+                # A failed notice is retried even once it is outside the window, from what
+                # staging kept of its recording (its parcels and related numbers). One out
+                # of the window after a re-index keeps a dead id and fails loudly.
+                stored = [
+                    {"item_id": r.transaction_item_id, "entry": r.entry_name,
+                     "instrument": r.instrument_number,
+                     "doc_code": r.doc_code, "record_date": r.record_date.strftime("%m/%d/%Y"),
+                     "recording_apns": (r.fields or {}).get("recording_apns") or [],
+                     "related": (r.fields or {}).get("related_deeds_of_trust") or [],
+                     "href": _cowlitz_doc_url(r.transaction_item_id)}
+                    for r in db.execute(select(Doc).where(Doc.county == "cowlitz", retry,
+                                                          Doc.doc_code != "NOD")
+                                        .order_by(Doc.updated_at)).scalars()]
+                return settled, stored
 
         def _stage_one(doc: dict, pdf: bytes | None) -> str:
             """OCR and stage one recording right after it is read (sync, in a thread)."""
@@ -2315,6 +2611,7 @@ def crawl_nts_cowlitz_recorder() -> dict:
                 valid = [d for d in docs if _ITEM_ID_RE.fullmatch(d.get("item_id") or "")]
                 summary["discovered"] = len(docs)
                 summary["invalid"] = len(docs) - len(valid)
+                settled, stored_failures = await asyncio.to_thread(_relocate_and_snapshot, valid)
                 fresh = [d for d in valid if d["item_id"] not in settled]
                 summary["kept"] = len(valid) - len(fresh)
                 retries = [d for d in stored_failures if _ITEM_ID_RE.fullmatch(d["item_id"])]
@@ -2396,14 +2693,18 @@ def _bounded_fetch(url: str, max_bytes: int, wall_s: float, headers: dict) -> by
             pass
 
 
-def _alert_recorder(what: str, detail: str, county: str = "chelan") -> None:
+def _alert_recorder(what: str, detail: str, county: str = "chelan", topic: str = "") -> None:
+    """``topic`` gives a recurring, informational alert its own cooldown bucket, so it can
+    never hold back a run-failure alert for the same county."""
     from src.workers.ops_alerts import send_ops_alert
 
     name = county.title()
     send_ops_alert(
-        kind="nts_recorder", key=f"nts_recorder:{county}",
+        kind="nts_recorder", key=f"nts_recorder:{county}" + (f":{topic}" if topic else ""),
         subject=f"{name} NTS recorder crawl: {what}",
         body=(f"The {name} County NTS recorder crawl: {what} ({detail}).\n\n"
-              "Staged notices await operator review; nothing reaches customers from here. "
-              "Check the crawler logs and nts_recorder_documents."),
+              + ("Douglas notices are written to nts_notices automatically from the recorder's typed "
+                 "remarks; check the crawler logs." if county == "douglas" else
+                 "Staged notices await operator review; nothing reaches customers from here. "
+                 "Check the crawler logs and nts_recorder_documents.")),
     )

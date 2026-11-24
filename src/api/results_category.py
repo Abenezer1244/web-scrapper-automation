@@ -32,6 +32,7 @@ from src.api.lead_actionability import (
     already_delivered_condition,
     already_delivered_sql,
     has_address_condition,
+    no_address_held_condition,
     not_privacy_suppressed_condition,
     shown_condition,
 )
@@ -50,10 +51,10 @@ ResultsListCategory = Literal["new", "already_delivered", "no_address", "not_qua
 
 
 def no_address_condition():
-    """Exactly the run breakdown's first branch (``NOT address_actionable_sql``):
-    every row of the job with neither address, whatever else is true of it. No
-    duplicate or superseded exclusion, because the breakdown applies none either."""
-    return not_(has_address_condition())
+    """Exactly the run breakdown's no_address branch: every row of the job with neither
+    address, or held because it had none when the run delivered, whatever else is true
+    of it. No duplicate or superseded exclusion, because the breakdown applies none either."""
+    return or_(not_(has_address_condition()), no_address_held_condition())
 
 
 # already_delivered_condition / already_delivered_sql live in lead_actionability

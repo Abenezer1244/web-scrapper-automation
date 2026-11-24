@@ -177,11 +177,23 @@ _UNIT_DESIGNATOR_RE = re.compile(
 )
 # A number right after a road word is the road's number, not a unit: "COUNTY ROAD #5",
 # "HWY NO 9", "SR #20" (Codex). Kept even when it ends the street.
-_ROAD_WORD_RE = re.compile(r"\b(?:ROAD|RD|HWY|HIGHWAY|ROUTE|RTE|SR)\.?,?\s*$", re.IGNORECASE)  # "RD. #5"
+_ROAD_WORD_RE = re.compile(
+    r"\b(?:ROAD|RD|HWY|HIGHWAY|ROUTE|RTE|SR|CR|CO\s+RD|FM|US|STATE\s+RTE)\.?,?\s*$",
+    re.IGNORECASE,
+)  # "RD. #5", "CR #5" (Codex)
 _UNIT_DESIGNATOR_WORDS = frozenset(
     _UNIT_WORDS.split("|") + ["NO", "BOX", "FL", "FLR", "FLOOR", "DEPT", "TRLR", "TRAILER", "BLD"])
+# Common USPS street-type abbreviations (Publication 28, C1) beyond _SUFFIX, so a short
+# type such as "WY" is never read as a unit id ("OLD LOT 5 WY", Codex).
+_USPS_TYPES = frozenset(
+    "ALY ANX ARC AV AVE AVN BCH BLF BLV BLVD BND BR BRG BTM BV BYP CIR CMN COR CP CPE CR CRK "
+    "CRT CRES CSWY CT CTR CV CYN DL DM DR DV EST EXPY EXT FLS FRD FRK FRST FRY FT FWY GDN GLN "
+    "GRN GRV GTWY HBR HL HLS HOLW HTS HVN HW HWY INLT IS JCT KNL KY LCK LDG LK LN LNDG LOOP MDW "
+    "ML MNR MT MTN NCK OPAS ORCH OVAL PARK PASS PATH PIKE PK PKWY PL PLN PLZ PNE PR PRT PT PY "
+    "RADL RD RDG RIV RNCH ROW RPD RST RTE RUN SHR SMT SPG SQ ST STA STRA TER TPKE TR TRAK TRCE "
+    "TRL TUNL UN VIA VIS VL VLG VLY VW WALK WAY WL WY XING".split())
 _STREET_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values()) | frozenset(_DIRECTIONAL) \
-    | frozenset(_DIRECTIONAL.values())
+    | frozenset(_DIRECTIONAL.values()) | _USPS_TYPES
 
 
 def _unit_like(token: str) -> bool:

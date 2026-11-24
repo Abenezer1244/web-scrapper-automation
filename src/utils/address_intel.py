@@ -177,7 +177,7 @@ _UNIT_DESIGNATOR_RE = re.compile(
 )
 # A number right after a road word is the road's number, not a unit: "COUNTY ROAD #5",
 # "HWY NO 9", "SR #20" (Codex). Kept even when it ends the street.
-_ROAD_WORD_RE = re.compile(r"\b(?:ROAD|RD|HWY|HIGHWAY|ROUTE|RTE|SR)\s*$", re.IGNORECASE)
+_ROAD_WORD_RE = re.compile(r"\b(?:ROAD|RD|HWY|HIGHWAY|ROUTE|RTE|SR)\.?,?\s*$", re.IGNORECASE)  # "RD. #5"
 _UNIT_DESIGNATOR_WORDS = frozenset(
     _UNIT_WORDS.split("|") + ["NO", "BOX", "FL", "FLR", "FLOOR", "DEPT", "TRLR", "TRAILER", "BLD"])
 _STREET_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values()) | frozenset(_DIRECTIONAL) \

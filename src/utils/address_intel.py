@@ -180,8 +180,9 @@ _UNIT_DESIGNATOR_RE = re.compile(
 # street. A plain "... RD" is not one: "7431 OLD REDMOND RD #321" is an apartment
 # (56 such owner-occupied King leads, 2026-11-24), and so is anything marked UNIT/APT.
 _ROAD_WORD_RE = re.compile(
-    r"\b(?:(?:COUNTY|CO|STATE|ST|FOREST|FARM|TOWNSHIP|TWP)\s+(?:ROAD|RD|ROUTE|RTE|HWY|HIGHWAY)"
-    r"|HWY|HIGHWAY|ROUTE|RTE|SR|SH|CR|FM|US)\.?,?(?:\s+NO\.?)?\s*$",  # "COUNTY ROAD NO. #5"
+    r"\b(?:(?:COUNTY|CO|STATE|ST|FOREST(?:\s+SERVICE)?|FARM|TOWNSHIP|TWP|FS)\s+"
+    r"(?:ROAD|RD|ROUTE|RTE|HWY|HIGHWAY)"
+    r"|HWY|HIGHWAY|ROUTE|RTE|SR|SH|CR|FM|US|FSR)\.?,?(?:\s+NO\.?)?\s*$",  # "COUNTY ROAD NO. #5"
     re.IGNORECASE,
 )  # "RD. #5", "CR #5" (Codex)
 _UNIT_DESIGNATOR_WORDS = frozenset(

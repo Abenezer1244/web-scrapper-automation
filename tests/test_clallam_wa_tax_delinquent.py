@@ -257,6 +257,8 @@ def test_a_page_shape_names_the_labels_never_the_owner_or_address():
     status = parse_portal_status(html)
     shape = page_shape(200, html)
     assert "markers=as_of,due_table,total_due" in shape and "Year - Statement ID" in shape
+    changed = html.replace("<th", "<th>JANE Q DOE 12 ELM ST</th><th", 1)   # a name in a header
+    assert "JANE" not in page_shape(200, changed) and "'?'" in page_shape(200, changed)
     for private in (status["owner"], status["mailing"], status["situs"]):
         assert private and private not in shape
         assert not any(len(w) > 3 and w in shape for w in private.split())

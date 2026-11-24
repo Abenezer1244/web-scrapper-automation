@@ -173,6 +173,11 @@ _SHAPE_MARKERS = {"as_of": "Property Tax Information as of", "due_table": "Year 
                   "moved": "Object moved"}
 
 
+# The table header labels a parcel page carries (captured 2026-11-12).
+_KNOWN_HEADER_RE = re.compile(
+    r"Year - Statement ID|Year|Levy Code|Type|#|Improvement #\d{1,2}:|Statement ID|Total Due")
+
+
 def page_shape(status: int, html: str) -> str:
     """A portal page's shape for logs: sizes, which fixed labels it carries, and its tables'
     first header labels. Never its text: a parcel page names its owner and address."""
@@ -181,8 +186,8 @@ def page_shape(status: int, html: str) -> str:
     found = ",".join(k for k, label in _SHAPE_MARKERS.items() if label.lower() in text) or "none"
     heads = [" ".join(th.get_text(" ").split()) for t in soup.find_all("table")
              for th in t.find_all("th")[:1]]
-    # Only short labels that recur on every parcel page; a header is never owner data, but cap it.
-    heads = list(dict.fromkeys(h[:30] for h in heads if h))[:8]
+    # Known labels only: a changed page could put a name in a header (Codex P2).
+    heads = list(dict.fromkeys(h if _KNOWN_HEADER_RE.fullmatch(h) else "?" for h in heads if h))[:8]
     return (f"status={status} bytes={len(html)} text={len(text)} "
             f"tables={len(soup.find_all('table'))} markers={found} headers={heads}")
 

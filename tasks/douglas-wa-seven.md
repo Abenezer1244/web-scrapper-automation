@@ -254,8 +254,13 @@ Codex consult folded in (4 High, 2 Medium). Connector stays INACTIVE until the P
     volume the empty draft is deleted by path after the handle closes (Low race).
 - [ ] **Phase B (revised 2026-11-24 after Codex consult: 4 High, 4 Medium).** "Current copy" is a durable
   per-county observation, not a timestamp sort. Split:
-  - [ ] **B1 — observation store** (folded into migration 173 / PR #680 while unmerged; models, tax_summons.py,
-    review CLI, tests):
+  - [x] **B1 — observation store** (folded into migration 173 / PR #680 while unmerged; models, tax_summons.py,
+    review CLI, tests). Built 2026-11-24 (39140c90), 182 tests, live `fetch` smoke verified the real 4.9 MB
+    summons. Codex B1 reviews 1-3 fixed: publish during a hold, supersede by an earlier publication, fetch URL,
+    token replay, clocks, two-transition observation guard, year watermark, insert guard. **Open (High,
+    bypass-only, owner decision):** anyone with the worker's DB credentials (bridgeleads_system) can act as the
+    watcher and clear a hold; Codex's fix is a dedicated watcher DB role + SECURITY DEFINER functions +
+    provisioner changes. Original design notes:
     `tax_summons_observations` (one row per county: current_version_id, status ok|link_missing|page_failed|
     download_failed|ambiguous|rollback, checked_at/confirmed_at by the DB clock, link_url, link_year,
     max_link_year, claim_token + claim_expires_at). `claim_watch` (lease; a second watcher skips) before any

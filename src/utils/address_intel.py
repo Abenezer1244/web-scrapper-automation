@@ -224,11 +224,14 @@ def _unit_id(token: str) -> str:
     return re.sub(r"(?<=[A-Z])-(?=\d)|(?<=\d)-(?=[A-Z])", "", t)
 
 
-def _unit_ids(street: str | None) -> str | None:
-    """Every id in the unit tail, joined: "BLDG 1 UNIT 5" -> "15", "UNIT 5." -> "5",
-    "#G304" and "UNIT G 304" -> "G304". Designator words, "#" and punctuation are dropped,
-    so only the ids are compared (Codex). None when the street names no unit. A unit word
-    inside a street name ("OLD LOT 5 ACCESS ALY") is glued first and never starts a tail.
+def _unit_ids(street: str | None, zip_in_street: bool = False) -> str | None:
+    """The unit tail as comparable ids: "BLDG 1 UNIT 23" -> "B:1|U:23", "#G304" and
+    "UNIT G 304" -> "U:G304". None when the street names no unit. A unit word inside a
+    street name ("OLD LOT 5 ACCESS ALY") is glued first and never starts a tail.
+
+    zip_in_street: the parser found no ZIP on this address, so a trailing state / ZIP
+    still sits in the street and is trimmed. Otherwise a 5-digit chunk is a unit id
+    ("UNIT A 12345", Codex).
     """
     s = _glue_named_units(_keep_meaningful_dots(street or "")).upper()
     s = _UNIT_LETTER_DIGIT_DOT_RE.sub("\u00b7", s)
@@ -252,7 +255,7 @@ def _unit_ids(street: str | None) -> str | None:
     # A street parsed without commas still carries its state / ZIP ("#26 98032"): those
     # are not unit ids (2026-11-24 dry run: "4120 S 225TH PL #26 98032" vs "#26, KENT").
     # Never the id right after a marker ("# 98032" stays a unit).
-    while (len(chunks) > 1 and not _UNIT_START_RE.fullmatch(chunks[-2])
+    while (zip_in_street and len(chunks) > 1 and not _UNIT_START_RE.fullmatch(chunks[-2])
            and re.fullmatch(r"\d{5}(?:[-_]\d{4})?|WA", chunks[-1].rstrip("._"))):
         chunks.pop()
     if chunks:
@@ -538,7 +541,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     # ...unless the explicit units differ in a way that normalizing erased ("UNIT A.1"
     # vs "UNIT A 1", Codex). Read from the parsed street, never the whole line.
     if (_normalize_full(property_address) == _normalize_full(mailing_address)
-            and _unit_ids(p["street"]) == _unit_ids(m["street"])):
+            and _unit_ids(p["street"], not p["zip"]) == _unit_ids(m["street"], not m["zip"])):
         return False
     p_street = _compare_street(p["street"])
     m_street = _compare_street(m["street"])
@@ -559,7 +562,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     # Both sides name a unit / "#" number and they differ: two places, whatever the street
     # type ("UNIT 5" vs "UNIT 6", "COUNTY ROAD #5" vs "#6", Codex). Only a unit OMITTED on
     # one side is the product rule's same place (county situs drops the unit).
-    p_unit, m_unit = _unit_ids(p["street"]), _unit_ids(m["street"])
+    p_unit, m_unit = _unit_ids(p["street"], not p["zip"]), _unit_ids(m["street"], not m["zip"])
     if p_unit and m_unit and p_unit != m_unit:
         return True
 

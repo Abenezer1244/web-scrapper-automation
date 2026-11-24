@@ -590,3 +590,9 @@ class TestPunctuationAndSpacing:
                      ("20102 67TH AVE NE SPC 9, ARLINGTON, WA 98223", "20102 67TH AVE NE #9, ARLINGTON, WA 98223"),
                      ("4420 S 200TH ST, KENT, WA 98032", "4420 S.200TH ST., KENT, WA 98032")):
             assert compute_owner_flags(a, b)["absentee_owner"] is False, a
+
+    def test_own_zip_after_a_comma_less_unit_is_trimmed(self):
+        # 2026-11-24 dry run: structured ZIP beside a comma-less situs line.
+        f = compute_owner_flags("1420 E PINE ST #409 98122", "1420 E PINE ST #409, SEATTLE, WA 98122",
+                                property_state="WA", property_zip="98122")
+        assert f["absentee_owner"] is False

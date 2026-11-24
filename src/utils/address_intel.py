@@ -205,7 +205,19 @@ _UNIT_START_RE = re.compile(
     rf"#|\b(?:{_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b", re.IGNORECASE)
 
 
-_UNIT_KIND = {"BLDG": "B", "BLD": "B", "FL": "F", "FLR": "F", "FLOOR": "F", "DEPT": "D", "BOX": "X"}
+# The kind of each marker, so "LOT 1 UNIT 2" != "LOT 2 UNIT 1" (Codex). Spellings of the
+# same kind share a letter ("APT 5" == "UNIT 5" == "#5").
+_UNIT_KIND = {"BLDG": "B", "BLD": "B", "FL": "F", "FLR": "F", "FLOOR": "F", "DEPT": "D",
+              "BOX": "X", "LOT": "L", "SPC": "S", "SPACE": "S", "RM": "R", "ROOM": "R",
+              "TRLR": "T", "TRAILER": "T"}
+
+
+def _unit_id(token: str) -> str:
+    """One unit id, comparable: a hyphen between a letter and a digit is spelling
+    ("F-203" == "F203"); one between digits, and a decimal point, are not ("1-23",
+    "1.23" kept apart from "123", Codex)."""
+    t = token.upper().replace(".", "_")
+    return re.sub(r"(?<=[A-Z])-(?=\d)|(?<=\d)-(?=[A-Z])", "", t)
 
 
 def _unit_ids(street: str | None) -> str | None:
@@ -227,7 +239,7 @@ def _unit_ids(street: str | None) -> str | None:
     # ("F-203" == "F203").
     groups: list[list[str]] = []
     expecting_id = False
-    for tok in re.findall(r"#|[A-Z0-9]+(?:-[A-Z0-9]+)*", s[m.start():]):
+    for tok in re.findall(r"#|[A-Z0-9_]+(?:-[A-Z0-9_]+)*", s[m.start():]):
         is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
         if is_marker and not expecting_id:
             groups.append([_UNIT_KIND.get(tok, "U"), ""])
@@ -237,7 +249,7 @@ def _unit_ids(street: str | None) -> str | None:
         else:
             if not groups:
                 groups.append(["U", ""])
-            groups[-1][1] += re.sub(r"(?<=[A-Z])-(?=\d)|(?<=\d)-(?=[A-Z])", "", tok)
+            groups[-1][1] += _unit_id(tok)
             expecting_id = False
     ids = "|".join(sorted(f"{k}:{v}" for k, v in groups if v))
     return ids or None
@@ -407,7 +419,7 @@ def _same_street_modulo_punctuation(a: str, b: str) -> bool:
 
 def _marked_unit(street: str | None) -> str | None:
     m = _MARKED_UNIT_RE.search((street or "").upper())
-    return m.group(1).replace("-", "") if m else None
+    return _unit_id(m.group(1)) if m else None
 
 
 def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_street: str) -> bool:
@@ -424,7 +436,7 @@ def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_s
     tp, tm = p_street.split(" "), m_street.split(" ")
     for long_t, short_t, short_raw in ((tp, tm, m_raw), (tm, tp, p_raw)):
         if len(long_t) == len(short_t) + 1 and long_t[:-1] == short_t:
-            if _marked_unit(short_raw) == long_t[-1].replace("-", ""):
+            if _marked_unit(short_raw) == _unit_id(long_t[-1]):
                 return True
     return False
 

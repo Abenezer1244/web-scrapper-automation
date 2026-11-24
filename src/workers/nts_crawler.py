@@ -1940,6 +1940,10 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         # the recording must still list no parcel of its own (Codex).
         if recording_apns:
             raise ReviewError("this recording lists its own APNs: use one of them, not the image")
+        if (doc.county, doc.state) == ("chelan", "WA") and live_apns != []:
+            # Chelan indexes APNs late: "none" must be the recorder page's answer now (Codex).
+            raise ReviewError("Chelan may index this recording's APN late: approve from the image "
+                              "only once the recorder page confirms it lists none")
         printed_now = " ".join((values.get("property_address") or "").split())
         if (image_parcel.get("county"), image_parcel.get("state")) != (doc.county, doc.state) \
                 or image_parcel.get("parcel") != parcel or not image_parcel.get("situs") \

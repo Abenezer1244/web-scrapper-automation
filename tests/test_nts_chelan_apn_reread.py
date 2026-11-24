@@ -85,6 +85,25 @@ def test_a_re_read_never_widens_what_the_recording_says(db, tmp_path, stored, li
     assert db.get(Doc, doc_id).status == "pending_review"
 
 
+@pytest.mark.parametrize("stored,live,match", [
+    ([], None, "confirms it lists none"),               # page unreadable: no answer
+    (None, None, "confirms it lists none"),             # APNs unknown, never re-read
+    ([], ["111111111111"], "lists its own APNs"),       # the page lists one now
+], ids=["unreadable", "unknown", "listed-now"])
+def test_chelan_image_evidence_needs_the_page_to_say_no_apn(db, tmp_path, stored, live, match):
+    doc_id = _stage(db, tmp_path, "9930003", "2630003")
+    doc = db.get(Doc, doc_id)
+    doc.fields = {**doc.fields, "recording_apns": stored}
+    db.flush()
+    printed = "1 MAIN ST, WENATCHEE, WA 98801"
+    evidence = {"county": "chelan", "state": "WA", "parcel": _APN, "situs": "1 MAIN ST",
+                "city": "WENATCHEE", "zip": "98801", "printed": printed}
+    with pytest.raises(ReviewError, match=match):
+        approve_recorder_document(db, doc_id, reviewer="op-1", live_apns=live, image_parcel=evidence,
+                                  values=_values(property_address=printed))
+    assert db.get(Doc, doc_id).status == "pending_review"
+
+
 def test_the_cli_re_reads_the_page_when_no_apn_was_stored(c, db, tmp_path, capsys, monkeypatch):
     fetched: list[str] = []
 

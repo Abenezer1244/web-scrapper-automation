@@ -2110,12 +2110,14 @@ class TaxSummonsVersion(Base):
         CheckConstraint("seen_order > 0 AND revision >= 0", name="ck_tax_summons_versions_counters"),
         CheckConstraint("case_number IS NULL OR case_number ~ '^[0-9]{2}-[0-9]-[0-9]{5}-[0-9]{2}$'",
                         name="ck_tax_summons_versions_case"),
+        CheckConstraint("amount_as_of IS NULL OR amount_as_of BETWEEN DATE '2000-01-01' AND DATE '2100-12-31'",
+                        name="ck_tax_summons_versions_as_of"),
         CheckConstraint(
             "(published_at IS NULL) = (published_by IS NULL) "
             "AND (published_at IS NULL) = (published_revision IS NULL) "
             "AND (published_at IS NULL) = (published_seq IS NULL) "
-            "AND (published_at IS NULL OR (case_number IS NOT NULL AND published_revision > 0 "
-            "AND published_seq > 0)) "
+            "AND (published_at IS NULL OR (case_number IS NOT NULL AND amount_as_of IS NOT NULL "
+            "AND published_revision > 0 AND published_seq > 0)) "
             "AND (status <> 'published' OR published_at IS NOT NULL)",
             name="ck_tax_summons_versions_published"),
     )
@@ -2128,7 +2130,8 @@ class TaxSummonsVersion(Base):
     seen_order = Column(Integer, nullable=False, server_default=FetchedValue())  # set by the seal trigger
     status = Column(String(16), nullable=False, default="pending", server_default="pending")
     case_number = Column(String(32), nullable=True)
-    manifest = Column(JSON(none_as_null=True), nullable=True)  # {"<page>": <rows on that page>}
+    manifest = Column(JSON(none_as_null=True), nullable=True)
+    amount_as_of = Column(Date, nullable=True)  # the summons' "Taxes and Interest Due As Of" date  # {"<page>": <rows on that page>}
     revision = Column(Integer, nullable=False, default=0, server_default="0")
     revision_txid = Column(BigInteger, nullable=True)  # set by the seal trigger: who may fill the revision
     first_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

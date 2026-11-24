@@ -13,8 +13,9 @@ Steps for a new copy (the watcher records it and alerts): download it with
            the copy the county serves now, saved owner-only after its digest is checked.
            Work only from that file: manifest and publish hash it and refuse a copy whose
            bytes differ (the county can replace the file at the same URL). Then
-  manifest --version V --pdf FILE --case 26-2-00337-09 --pages 6:3,7:3,8:4,...
-           the case number and how many rows each Exhibit A page holds, read off the PDF.
+  manifest --version V --pdf FILE --case 26-2-00337-09 --as-of 2026-08-01 --pages 6:3,7:3,8:4,...
+           the case number, the date the amounts are stated as of ("Taxes and Interest Due As
+           Of"), and how many rows each Exhibit A page holds, all read off the PDF.
            A re-uploaded summons keeps its case; a later year's summons needs --new-case.
            Starts a new, empty revision: rows loaded before it no longer count.
   draft    --version V --out FILE
@@ -129,7 +130,7 @@ def cmd_show(db, op, args) -> None:
     print(f"{_shown(v.county)}, {_shown(v.state)}  case {v.case_number or '-'}  {v.status}  revision {v.revision}"
           + (f"  published revision {v.published_revision}" if v.published_revision else ""))
     print(f"pdf: {_shown(v.source_url)}  sha {v.sha256}")
-    print(f"manifest (page: rows): {v.manifest or '-'}")
+    print(f"manifest (page: rows): {v.manifest or '-'}  amounts as of: {v.amount_as_of or '-'}")
     for r in db.execute(select(Row).where(Row.version_id == v.id, Row.revision == v.revision)
                         .order_by(Row.page, Row.row_no)).scalars():
         print(f"p{r.page} r{r.row_no}  {r.eligibility:<10} {r.parcel_id or '-'}  {r.amount_due or '-'}  "
@@ -157,9 +158,18 @@ def _pdf_sha256(path: str) -> str:
         raise SystemExit(f"cannot read the --pdf file ({type(exc).__name__})") from None
 
 
+def _as_of(raw: str):
+    from datetime import date
+
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise SystemExit("--as-of must be a date like 2026-08-01") from None
+
+
 def cmd_manifest(db, op, args) -> str:
     rev = set_manifest(db, args.version, case_number=args.case, rows_per_page=_pages(args.pages), actor=op,
-                       pdf_sha256=_pdf_sha256(args.pdf), new_case=args.new_case)
+                       pdf_sha256=_pdf_sha256(args.pdf), amount_as_of=_as_of(args.as_of), new_case=args.new_case)
     return f"manifest recorded; the version is at revision {rev} with no rows: load them next"
 
 
@@ -347,6 +357,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--case", required=True)
     p.add_argument("--pages", required=True)
     p.add_argument("--pdf", required=True, help="your downloaded copy of this version's PDF")
+    p.add_argument("--as-of", required=True,
+                   help="the date the summons states its amounts as of (\"Taxes and Interest Due As Of\"), YYYY-MM-DD")
     p.add_argument("--new-case", action="store_true", help="a later year's summons, filed under a new case")
     p = sub.add_parser("draft")
     p.add_argument("--version", required=True)

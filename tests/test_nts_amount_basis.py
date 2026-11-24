@@ -264,11 +264,15 @@ def test_the_new_column_lands_after_every_existing_one():
         resolve_lead_export_columns,
     )
 
+    # Appended after it (2026-11-17): the tax foreclosure minimum bid, last in every
+    # layout that carries tax columns; default_amount_type stays last in auction-only ones.
     for cols in (LEAD_CSV_COLUMNS, OVERLAP_LEAD_COLUMNS, BATCH_LEAD_COLUMNS,
-                 resolve_lead_export_columns("pre_foreclosure"),
-                 resolve_lead_export_columns("trustee_sale"),
-                 resolve_crm_export_columns("pre_foreclosure"),
                  resolve_crm_export_columns(None)):
+        assert cols[-2:] == ["default_amount_type", "foreclosure_minimum_bid"]
+        assert cols.count("default_amount_type") == 1
+    for cols in (resolve_lead_export_columns("pre_foreclosure"),
+                 resolve_lead_export_columns("trustee_sale"),
+                 resolve_crm_export_columns("pre_foreclosure")):
         assert cols[-1] == "default_amount_type"
         assert cols.count("default_amount_type") == 1
     for record_type in ("probate", "tax_delinquent", "code_violation"):

@@ -580,3 +580,10 @@ class TestPunctuationAndSpacing:
         for a, b in (("4120 S 225TH PL #26 98032", "4120 S 225TH PL #26, KENT, WA 98032"),
                      ("2348 FAIRVIEW AVE E #203 98102", "2348 FAIRVIEW AVE E #203, SEATTLE, WA 98102")):
             assert compute_owner_flags(a, b)["absentee_owner"] is not True, a
+
+    def test_dry_run_regressions_stay_same_place(self):
+        # 2026-11-24 dry run: these were wrongly flipped by earlier unit/dot rules.
+        for a, b in (("23708 LOCUST WAY SPC 38-B, BOTHELL, WA 98021", "23708 LOCUST WAY # 38B, BOTHELL, WA 98021"),
+                     ("20102 67TH AVE NE SPC 9, ARLINGTON, WA 98223", "20102 67TH AVE NE #9, ARLINGTON, WA 98223"),
+                     ("4420 S 200TH ST, KENT, WA 98032", "4420 S.200TH ST., KENT, WA 98032")):
+            assert compute_owner_flags(a, b)["absentee_owner"] is False, a

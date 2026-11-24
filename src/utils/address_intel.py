@@ -158,7 +158,10 @@ _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 # A dot directly between two letters ("N.E.", "S.W.", a unit "A.BC") is kept too, so the
 # dot-dropping paths never equate it with a space: "N.E. MAIN" is not "N E MAIN" (North E
 # Main), "UNIT A.BC" is not "UNIT A BC" (Codex). A dot before a space ("AVE. S") still goes.
-_LETTER_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=[A-Z0-9])", re.IGNORECASE)  # "A.1" too (Codex)
+_LETTER_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=[A-Z])", re.IGNORECASE)
+# Inside a unit id a letter-digit dot is kept too ("UNIT A.1" != "UNIT A 1", Codex). Not in
+# the street itself: "S.200TH ST" is "S 200TH ST" (2026-11-24 dry run).
+_UNIT_LETTER_DIGIT_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=\d)", re.IGNORECASE)
 
 
 def _keep_meaningful_dots(text: str) -> str:
@@ -228,6 +231,7 @@ def _unit_ids(street: str | None) -> str | None:
     inside a street name ("OLD LOT 5 ACCESS ALY") is glued first and never starts a tail.
     """
     s = _glue_named_units(_keep_meaningful_dots(street or "")).upper()
+    s = _UNIT_LETTER_DIGIT_DOT_RE.sub("\u00b7", s)
     m = _UNIT_START_RE.search(s)
     if not m:
         return None
@@ -269,7 +273,12 @@ def _unit_ids(street: str | None) -> str | None:
             sep = "" if not prev or (len(prev) == 1 and prev.isalpha() and tok[0].isdigit()) else " "
             groups[-1][1] = prev + sep + _unit_id(tok)
             expecting_id = False
-    ids = "|".join(sorted(f"{k}:{v}" for k, v in groups if v))
+    groups = [g for g in groups if g[1]]
+    if len(groups) == 1:
+        # One unit named: its kind is just spelling ("SPC 9" == "#9" == "UNIT 9"). Kinds
+        # only tell groups apart when there are several ("LOT 1 UNIT 2").
+        groups[0][0] = "U"
+    ids = "|".join(sorted(f"{k}:{v}" for k, v in groups))
     return ids or None
 
 
@@ -524,11 +533,13 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
 
     # Byte-identical (post-normalize) is unambiguous same-place → confirmed False,
     # even with no parsed ZIP/city/state to discriminate.
-    if _normalize_full(property_address) == _normalize_full(mailing_address):
-        return False
-
     p = parse_property_for_display(property_address)
     m = parse_property_for_display(mailing_address)
+    # ...unless the explicit units differ in a way that normalizing erased ("UNIT A.1"
+    # vs "UNIT A 1", Codex). Read from the parsed street, never the whole line.
+    if (_normalize_full(property_address) == _normalize_full(mailing_address)
+            and _unit_ids(p["street"]) == _unit_ids(m["street"])):
+        return False
     p_street = _compare_street(p["street"])
     m_street = _compare_street(m["street"])
 

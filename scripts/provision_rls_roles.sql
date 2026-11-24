@@ -18,7 +18,11 @@
 --   psql "$ADMIN_DATABASE_URL" \
 --     -v app_pw="$(openssl rand -base64 32)" \
 --     -v sys_pw="$(openssl rand -base64 32)" \
+--     -v watch_pw="$(openssl rand -base64 32)" \
 --     -f scripts/provision_rls_roles.sql
+--
+-- watch_pw is optional: without it the summons watcher role (Role 5) is not created and
+-- its writes stay refused; a rerun never rotates an existing role's password.
 --
 -- Codex review (Phase 0 gate) drove the structure below:
 --   * app role write-grants are split from read-only grants (least privilege);
@@ -677,6 +681,113 @@ BEGIN
 END
 $purge$;
 
+-- ── Role 5: bridgeleads_watcher — the tax-summons watcher (migration 173) ───
+-- The ONLY writer of what a county serves (tax_summons_observations) and of new copies
+-- (tax_summons_versions INSERT): the Douglas summons watcher logs in as it, through its
+-- own DSN (DATABASE_URL_WATCHER). Migration 173's triggers refuse those writes from any
+-- other login whatever the grants, so the blanket system grant above cannot reopen them;
+-- the grants and policies below are the second layer. Created only when -v watch_pw is
+-- passed (the password is never rotated by a rerun); verified on EVERY run: no unsafe
+-- attributes and no membership either way, so no runtime role can SET ROLE into it.
+\if :{?watch_pw}
+  SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher') AS create_watch \gset
+  \if :create_watch
+    CREATE ROLE bridgeleads_watcher LOGIN PASSWORD :'watch_pw'
+        NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+  \else
+    \echo '>>> Role bridgeleads_watcher already exists — password NOT rotated (by design).'
+  \endif
+  ALTER ROLE bridgeleads_watcher LOGIN;  -- re-asserted like the system role; attributes verified below
+\else
+  \echo '>>> watch_pw not set: bridgeleads_watcher is not created (summons watcher writes stay refused).'
+\endif
+DO $watcher$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher') THEN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher'
+                   AND (rolsuper OR rolbypassrls OR rolcreaterole OR rolcreatedb OR rolreplication)) THEN
+            RAISE EXCEPTION 'bridgeleads_watcher has attributes it must not have';
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
+                    WHERE r.rolname = 'bridgeleads_watcher') THEN
+            RAISE EXCEPTION 'a role is a member of bridgeleads_watcher (it could act as the watcher)';
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member
+                    WHERE r.rolname = 'bridgeleads_watcher') THEN
+            RAISE EXCEPTION 'bridgeleads_watcher is a member of another role';
+        END IF;
+        GRANT USAGE ON SCHEMA public TO bridgeleads_watcher;
+    END IF;
+    -- Converge the review tables' matrix AFTER the blanket system grant above: the system
+    -- role reviews (reads observations, updates versions, appends rows and events).
+    IF to_regclass('public.tax_summons_observations') IS NOT NULL THEN
+        REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM anon;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM authenticated;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+                REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM service_role;
+            END IF;
+        GRANT SELECT, UPDATE ON tax_summons_versions TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_versions_system_all ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_select ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_insert ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_update ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_delete ON tax_summons_versions;
+        CREATE POLICY tax_summons_versions_system_select ON tax_summons_versions FOR SELECT TO bridgeleads_system USING (true);
+        CREATE POLICY tax_summons_versions_system_update ON tax_summons_versions FOR UPDATE TO bridgeleads_system USING (true) WITH CHECK (true);
+        GRANT SELECT, INSERT ON tax_summons_rows TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_rows_system_all ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_select ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_insert ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_update ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_delete ON tax_summons_rows;
+        CREATE POLICY tax_summons_rows_system_select ON tax_summons_rows FOR SELECT TO bridgeleads_system USING (true);
+        CREATE POLICY tax_summons_rows_system_insert ON tax_summons_rows FOR INSERT TO bridgeleads_system WITH CHECK (true);
+        GRANT SELECT, INSERT ON tax_summons_events TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_events_system_all ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_select ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_insert ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_update ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_delete ON tax_summons_events;
+        CREATE POLICY tax_summons_events_system_select ON tax_summons_events FOR SELECT TO bridgeleads_system USING (true);
+        CREATE POLICY tax_summons_events_system_insert ON tax_summons_events FOR INSERT TO bridgeleads_system WITH CHECK (true);
+        GRANT SELECT ON tax_summons_observations TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_observations_system_all ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_select ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_insert ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_update ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_delete ON tax_summons_observations;
+        CREATE POLICY tax_summons_observations_system_select ON tax_summons_observations FOR SELECT TO bridgeleads_system USING (true);
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher') THEN
+            REVOKE ALL ON tax_summons_versions FROM bridgeleads_watcher;
+            GRANT SELECT, INSERT, UPDATE (last_checked_at) ON tax_summons_versions TO bridgeleads_watcher;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_all ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_select ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_insert ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_update ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_delete ON tax_summons_versions;
+            CREATE POLICY tax_summons_versions_watcher_select ON tax_summons_versions FOR SELECT TO bridgeleads_watcher USING (true);
+            CREATE POLICY tax_summons_versions_watcher_insert ON tax_summons_versions FOR INSERT TO bridgeleads_watcher WITH CHECK (true);
+            CREATE POLICY tax_summons_versions_watcher_update ON tax_summons_versions FOR UPDATE TO bridgeleads_watcher USING (true) WITH CHECK (true);
+            REVOKE ALL ON tax_summons_observations FROM bridgeleads_watcher;
+            GRANT SELECT, INSERT, UPDATE ON tax_summons_observations TO bridgeleads_watcher;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_all ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_select ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_insert ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_update ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_delete ON tax_summons_observations;
+            CREATE POLICY tax_summons_observations_watcher_select ON tax_summons_observations FOR SELECT TO bridgeleads_watcher USING (true);
+            CREATE POLICY tax_summons_observations_watcher_insert ON tax_summons_observations FOR INSERT TO bridgeleads_watcher WITH CHECK (true);
+            CREATE POLICY tax_summons_observations_watcher_update ON tax_summons_observations FOR UPDATE TO bridgeleads_watcher USING (true) WITH CHECK (true);
+        END IF;
+    END IF;
+END
+$watcher$;
+
 -- ── Role 3: owner / migration role ──────────────────────────────────────────
 -- The existing schema owner keeps DDL rights and is used ONLY by Alembic via
 -- DATABASE_URL_MIGRATE (Phase 3). No new role here — do NOT grant DDL to
@@ -687,8 +798,11 @@ $purge$;
 -- normally passes. If it fails, the fix is:
 --   REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 -- (run separately — it affects every role, so it's an explicit decision).
+-- The watcher too: the summons triggers resolve their tables through public.
 SELECT has_schema_privilege('bridgeleads_app', 'public', 'CREATE')
-    OR has_schema_privilege('bridgeleads_system', 'public', 'CREATE') AS can_ddl \gset
+    OR has_schema_privilege('bridgeleads_system', 'public', 'CREATE')
+    OR (EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher')
+        AND has_schema_privilege('bridgeleads_watcher', 'public', 'CREATE')) AS can_ddl \gset
 \if :can_ddl
   \echo '>>> ERROR: a scoped role can CREATE (DDL) in schema public. Aborting.'
   \echo '>>> Remedy: REVOKE CREATE ON SCHEMA public FROM PUBLIC; then rerun.'

@@ -142,6 +142,95 @@ _GRANTS = [
     # just inserted in the same transaction (skip_trace_claim.py). The only
     # pending-row DELETE in src, pinned by tests/test_worker_delete_grants.py.
     "GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system",
+    # Tax-summons review (migration 173): mirrors provision_rls_roles.sql Role 5. The
+    # blanket grant above gives the system role INSERT/UPDATE on every table; on these the
+    # system role only reviews, and observations / new copies are the watcher's alone
+    # (the triggers refuse anyone else regardless). MUST stay after the blanket grant.
+    """DO $summons$
+    BEGIN
+    -- The watcher is trusted only as provision_rls_roles.sql Role 5 verifies it: no unsafe
+    -- attributes, no membership either way (so no runtime role can act as it), no DDL.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher') THEN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher'
+                   AND (rolsuper OR rolbypassrls OR rolcreaterole OR rolcreatedb OR rolreplication)) THEN
+            RAISE EXCEPTION 'bridgeleads_watcher has attributes it must not have';
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid IN (m.roleid, m.member)
+                    WHERE r.rolname = 'bridgeleads_watcher') THEN
+            RAISE EXCEPTION 'bridgeleads_watcher has a role membership (either way)';
+        END IF;
+        IF has_schema_privilege('bridgeleads_watcher', 'public', 'CREATE') THEN
+            RAISE EXCEPTION 'bridgeleads_watcher can CREATE in schema public';
+        END IF;
+    END IF;
+    IF to_regclass('public.tax_summons_observations') IS NOT NULL THEN
+        REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM anon;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM authenticated;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+            REVOKE ALL ON tax_summons_versions, tax_summons_rows, tax_summons_events, tax_summons_observations FROM service_role;
+        END IF;
+        GRANT SELECT, UPDATE ON tax_summons_versions TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_versions_system_all ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_select ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_insert ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_update ON tax_summons_versions;
+        DROP POLICY IF EXISTS tax_summons_versions_system_delete ON tax_summons_versions;
+        CREATE POLICY tax_summons_versions_system_select ON tax_summons_versions FOR SELECT TO bridgeleads_system USING (true);
+        CREATE POLICY tax_summons_versions_system_update ON tax_summons_versions FOR UPDATE TO bridgeleads_system USING (true) WITH CHECK (true);
+        GRANT SELECT, INSERT ON tax_summons_rows TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_rows_system_all ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_select ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_insert ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_update ON tax_summons_rows;
+        DROP POLICY IF EXISTS tax_summons_rows_system_delete ON tax_summons_rows;
+        CREATE POLICY tax_summons_rows_system_select ON tax_summons_rows FOR SELECT TO bridgeleads_system USING (true);
+        CREATE POLICY tax_summons_rows_system_insert ON tax_summons_rows FOR INSERT TO bridgeleads_system WITH CHECK (true);
+        GRANT SELECT, INSERT ON tax_summons_events TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_events_system_all ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_select ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_insert ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_update ON tax_summons_events;
+        DROP POLICY IF EXISTS tax_summons_events_system_delete ON tax_summons_events;
+        CREATE POLICY tax_summons_events_system_select ON tax_summons_events FOR SELECT TO bridgeleads_system USING (true);
+        CREATE POLICY tax_summons_events_system_insert ON tax_summons_events FOR INSERT TO bridgeleads_system WITH CHECK (true);
+        GRANT SELECT ON tax_summons_observations TO bridgeleads_system;
+        DROP POLICY IF EXISTS tax_summons_observations_system_all ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_select ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_insert ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_update ON tax_summons_observations;
+        DROP POLICY IF EXISTS tax_summons_observations_system_delete ON tax_summons_observations;
+        CREATE POLICY tax_summons_observations_system_select ON tax_summons_observations FOR SELECT TO bridgeleads_system USING (true);
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_watcher') THEN
+            GRANT USAGE ON SCHEMA public TO bridgeleads_watcher;
+            REVOKE ALL ON tax_summons_versions FROM bridgeleads_watcher;
+            GRANT SELECT, INSERT, UPDATE (last_checked_at) ON tax_summons_versions TO bridgeleads_watcher;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_all ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_select ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_insert ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_update ON tax_summons_versions;
+            DROP POLICY IF EXISTS tax_summons_versions_watcher_delete ON tax_summons_versions;
+            CREATE POLICY tax_summons_versions_watcher_select ON tax_summons_versions FOR SELECT TO bridgeleads_watcher USING (true);
+            CREATE POLICY tax_summons_versions_watcher_insert ON tax_summons_versions FOR INSERT TO bridgeleads_watcher WITH CHECK (true);
+            CREATE POLICY tax_summons_versions_watcher_update ON tax_summons_versions FOR UPDATE TO bridgeleads_watcher USING (true) WITH CHECK (true);
+            REVOKE ALL ON tax_summons_observations FROM bridgeleads_watcher;
+            GRANT SELECT, INSERT, UPDATE ON tax_summons_observations TO bridgeleads_watcher;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_all ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_select ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_insert ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_update ON tax_summons_observations;
+            DROP POLICY IF EXISTS tax_summons_observations_watcher_delete ON tax_summons_observations;
+            CREATE POLICY tax_summons_observations_watcher_select ON tax_summons_observations FOR SELECT TO bridgeleads_watcher USING (true);
+            CREATE POLICY tax_summons_observations_watcher_insert ON tax_summons_observations FOR INSERT TO bridgeleads_watcher WITH CHECK (true);
+            CREATE POLICY tax_summons_observations_watcher_update ON tax_summons_observations FOR UPDATE TO bridgeleads_watcher USING (true) WITH CHECK (true);
+        END IF;
+    END IF;
+    END
+    $summons$""",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system",
 ]
 

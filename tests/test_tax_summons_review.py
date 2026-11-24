@@ -28,13 +28,12 @@ from src.db.models import TaxSummonsRow as Row
 from src.db.models import TaxSummonsVersion as Version
 from src.db.session import sync_engine
 from src.utils.crypto import blind_index
+from src.workers import tax_summons as store
 from src.workers.tax_summons import (
     TaxReviewError,
-    claim_watch,
     draft_rows,
     load_rows,
     publish,
-    record_observation,
     serving_status,
     set_manifest,
 )
@@ -81,6 +80,50 @@ def c():
 def db(c):
     with c.session_factory() as s:
         yield s
+
+
+_WATCHER = "bridgeleads_watcher"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _watcher_role():
+    """The watcher's role, with the migration's own grants and policies, on the TEST
+    cluster (tests/_db_safety pins this run to a *_test database). Roles are cluster-wide,
+    so it is created once and kept; NOLOGIN here: tests act as it through SET ROLE from a
+    superuser login, which the triggers allow (production logs in as it)."""
+    with sync_engine.begin() as conn:
+        conn.execute(text(f"DO $r$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{_WATCHER}') "
+                          f"THEN CREATE ROLE {_WATCHER} NOLOGIN NOSUPERUSER NOBYPASSRLS; END IF; END $r$"))
+        conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {_WATCHER}"))
+        for table, role in migration_173.ROLE_POLICIES:
+            if role == _WATCHER:
+                conn.execute(text(migration_173.role_sql(table, role)))
+    yield
+
+
+@contextmanager
+def _as_watcher(db):
+    """Run the block as the watcher (SET LOCAL ROLE inside a savepoint: a failure rolls the
+    savepoint back, which also restores the role)."""
+    sp = db.begin_nested()
+    db.execute(text(f"SET LOCAL ROLE {_WATCHER}"))
+    try:
+        yield
+    except BaseException:
+        sp.rollback()
+        raise
+    db.execute(text("RESET ROLE"))
+    sp.commit()
+
+
+def claim_watch(db, **kw):
+    with _as_watcher(db):
+        return store.claim_watch(db, **kw)
+
+
+def record_observation(db, **kw):
+    with _as_watcher(db):
+        return store.record_observation(db, **kw)
 
 
 def open_version(db, *, county: str, state: str, source_url: str, sha256: str) -> tuple[str, bool]:
@@ -585,8 +628,9 @@ def test_only_a_newer_publication_supersedes_a_copy(db):
 
 def test_the_order_copies_were_seen_is_the_databases(db):
     v1 = _version(db, "v1")
-    db.execute(text("INSERT INTO tax_summons_versions (id, county, state, source_url, sha256, seen_order) "
-                    "VALUES (gen_random_uuid(), 'douglas', 'WA', 'u', :d, 1)"), {"d": _digest("v2")})
+    with _as_watcher(db):
+        db.execute(text("INSERT INTO tax_summons_versions (id, county, state, source_url, sha256, seen_order) "
+                        "VALUES (gen_random_uuid(), 'douglas', 'WA', 'u', :d, 1)"), {"d": _digest("v2")})
     orders = db.execute(text("SELECT sha256, seen_order FROM tax_summons_versions WHERE county = 'douglas' "
                              "ORDER BY seen_order")).all()
     assert [o.seen_order for o in orders] == [1, 2] and orders[1].sha256 == _digest("v2")
@@ -635,9 +679,18 @@ def test_a_later_redemption_outranks_an_earlier_eligible_copy(db):
         _load(db, v3, _row(6, 1, _A), _row(6, 2, _B))
 
 
-def _refused(db, sql: str, params: dict, match: str = "sealed|only changes by erasure") -> None:
+def _watcher_writes(sql: str) -> bool:
+    """Observation writes and new copies are the watcher's alone; a refusal test of any
+    other rule must run as the watcher, or the identity check would answer first."""
+    return "tax_summons_observations" in sql or sql.startswith("INSERT INTO tax_summons_versions")
+
+
+def _refused(db, sql: str, params: dict, match: str = "sealed|only changes by erasure", *,
+             as_watcher: bool | None = None) -> None:
     with pytest.raises(DBAPIError, match=match):
         with db.begin_nested():
+            if _watcher_writes(sql) if as_watcher is None else as_watcher:
+                db.execute(text(f"SET LOCAL ROLE {_WATCHER}"))
             db.execute(text(sql), params)
 
 
@@ -784,8 +837,9 @@ def _as_system_role(db) -> None:
                     "'bridgeleads_system') THEN CREATE ROLE bridgeleads_system NOLOGIN NOBYPASSRLS; "
                     "END IF; END $r$"))
     db.execute(text("GRANT USAGE ON SCHEMA public TO bridgeleads_system"))
-    for table in migration_173.POLICIES:
-        db.execute(text(migration_173.system_only_sql(table)))
+    for table, role in migration_173.ROLE_POLICIES:
+        if role == "bridgeleads_system":
+            db.execute(text(migration_173.role_sql(table, role)))
 
 
 @pytest.mark.parametrize("provisioner_regrants", [False, True])
@@ -974,6 +1028,47 @@ def test_a_hold_is_cleared_only_by_a_new_confirmation(db, change, match):
     assert _serving(db)[0] == "link_missing"
 
 
+@pytest.mark.parametrize("as_role", [None, "bridgeleads_system"])
+def test_only_the_watcher_records_what_the_county_serves(db, as_role):
+    """A superuser login acting as itself, or the system role (whatever its grants: here
+    the old FOR ALL ones), is refused by the trigger before any other rule."""
+    vid = _version(db, "v1")
+    _publish(db, vid)
+    record_observation(db, county="douglas", state="WA", token=_claim(db), hold="link_missing")
+    if as_role:
+        _as_system_role(db)
+        db.execute(text("GRANT SELECT, INSERT, UPDATE ON tax_summons_observations, tax_summons_versions "
+                        "TO bridgeleads_system"))  # the provisioner's blanket grant, re-run
+        for table in ("tax_summons_observations", "tax_summons_versions"):
+            db.execute(text(f"CREATE POLICY {table}_system_all ON {table} FOR ALL TO bridgeleads_system "
+                            "USING (true) WITH CHECK (true)"))
+    for sql in ("UPDATE tax_summons_observations SET claim_token = claim_token + 1, "
+                "claim_expires_at = now() + interval '5 minutes' WHERE county = 'douglas'",
+                "UPDATE tax_summons_observations SET status = 'ok' WHERE county = 'douglas'",
+                "INSERT INTO tax_summons_versions (id, county, state, source_url, sha256, seen_order) "
+                "VALUES (gen_random_uuid(), 'douglas', 'WA', 'u', repeat('c', 64), 1)"):
+        with pytest.raises(DBAPIError, match="only the watcher"):
+            with db.begin_nested():
+                if as_role:
+                    db.execute(text(f"SET LOCAL ROLE {as_role}"))
+                db.execute(text(sql))
+    assert _serving(db) == ("link_missing", vid)
+    with pytest.raises(DBAPIError, match="only the watcher"):  # the module, called without the watcher login
+        with db.begin_nested():
+            store.claim_watch(db, county="douglas", state="WA", lease_seconds=60)
+
+
+def test_the_watcher_only_notes_when_it_saw_a_copy(db):
+    vid = _version(db, "v1")
+    with _as_watcher(db):
+        db.execute(text("UPDATE tax_summons_versions SET last_checked_at = now() WHERE id = :v"), {"v": vid})
+    _refused(db, "UPDATE tax_summons_versions SET status = 'superseded' WHERE id = :v", {"v": vid},
+             match="permission denied", as_watcher=True)  # its grant is UPDATE (last_checked_at) only
+    db.execute(text(f"GRANT UPDATE ON tax_summons_versions TO {_WATCHER}"))  # a drifted grant, this test only
+    _refused(db, "UPDATE tax_summons_versions SET status = 'superseded' WHERE id = :v", {"v": vid},
+             match="only records when it saw a copy", as_watcher=True)
+
+
 def test_a_result_cannot_rewrite_the_held_copy(db):
     _publish(db, _version(db, "v1"))
     token = _claim(db)
@@ -998,8 +1093,9 @@ def test_a_confirmation_keeps_the_year_high_water_mark(db):
     token = _claim(db)
     _refused(db, "UPDATE tax_summons_observations SET claim_expires_at = NULL, status = 'ok', link_year = 2025 "
                  "WHERE county = 'douglas' AND claim_token = :t", {"t": token}, match="is a rollback")
-    db.execute(text("UPDATE tax_summons_observations SET claim_expires_at = NULL, status = 'ok', link_year = 2027 "
-                    "WHERE county = 'douglas' AND claim_token = :t"), {"t": token})
+    with _as_watcher(db):
+        db.execute(text("UPDATE tax_summons_observations SET claim_expires_at = NULL, status = 'ok', "
+                        "link_year = 2027 WHERE county = 'douglas' AND claim_token = :t"), {"t": token})
     assert db.execute(text("SELECT max_link_year FROM tax_summons_observations")).scalar() == 2027
 
 
@@ -1024,11 +1120,13 @@ def test_the_observation_clock_is_the_databases_and_the_row_stays(db):
     _refused(db, "UPDATE tax_summons_observations SET checked_at = '2000-01-01', confirmed_at = '2000-01-01' "
                  "WHERE county = 'douglas'", {}, match="needs the live claim")
     token = _claim(db)  # a result stamps the database's clock, whatever the writer sends
-    db.execute(text("UPDATE tax_summons_observations SET claim_expires_at = NULL, checked_at = '2000-01-01', "
-                    "confirmed_at = '2000-01-01' WHERE county = 'douglas' AND claim_token = :t"), {"t": token})
+    with _as_watcher(db):
+        db.execute(text("UPDATE tax_summons_observations SET claim_expires_at = NULL, checked_at = '2000-01-01', "
+                        "confirmed_at = '2000-01-01' WHERE county = 'douglas' AND claim_token = :t"), {"t": token})
     assert db.execute(text("SELECT checked_at > now() - interval '1 minute' AND confirmed_at > now() - "
                            "interval '1 minute' FROM tax_summons_observations")).scalar()
-    _refused(db, "DELETE FROM tax_summons_observations", {}, match="never deleted")
+    _refused(db, "DELETE FROM tax_summons_observations", {}, match="never deleted", as_watcher=False)
+    _refused(db, "DELETE FROM tax_summons_observations", {}, match="permission denied", as_watcher=True)
     _refused(db, "INSERT INTO tax_summons_observations (county, state, status) VALUES ('chelan', 'WA', 'ok')", {},
              match="starts unobserved|ck_tax_summons_observations_ok")
 

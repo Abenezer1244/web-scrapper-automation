@@ -21,11 +21,13 @@ eligible rows can ever become leads (Phase C, connector added later, inactive).
                         newer one). Publication and manifests need the CURRENT copy.
 
 Triggers seal what review decided (SEAL_SQL): a published or superseded version and its
-rows cannot be changed, by any role, except a row's erasure. RLS on all three.
-bridgeleads_system gets a FOR ALL policy on versions and only SELECT +
-INSERT policies on rows and events, so those two stay append-only even under the
-provisioner's blanket UPDATE grant (scripts/provision_rls_roles.sql). Grants and
-policies sit inside a role-existence guard, exactly as 151 pacs_tax_status. No data.
+rows cannot be changed, by any role, except a row's erasure. Only the watcher's
+own login (bridgeleads_watcher) writes observations and new versions: the triggers refuse
+anyone else, whatever the grants. RLS on all four tables; ROLE_POLICIES is the per-role
+privilege matrix (the system role reviews: it reads observations, updates versions, and
+only inserts rows and events). Grants and policies sit inside role-existence guards; the
+provisioner (scripts/provision_rls_roles.sql) applies the same matrix after its blanket
+grant. No data.
 
 Revision ID: 173
 Revises: 172
@@ -45,15 +47,25 @@ _ELIGIBILITY = "('eligible', 'redeemed', 'unreadable', 'excluded')"
 _EXCLUDE = "('duplicate', 'not_a_parcel', 'privacy_request', 'entered_in_error')"
 _REINSTATE = "('redemption_reversed', 'entered_in_error')"
 
-# Per table: the grant, and the commands the system role's policies allow. Rows and
-# events have no UPDATE/DELETE policy, so RLS refuses both whatever the grants say.
-# Tests apply exactly this SQL (CI clusters have no provisioned roles).
-POLICIES = {
-    "tax_summons_versions": ("SELECT, INSERT, UPDATE", ("ALL",)),
-    "tax_summons_rows": ("SELECT, INSERT", ("SELECT", "INSERT")),
-    "tax_summons_events": ("SELECT, INSERT", ("SELECT", "INSERT")),
-    "tax_summons_observations": ("SELECT, INSERT, UPDATE", ("ALL",)),
+# The watcher (Phase B) is the ONLY writer of what a county serves: observations, and new
+# copies (versions). It logs in as its own role, bridgeleads_watcher; the triggers refuse
+# those writes from anyone else (tax_summons_require_watcher), so they hold even if the
+# provisioner's blanket grant gives the system role table privileges again. The grants
+# and policies below are the second layer.
+WATCHER_ROLE = "bridgeleads_watcher"
+# (table, role) -> (table privileges, row-security policy commands). Each run converges:
+# REVOKE ALL, then exactly these. Rows and events have no UPDATE policy, so RLS refuses
+# their update whatever a later grant says. Tests apply exactly this SQL (CI clusters
+# have no provisioned roles).
+ROLE_POLICIES = {
+    ("tax_summons_versions", "bridgeleads_system"): ("SELECT, UPDATE", ("SELECT", "UPDATE")),
+    ("tax_summons_versions", WATCHER_ROLE): ("SELECT, INSERT, UPDATE (last_checked_at)", ("SELECT", "INSERT", "UPDATE")),
+    ("tax_summons_rows", "bridgeleads_system"): ("SELECT, INSERT", ("SELECT", "INSERT")),
+    ("tax_summons_events", "bridgeleads_system"): ("SELECT, INSERT", ("SELECT", "INSERT")),
+    ("tax_summons_observations", "bridgeleads_system"): ("SELECT", ("SELECT",)),
+    ("tax_summons_observations", WATCHER_ROLE): ("SELECT, INSERT, UPDATE", ("SELECT", "INSERT", "UPDATE")),
 }
+REVIEW_TABLES = ("tax_summons_versions", "tax_summons_rows", "tax_summons_events", "tax_summons_observations")
 OBSERVATION_STATUSES = ("unknown", "ok", "link_missing", "page_failed", "download_failed", "ambiguous", "rollback")
 
 
@@ -81,7 +93,23 @@ EVENT_SHAPE_CHECK = (
 #    and publication fields are frozen, and it can only become superseded. A
 #    superseded version changes only last_checked_at.
 SEAL_SQL = r"""
-CREATE FUNCTION tax_summons_rows_seal() RETURNS trigger LANGUAGE plpgsql AS $fn$
+-- Only the watcher's own login writes what a county serves. current_user is the role
+-- the write runs as; session_user is the login, so a system login that somehow switched
+-- role is still refused. A superuser login (tests, an administrator) may act as the
+-- watcher by SET ROLE; superusers can change these triggers anyway.
+CREATE FUNCTION tax_summons_require_watcher() RETURNS void LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $fn$
+BEGIN
+    IF current_user <> 'bridgeleads_watcher'
+       OR (session_user <> 'bridgeleads_watcher'
+           AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = session_user AND rolsuper)) THEN
+        RAISE EXCEPTION 'tax_summons: only the watcher (bridgeleads_watcher) records what the county serves'
+              USING ERRCODE = 'insufficient_privilege';
+    END IF;
+END
+$fn$;
+CREATE FUNCTION tax_summons_rows_seal() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $fn$
 DECLARE
     v_status text;
     v_revision integer;
@@ -136,7 +164,8 @@ $fn$;
 CREATE TRIGGER tax_summons_rows_seal BEFORE INSERT OR UPDATE ON tax_summons_rows
     FOR EACH ROW EXECUTE FUNCTION tax_summons_rows_seal();
 
-CREATE FUNCTION tax_summons_versions_seal() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE FUNCTION tax_summons_versions_seal() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $fn$
 DECLARE
     v_established text;
     v_entries integer;
@@ -154,6 +183,7 @@ BEGIN
     -- publication never interleave, whoever writes them.
     PERFORM pg_advisory_xact_lock(7173, hashtext(NEW.county || '/' || NEW.state));
     IF TG_OP = 'INSERT' THEN
+        PERFORM tax_summons_require_watcher();  -- a new copy is something the county serves
         -- The order copies were seen is the database's to assign, never the writer's.
         SELECT coalesce(max(o.seen_order), 0) + 1 INTO NEW.seen_order FROM tax_summons_versions o
          WHERE o.county = NEW.county AND o.state = NEW.state;
@@ -166,6 +196,12 @@ BEGIN
                   USING ERRCODE = 'check_violation';
         END IF;
         RETURN NEW;
+    END IF;
+    -- The watcher only notes that it saw a copy again; review is the operator's.
+    IF current_user = 'bridgeleads_watcher'
+       AND (to_jsonb(NEW) - 'last_checked_at') IS DISTINCT FROM (to_jsonb(OLD) - 'last_checked_at') THEN
+        RAISE EXCEPTION 'tax_summons_versions: the watcher only records when it saw a copy'
+              USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF (NEW.id, NEW.county, NEW.state, NEW.sha256, NEW.seen_order, NEW.source_url, NEW.first_seen_at)
        IS DISTINCT FROM
@@ -306,7 +342,8 @@ CREATE TRIGGER tax_summons_versions_seal BEFORE INSERT OR UPDATE ON tax_summons_
 -- Nothing reviewed is ever deleted, by any role: a removed row would change what an
 -- operator approved, and a removed redemption would drop out of the case's history.
 -- (Erasure clears fields; it never deletes.)
-CREATE FUNCTION tax_summons_no_delete() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE FUNCTION tax_summons_no_delete() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $fn$
 BEGIN
     RAISE EXCEPTION '%: review records are never deleted', TG_TABLE_NAME USING ERRCODE = 'check_violation';
 END
@@ -326,7 +363,8 @@ CREATE TRIGGER tax_summons_events_no_truncate BEFORE TRUNCATE ON tax_summons_eve
     FOR EACH STATEMENT EXECUTE FUNCTION tax_summons_no_delete();
 
 -- The audit is append-only for every role, not just the system role's policies.
-CREATE FUNCTION tax_summons_events_no_update() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE FUNCTION tax_summons_events_no_update() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $fn$
 BEGIN
     RAISE EXCEPTION 'tax_summons_events: the audit is append-only' USING ERRCODE = 'check_violation';
 END
@@ -338,7 +376,8 @@ CREATE TRIGGER tax_summons_events_no_update BEFORE UPDATE ON tax_summons_events
 -- A copy is superseded only by a publication made after it was superseded, checked at
 -- commit so publish() can supersede the old copies and publish the current one in one
 -- transaction. A copy published earlier does not count.
-CREATE FUNCTION tax_summons_versions_superseded() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE FUNCTION tax_summons_versions_superseded() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $fn$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM tax_summons_versions o
                     WHERE o.county = NEW.county AND o.state = NEW.state AND o.id <> NEW.id
@@ -360,7 +399,8 @@ CREATE CONSTRAINT TRIGGER tax_summons_versions_superseded AFTER UPDATE ON tax_su
 # link year never go back), its clocks are the database's, and its current copy is one of
 # its own county's versions. It is never deleted.
 OBSERVE_SQL = r"""
-CREATE FUNCTION tax_summons_observations_guard() RETURNS trigger LANGUAGE plpgsql AS $fn$
+CREATE FUNCTION tax_summons_observations_guard() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, public, pg_temp AS $fn$
 DECLARE
     v_now timestamptz;
 BEGIN
@@ -368,6 +408,7 @@ BEGIN
         RAISE EXCEPTION 'tax_summons_observations: write under READ COMMITTED'
               USING ERRCODE = 'feature_not_supported';
     END IF;
+    PERFORM tax_summons_require_watcher();
     PERFORM pg_advisory_xact_lock(7173, hashtext(NEW.county || '/' || NEW.state));
     IF TG_OP = 'INSERT' THEN
         IF NEW.status <> 'unknown' OR NEW.current_version_id IS NOT NULL OR NEW.claim_token <> 0
@@ -451,22 +492,26 @@ CREATE TRIGGER tax_summons_observations_no_truncate BEFORE TRUNCATE ON tax_summo
 """
 
 
-def system_only_sql(table: str) -> str:
-    grants, commands = POLICIES[table]
+def role_sql(table: str, role: str) -> str:
+    """Converge one role's privileges and policies on one review table (role-existence
+    guarded: a cluster without the role has nothing to grant). Enforcement does not depend
+    on this: the triggers refuse non-watcher writes whether or not the role exists."""
+    grants, commands = ROLE_POLICIES[(table, role)]
+    short = role.removeprefix("bridgeleads_")
+    stale = " ".join(f"DROP POLICY IF EXISTS {table}_{short}_{c} ON {table};"
+                     for c in ("all", "select", "insert", "update", "delete"))
     policies = []
     for cmd in commands:
-        name = f"{table}_system_{cmd.lower()}"
-        clause = "WITH CHECK (true)" if cmd == "INSERT" else (
-            "USING (true)" if cmd == "SELECT" else "USING (true) WITH CHECK (true)")
-        policies.append(f"DROP POLICY IF EXISTS {name} ON {table}; "
-                        f"CREATE POLICY {name} ON {table} FOR {cmd} TO bridgeleads_system {clause};")
-    revoke = "" if "ALL" in commands else f"REVOKE UPDATE, DELETE, TRUNCATE ON {table} FROM bridgeleads_system;"
+        name = f"{table}_{short}_{cmd.lower()}"
+        clause = {"INSERT": "WITH CHECK (true)", "SELECT": "USING (true)"}.get(cmd, "USING (true) WITH CHECK (true)")
+        policies.append(f"CREATE POLICY {name} ON {table} FOR {cmd} TO {role} {clause};")
     return f"""
         DO $tsr_rls$
         BEGIN
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_system') THEN
-                GRANT {grants} ON {table} TO bridgeleads_system;
-                {revoke}
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+                REVOKE ALL ON {table} FROM {role};
+                GRANT {grants} ON {table} TO {role};
+                {stale}
                 {' '.join(policies)}
             END IF;
         END
@@ -623,9 +668,10 @@ def upgrade() -> None:
                            name="ck_tax_summons_observations_values"),
     )
 
-    for table in POLICIES:
+    for table in REVIEW_TABLES:
         op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
-        op.execute(system_only_sql(table))
+    for table, role in ROLE_POLICIES:
+        op.execute(role_sql(table, role))
     op.execute(SEAL_SQL)
     op.execute(OBSERVE_SQL)
 
@@ -634,6 +680,7 @@ def downgrade() -> None:
     for table in ("tax_summons_observations", "tax_summons_events", "tax_summons_rows", "tax_summons_versions"):
         op.execute(f"DROP TABLE IF EXISTS {table}")  # its indexes, policies and triggers go with it
     op.execute("DROP FUNCTION IF EXISTS tax_summons_observations_guard()")
+    op.execute("DROP FUNCTION IF EXISTS tax_summons_require_watcher()")
     op.execute("DROP FUNCTION IF EXISTS tax_summons_versions_seal()")
     op.execute("DROP FUNCTION IF EXISTS tax_summons_versions_superseded()")
     op.execute("DROP FUNCTION IF EXISTS tax_summons_no_delete()")

@@ -252,7 +252,27 @@ Codex consult folded in (4 High, 2 Medium). Connector stays INACTIVE until the P
   - Also tracked (not fixed): migration-before-role-provisioning leaves no policies (fails closed; prod role
     exists); a writer bypassing the module can deadlock with it (Postgres aborts one side); on a rejected FAT
     volume the empty draft is deleted by path after the handle closes (Low race).
-- [ ] **Phase B — summons watcher.** Daily beat: find the PDF from the county foreclosure page (not a fixed URL),
+- [ ] **Phase B (revised 2026-11-24 after Codex consult: 4 High, 4 Medium).** "Current copy" is a durable
+  per-county observation, not a timestamp sort. Split:
+  - [ ] **B1 — observation store** (folded into migration 173 / PR #680 while unmerged; models, tax_summons.py,
+    review CLI, tests):
+    `tax_summons_observations` (one row per county: current_version_id, status ok|link_missing|page_failed|
+    download_failed|ambiguous|rollback, checked_at/confirmed_at by the DB clock, link_url, link_year,
+    max_link_year, claim_token + claim_expires_at). `claim_watch` (lease; a second watcher skips) before any
+    fetch; `record_observation(token, ...)` under the county lock refuses a stale token (fencing), opens the
+    digest's version and points current at it. Publication and manifests require the version to be CURRENT
+    (replaces "newest seen_order", in module and trigger) so pending B -> C -> B can be published and a
+    re-served superseded copy holds. A lower link year than max_link_year = rollback hold. `fetch` CLI
+    command downloads the current copy and verifies its digest (no artifact store: a copy the county no
+    longer serves is not current, so it cannot be published anyway). Phase C predicate (defined here):
+    status ok AND current version published AND confirmed_at within 36 h of the DB clock.
+  - [ ] **B2 — watcher** (tax_summons_watch.py, beat entry, worker include, safe_http content-type check,
+    tests): claim -> page GET (allowlisted, 200, no-cache) -> exact-origin anchor parse, highest year, hold on
+    two distinct same-year links -> PDF stream (no redirects, https, 30 MB cap, deadline, application/pdf,
+    %PDF-) in a private temp dir -> record. Task soft/hard limits ~10/12 min, beat expiry, DB lock/statement
+    timeouts. Alerts after commit (send_ops_alert, no PII): new copy (key = version), daily reminder while
+    current is pending (key = version + day), hold episodes (key = county + status).
+- [ ] ~~**Phase B — summons watcher.**~~ (original wording, superseded by B1/B2 above) Daily beat: find the PDF from the county foreclosure page (not a fixed URL),
   hash it, record last-checked; a new digest opens a pending version and alerts ops. Fetch failures / replacement by
   sale results are source-health events, bounded. Tests. Must handle the county re-serving an OLDER digest
   (open_version then only moves last_checked_at on a superseded row): "current copy" = the digest served now, not the

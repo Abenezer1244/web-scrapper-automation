@@ -4,9 +4,14 @@ Douglas WA files one summons a year and re-uploads the scanned PDF as parcels re
 stamping those rows REDEEMED with a strike line OCR cannot read. So every distinct
 digest is a version an operator reviews by hand:
 
-  open_version   a digest seen for the first time becomes a pending version, next in
-                 seen_order (the watcher, Phase B); a digest seen again only moves
-                 last_checked_at.
+  claim_watch / record_observation
+                 the watcher (Phase B) claims the county (a fencing token) BEFORE it
+                 fetches, then records what it found: the copy it confirmed the county
+                 serves (a new digest becomes a pending version) or a hold
+                 (link_missing, page_failed, download_failed, ambiguous, rollback). A late
+                 run holding a stale token is refused, so it never overwrites a newer one.
+  serving_status the Phase C predicate: the county's current copy is published and was
+                 confirmed recently by the database clock, else a typed hold.
   set_manifest   the operator's reading of the PDF: its case number and how many rows
                  each exhibit page holds. A load must account for exactly those rows.
   draft_rows     a starting file: the case's last published rows, each marked
@@ -16,7 +21,7 @@ digest is a version an operator reviews by hand:
   load_rows      the operator's confirmed rows, stored under a new revision (rows are
                  never edited or deleted).
   publish        approves one named revision, so what is published is what the operator
-                 saw; refused unless the version is still the newest digest seen.
+                 saw; refused unless the version is the copy the county serves now.
 
 A parcel the county stamped redeemed stays out of later versions of the same case until
 a published version reinstates it with a reason code: the latest published decision on
@@ -36,9 +41,10 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from src.db.models import TaxSummonsEvent as Event
+from src.db.models import TaxSummonsObservation as Observation
 from src.db.models import TaxSummonsRow as Row
 from src.db.models import TaxSummonsVersion as Version
 
@@ -59,6 +65,17 @@ _TEXT_KEYS = ("vested_owner", "taxpayer", "property_address", "mailing_address")
 _MAX_AMOUNT = Decimal("10000000")
 _AMOUNT = re.compile(r"\$?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?")
 _MAX_PAGE, _MAX_ROWS_PER_PAGE, _MAX_ROWS = 9999, 50, 500
+
+# A watcher check that did not confirm the county's copy. Each holds the county's tax
+# leads at once (Phase C), whatever the last confirmed copy was.
+HOLD_STATUSES = ("link_missing", "page_failed", "download_failed", "ambiguous", "rollback")
+# How long a confirmed copy stays servable without a newer confirmation: a daily watcher
+# plus a missed day and a retry. Past it, Phase C holds as 'stale'.
+CONFIRMATION_TTL_HOURS = 36
+# The county page each summons is linked from: the watcher reads it, and the PDF it links
+# must come from the same HTTPS origin. Nothing else is ever fetched for a county.
+SUMMONS_PAGES = {("douglas", "WA"): "https://www.douglascountywa.gov/163/Tax-Foreclosure-Information"}
+MAX_SUMMONS_BYTES = 30_000_000  # the 2026 summons is 4.9 MB
 
 
 class TaxReviewError(Exception):
@@ -102,13 +119,12 @@ def _event(db, v: Version, action: str, actor: str, **kw) -> None:
     db.add(Event(version_id=v.id, revision=v.revision, action=action, actor=actor, **kw))
 
 
-def open_version(db, *, county: str, state: str, source_url: str, sha256: str) -> tuple[str, bool]:
-    """The version for this digest, created pending if it is new. Returns (id, created)."""
-    county, state = _county_key(county, state)
+def _open_version(db, *, county: str, state: str, source_url: str, sha256: str) -> tuple[str, bool]:
+    """The version for this digest, created pending if it is new. Returns (id, created).
+    The caller holds the county lock and records the observation (record_observation)."""
     sha256 = sha256.lower()
     if not re.fullmatch(r"[0-9a-f]{64}", sha256):
         raise TaxReviewError("sha256 is not a hex digest")
-    _lock_county(db, county, state)
     now = datetime.now(UTC)
     v = db.execute(select(Version).where(Version.county == county, Version.state == state,
                                          Version.sha256 == sha256)
@@ -143,14 +159,121 @@ def _established_case(db, v: Version) -> str | None:
     mistake, never becomes the rule for the next one)."""
     return db.execute(select(Version.case_number).where(
         Version.county == v.county, Version.state == v.state, Version.id != v.id,
-        Version.published_at.is_not(None)).order_by(Version.seen_order.desc()).limit(1)).scalar()
+        Version.published_at.is_not(None)).order_by(Version.published_seq.desc()).limit(1)).scalar()
 
 
-def _require_newest(db, v: Version) -> None:
-    newer = db.execute(select(Version.id).where(Version.county == v.county, Version.state == v.state,
-                                                Version.seen_order > v.seen_order).limit(1)).first()
-    if newer is not None:
-        raise TaxReviewError("a newer copy of the summons has been seen; review that one instead")
+def _observation(db, county: str, state: str) -> Observation:
+    """The county's observation row, read fresh and locked (created, unobserved, on first
+    use). The caller holds the county lock."""
+    obs = db.execute(select(Observation).where(Observation.county == county, Observation.state == state)
+                     .with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+    if obs is None:
+        obs = Observation(county=county, state=state, status="unknown", claim_token=0)
+        db.add(obs)
+        db.flush()
+    return obs
+
+
+def current_copy(db, version_id) -> tuple[str, str] | None:
+    """(link_url, sha256) when this version is the copy the watcher last confirmed its
+    county serves and the latest check found nothing wrong; else None. The URL is the one
+    the watcher confirmed, which can be newer than the version's first-seen address."""
+    vid = _version_id(version_id)
+    row = db.execute(select(Observation.link_url, Version.sha256).join(
+        Version, Version.id == Observation.current_version_id)
+        .where(Observation.current_version_id == vid, Observation.status == "ok")).one_or_none()
+    return None if row is None else (row[0], row[1])
+
+
+def _require_current(db, v: Version) -> None:
+    current = db.execute(select(Observation.current_version_id).where(
+        Observation.county == v.county, Observation.state == v.state, Observation.status == "ok")).scalar()
+    if current != v.id:
+        raise TaxReviewError("this is not the copy the county serves now (the watcher has confirmed "
+                             "another, or its latest check is a hold); review the current one")
+
+
+def claim_watch(db, *, county: str, state: str, lease_seconds: int) -> int | None:
+    """Claim the county for one watcher run, BEFORE anything is fetched. Returns the run's
+    fencing token, or None while another run's lease is still live."""
+    county, state = _county_key(county, state)
+    _lock_county(db, county, state)
+    obs = _observation(db, county, state)
+    # The wall clock after the lock was won, not the transaction's start.
+    live = db.execute(select(Observation.claim_expires_at > func.clock_timestamp()).where(
+        Observation.county == county, Observation.state == state)).scalar()
+    if live:
+        return None
+    obs.claim_token += 1
+    obs.claim_expires_at = func.clock_timestamp() + text(f"interval '{int(lease_seconds)} seconds'")
+    db.flush()
+    return obs.claim_token
+
+
+def record_observation(db, *, county: str, state: str, token: int, hold: str | None = None,
+                       source_url: str | None = None, link_year: int | None = None,
+                       sha256: str | None = None) -> dict:
+    """Record one watcher run's result, if its claim is still the latest (fencing).
+
+    A hold keeps the last confirmed copy for diagnosis but stops it being served. A link
+    year lower than one already confirmed is a rollback hold, never a confirmation.
+    Returns {"status", "version_id", "created", "published"}."""
+    county, state = _county_key(county, state)
+    _lock_county(db, county, state)
+    obs = _observation(db, county, state)
+    if obs.claim_token != token:
+        raise TaxReviewError("a newer watcher run has claimed this county; this run's result is stale")
+    live = db.execute(select(Observation.claim_expires_at > func.clock_timestamp()).where(
+        Observation.county == county, Observation.state == state)).scalar()
+    if token <= 0 or not live:  # never claimed, already recorded (a replay), or its lease ran out
+        raise TaxReviewError("this run holds no live claim; its result is not recorded")
+    if hold is None and obs.max_link_year is not None and link_year is not None and link_year < obs.max_link_year:
+        hold = "rollback"
+    # Every field of the result is set together and written once: the database takes a
+    # result only as a whole (tax_summons_observations_guard).
+    if hold is not None:
+        if hold not in HOLD_STATUSES:
+            raise TaxReviewError(f"unknown hold {hold!r}")
+        obs.claim_expires_at, obs.checked_at, obs.status = None, func.now(), hold
+        if hold == "rollback":
+            obs.link_url, obs.link_year = source_url, link_year
+        db.flush()
+        return {"status": hold, "version_id": obs.current_version_id, "created": False, "published": False}
+    if not (source_url and link_year and sha256):
+        raise TaxReviewError("a confirmed copy needs its URL, link year and digest")
+    vid, created = _open_version(db, county=county, state=state, source_url=source_url, sha256=sha256)
+    obs.claim_expires_at, obs.checked_at = None, func.now()  # the claim is consumed with the result
+    obs.status, obs.current_version_id, obs.confirmed_at = "ok", vid, func.now()
+    obs.link_url, obs.link_year = source_url, link_year
+    obs.max_link_year = max(link_year, obs.max_link_year or link_year)
+    db.flush()
+    status = db.execute(select(Version.status).where(Version.id == vid)).scalar()
+    return {"status": "ok", "version_id": vid, "created": created, "published": status == "published"}
+
+
+def serving_status(db, *, county: str, state: str) -> tuple[str, str | None]:
+    """Whether the county's tax leads may be served now: ("ok", version_id) when the
+    current copy is published and was confirmed within CONFIRMATION_TTL_HOURS of the
+    database clock; otherwise (reason, version_id), the reason one of HOLD_STATUSES,
+    "unobserved", "unpublished", "superseded" or "stale". Phase C asks this when it
+    selects rows and again before it delivers."""
+    county, state = _county_key(county, state)
+    row = db.execute(
+        select(Observation.status, Observation.current_version_id, Version.status,
+               Observation.confirmed_at
+               > func.statement_timestamp() - text(f"interval '{CONFIRMATION_TTL_HOURS} hours'"))
+        .outerjoin(Version, Version.id == Observation.current_version_id)
+        .where(Observation.county == county, Observation.state == state)).one_or_none()
+    if row is None or row[0] == "unknown":
+        return "unobserved", None
+    obs_status, vid, version_status, fresh = row
+    if obs_status != "ok":
+        return obs_status, vid  # a hold, even before any copy was ever confirmed
+    if version_status != "published":
+        return ("superseded" if version_status == "superseded" else "unpublished"), vid
+    if not fresh:
+        return "stale", vid
+    return "ok", vid
 
 
 def set_manifest(db, version_id, *, case_number: str, rows_per_page: dict[int, int], actor: str,
@@ -163,7 +286,7 @@ def set_manifest(db, version_id, *, case_number: str, rows_per_page: dict[int, i
     mistyped case number from hiding the parcels the county stamped redeemed."""
     v = _lock_version(db, version_id)
     _require_pending(v, "takes a manifest")
-    _require_newest(db, v)
+    _require_current(db, v)
     _require_same_pdf(v, pdf_sha256)
     case_number = (case_number or "").strip()
     if not _CASE.fullmatch(case_number):
@@ -204,7 +327,7 @@ def _prior_published(db, v: Version) -> Version | None:
     return db.execute(select(Version).where(
         Version.county == v.county, Version.state == v.state, Version.id != v.id,
         Version.case_number == v.case_number, Version.published_at.is_not(None))
-        .order_by(Version.seen_order.desc()).limit(1)).scalar_one_or_none()
+        .order_by(Version.published_seq.desc()).limit(1)).scalar_one_or_none()
 
 
 def draft_rows(db, version_id) -> dict:
@@ -325,15 +448,15 @@ def _parse_row(raw, i: int, parcel_shape: re.Pattern) -> dict:
 
 
 def _blocked_parcels(db, v: Version) -> set[str]:
-    """Parcels whose latest published decision in this case is 'redeemed'. Latest by the
-    order copies were seen (immutable), never by a timestamp."""
+    """Parcels whose latest published decision in this case is 'redeemed'. Latest in
+    publication order (published_seq, set by the database), never by a timestamp."""
     decisions = db.execute(
         select(Row.parcel_id, Row.eligibility)
         .join(Version, (Version.id == Row.version_id) & (Version.published_revision == Row.revision))
         .where(Version.county == v.county, Version.state == v.state, Version.case_number == v.case_number,
                Version.published_at.is_not(None), Version.id != v.id,
                Row.eligibility.in_(("redeemed", "eligible")), Row.parcel_id.is_not(None))
-        .order_by(Version.seen_order)).all()
+        .order_by(Version.published_seq)).all()
     latest: dict[str, str] = {}
     for parcel, eligibility in decisions:
         latest[parcel] = eligibility
@@ -409,7 +532,7 @@ def load_rows(db, version_id, payload, *, actor: str) -> tuple[int, dict[str, in
 def publish(db, version_id, *, actor: str, expected_revision: int, pdf_sha256: str) -> str | None:
     """Approve revision ``expected_revision`` of a pending version, checked against the
     operator's copy of its PDF: it becomes the county's published version and the previous
-    one is superseded (so is any older pending copy). Returns the superseded published
+    one is superseded (so is every other pending copy). Returns the superseded published
     version's id, if any."""
     v = _lock_version(db, version_id)
     _require_pending(v, "can be published")
@@ -425,10 +548,9 @@ def publish(db, version_id, *, actor: str, expected_revision: int, pdf_sha256: s
     for r in rows:  # rows can reach the table past load_rows; the format still binds
         if r.parcel_id is not None and not shape.fullmatch(r.parcel_id):
             raise TaxReviewError(f"page {r.page} row {r.row_no}: parcel is not in this county's parcel format")
+    _require_current(db, v)
     county_versions = db.execute(select(Version).where(Version.county == v.county, Version.state == v.state)
                                  .execution_options(populate_existing=True)).scalars().all()
-    if any(o.seen_order > v.seen_order for o in county_versions):
-        raise TaxReviewError("a newer copy of the summons has been seen; review that one instead")
     _check_redemptions(db, v, [{"page": r.page, "row_no": r.row_no, "parcel_id": r.parcel_id,
                                 "eligibility": r.eligibility, "reinstate_reason": r.reinstate_reason}
                                for r in rows])
@@ -455,5 +577,7 @@ def counts_by_eligibility(db, version_id) -> dict[str, int]:
     return counts
 
 
-__all__ = ["ELIGIBILITY", "EXCLUDE_REASONS", "REINSTATE_REASONS", "TaxReviewError", "counts_by_eligibility",
-           "draft_rows", "load_rows", "open_version", "publish", "set_manifest"]
+__all__ = ["CONFIRMATION_TTL_HOURS", "ELIGIBILITY", "EXCLUDE_REASONS", "HOLD_STATUSES", "REINSTATE_REASONS",
+           "MAX_SUMMONS_BYTES", "SUMMONS_PAGES", "TaxReviewError", "claim_watch", "counts_by_eligibility",
+           "current_copy", "draft_rows", "load_rows", "publish", "record_observation", "serving_status",
+           "set_manifest"]

@@ -30,10 +30,12 @@ from src.db.session import sync_engine
 from src.utils.crypto import blind_index
 from src.workers.tax_summons import (
     TaxReviewError,
+    claim_watch,
     draft_rows,
     load_rows,
-    open_version,
     publish,
+    record_observation,
+    serving_status,
     set_manifest,
 )
 from tests.test_privacy_authorize import _keyring  # noqa: F401 -- autouse keyring
@@ -79,6 +81,16 @@ def c():
 def db(c):
     with c.session_factory() as s:
         yield s
+
+
+def open_version(db, *, county: str, state: str, source_url: str, sha256: str) -> tuple[str, bool]:
+    """What the watcher does when it confirms the county serves these bytes: claim the
+    county, then record the copy (the only way a version comes to exist)."""
+    token = claim_watch(db, county=county, state=state, lease_seconds=600)
+    assert token is not None
+    seen = record_observation(db, county=county, state=state, token=token, source_url=source_url,
+                              link_year=2026, sha256=sha256)
+    return seen["version_id"], seen["created"]
 
 
 def _digest(tag: str) -> str:
@@ -431,7 +443,7 @@ def test_publish_refuses_when_a_newer_copy_was_seen(db):
     v1 = _version(db, "v1")
     rev = _load(db, v1, _row(6, 1, _A), _row(6, 2, _B))
     _version(db, "v2")
-    with pytest.raises(TaxReviewError, match="newer copy"):
+    with pytest.raises(TaxReviewError, match="serves now"):
         publish(db, v1, actor="op-1", expected_revision=rev, pdf_sha256=_sha(db, v1))
     assert db.get(Version, v1).status == "pending"
 
@@ -481,7 +493,7 @@ def test_a_direct_publish_of_an_older_copy_is_refused(db):
     v1 = _version(db, "v1")
     _load(db, v1, _row(6, 1, _A), _row(6, 2, _B))
     _version(db, "v2")
-    _refused(db, _RAW_PUBLISH, {"v": v1}, match="newer copy")
+    _refused(db, _RAW_PUBLISH, {"v": v1}, match="serves now")
 
 
 def _raw_eligible_rows(db, vid: str, reinstate: str | None = None) -> None:
@@ -544,10 +556,10 @@ def test_a_mistaken_new_case_on_a_pending_copy_does_not_become_the_rule(db):
 def test_an_older_copy_takes_no_manifest(db):
     v1, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
     _version(db, "v2")
-    with pytest.raises(TaxReviewError, match="newer copy"):
+    with pytest.raises(TaxReviewError, match="serves now"):
         set_manifest(db, v1, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, v1))
     _refused(db, "UPDATE tax_summons_versions SET case_number = :c, manifest = '{\"6\": 2}', "
-                 "revision = revision + 1 WHERE id = :v", {"v": v1, "c": _CASE}, match="newer copy")
+                 "revision = revision + 1 WHERE id = :v", {"v": v1, "c": _CASE}, match="serves now")
 
 
 def test_a_page_past_9999_is_refused_by_review(db):
@@ -560,7 +572,7 @@ def test_only_a_newer_publication_supersedes_a_copy(db):
     vid = _version(db, "v1")
     db.execute(text("SET CONSTRAINTS tax_summons_versions_superseded IMMEDIATE"))
     _refused(db, "UPDATE tax_summons_versions SET status = 'superseded' WHERE id = :v", {"v": vid},
-             match="superseded only by a newer published one")
+             match="superseded only by another published one")
     db.execute(text("SET CONSTRAINTS tax_summons_versions_superseded DEFERRED"))  # as at commit
     rev = _load(db, vid, _row(6, 1, _A), _row(6, 2, _B))
     publish(db, vid, actor="op-1", expected_revision=rev, pdf_sha256=_sha(db, vid))
@@ -578,9 +590,9 @@ def test_the_order_copies_were_seen_is_the_databases(db):
     orders = db.execute(text("SELECT sha256, seen_order FROM tax_summons_versions WHERE county = 'douglas' "
                              "ORDER BY seen_order")).all()
     assert [o.seen_order for o in orders] == [1, 2] and orders[1].sha256 == _digest("v2")
-    with pytest.raises(TaxReviewError, match="newer copy"):  # the backdated copy still counts as newer
-        publish(db, v1, actor="op-1", expected_revision=_load(db, v1, _row(6, 1, _A), _row(6, 2, _B)),
-                pdf_sha256=_sha(db, v1))
+    # A copy that reached the table without the watcher is not the county's current copy.
+    rev = _load(db, v1, _row(6, 1, _A), _row(6, 2, _B))
+    publish(db, v1, actor="op-1", expected_revision=rev, pdf_sha256=_sha(db, v1))
 
 
 @pytest.mark.parametrize("manifest", ['{"6": 2, "7": 0}', '{"6": 2, "6": 3}', '{"0": 1}', '{"06": 1}',
@@ -803,6 +815,224 @@ def test_the_system_role_reviews_but_never_rewrites_rows_or_audit(db, provisione
                       {"v": vid}).scalar() == 0
 
 
+# ── the watcher's observation: claim, fencing, holds, what may be served ──
+
+def _expire_lease(db) -> None:
+    """Move the current claim's lease into the past (test-only clock move)."""
+    with db.begin_nested():
+        db.execute(text("SET LOCAL session_replication_role = replica"))
+        db.execute(text("UPDATE tax_summons_observations SET claim_expires_at = now() - interval '1 second' "
+                        "WHERE county = 'douglas'"))
+
+
+def _claim(db) -> int:
+    token = claim_watch(db, county="douglas", state="WA", lease_seconds=600)
+    assert token is not None
+    return token
+
+
+def _observe(db, tag: str, *, year: int = 2026) -> dict:
+    return record_observation(db, county="douglas", state="WA", token=_claim(db), source_url=_URL,
+                              link_year=year, sha256=_digest(tag))
+
+
+def _serving(db) -> tuple[str, str | None]:
+    return serving_status(db, county="douglas", state="WA")
+
+
+def test_a_live_claim_keeps_a_second_watcher_out_until_it_records(db):
+    token = _claim(db)
+    assert claim_watch(db, county="douglas", state="WA", lease_seconds=600) is None
+    record_observation(db, county="douglas", state="WA", token=token, hold="page_failed")
+    assert _claim(db) == token + 1
+
+
+def test_a_run_whose_claim_was_taken_over_cannot_record(db):
+    stale = _claim(db)
+    _expire_lease(db)  # a worker died mid-fetch
+    fresh = _claim(db)
+    assert fresh == stale + 1
+    with pytest.raises(TaxReviewError, match="newer watcher run"):
+        record_observation(db, county="douglas", state="WA", token=stale, source_url=_URL, link_year=2026,
+                           sha256=_digest("late"))
+    assert db.execute(text("SELECT count(*) FROM tax_summons_versions")).scalar() == 0
+
+
+def test_what_may_be_served(db):
+    assert _serving(db) == ("unobserved", None)
+    vid = _observe(db, "v1")["version_id"]
+    assert _serving(db) == ("unpublished", vid)
+    set_manifest(db, vid, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, vid))
+    _publish(db, vid)
+    assert _serving(db) == ("ok", vid)
+    for hold in ("link_missing", "page_failed", "download_failed", "ambiguous"):
+        record_observation(db, county="douglas", state="WA", token=_claim(db), hold=hold)
+        assert _serving(db) == (hold, vid)  # the last confirmed copy is kept, not served
+    assert _observe(db, "v1")["status"] == "ok"
+    assert _serving(db) == ("ok", vid)
+
+
+def test_a_confirmation_goes_stale(db):
+    vid = _version(db, "v1")
+    _publish(db, vid)
+    with db.begin_nested():  # a day and a half with no confirmation (test-only clock move)
+        db.execute(text("SET LOCAL session_replication_role = replica"))
+        db.execute(text("UPDATE tax_summons_observations SET confirmed_at = now() - interval '37 hours' "
+                        "WHERE county = 'douglas'"))
+    assert _serving(db) == ("stale", vid)
+
+
+def test_an_earlier_years_link_after_a_later_one_is_a_rollback_hold(db):
+    vid = _version(db, "v1")
+    _publish(db, vid)
+    seen = _observe(db, "v0", year=2025)
+    assert (seen["status"], seen["version_id"], seen["created"]) == ("rollback", vid, False)
+    assert _serving(db) == ("rollback", vid)
+    assert db.execute(text("SELECT count(*) FROM tax_summons_versions")).scalar() == 1
+
+
+def test_the_county_serving_an_older_superseded_copy_holds(db):
+    a = _version(db, "a")
+    _publish(db, a)
+    b = _version(db, "b")
+    _publish(db, b)
+    assert _observe(db, "a")["version_id"] == a
+    assert _serving(db) == ("superseded", a)
+    with pytest.raises(TaxReviewError, match="only a pending version"):
+        publish(db, a, actor="op-1", expected_revision=1, pdf_sha256=_sha(db, a))
+
+
+def test_a_published_copy_served_again_after_a_pending_one_is_served(db):
+    a = _version(db, "a")
+    _publish(db, a)
+    _version(db, "b")  # pending, never published
+    assert _serving(db)[0] == "unpublished"
+    assert _observe(db, "a")["version_id"] == a
+    assert _serving(db) == ("ok", a)
+
+
+def test_a_pending_copy_served_again_can_still_be_published(db):
+    b = _version(db, "b")
+    c = _version(db, "c")
+    assert _observe(db, "b")["version_id"] == b  # the county went back to B
+    set_manifest(db, b, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, b))
+    _publish(db, b)
+    assert (db.get(Version, b).status, db.get(Version, c).status) == ("published", "superseded")
+    assert _serving(db) == ("ok", b)
+
+
+def test_nothing_is_published_during_a_hold(db):
+    a = _version(db, "a")
+    _publish(db, a)
+    b = _version(db, "b")
+    rev = _load(db, b, _row(6, 1, _A), _row(6, 2, _B))
+    record_observation(db, county="douglas", state="WA", token=_claim(db), hold="link_missing")
+    with pytest.raises(TaxReviewError, match="serves now"):
+        publish(db, b, actor="op-1", expected_revision=rev, pdf_sha256=_sha(db, b))
+    _refused(db, _RAW_PUBLISH, {"v": b}, match="serves now")
+    assert db.get(Version, a).status == "published"
+    with pytest.raises(TaxReviewError, match="serves now"):
+        set_manifest(db, b, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, b))
+
+
+def test_a_copy_is_not_superseded_by_an_earlier_publication(db):
+    _publish(db, _version(db, "a"))
+    b = _version(db, "b")
+    db.execute(text("SET CONSTRAINTS tax_summons_versions_superseded IMMEDIATE"))
+    _refused(db, "UPDATE tax_summons_versions SET status = 'superseded' WHERE id = :v", {"v": b},
+             match="superseded only by another published one")
+
+
+def test_a_result_needs_a_live_claim(db):
+    with pytest.raises(TaxReviewError, match="no live claim"):  # never claimed: token 0
+        record_observation(db, county="douglas", state="WA", token=0, hold="page_failed")
+    token = _claim(db)
+    record_observation(db, county="douglas", state="WA", token=token, source_url=_URL, link_year=2026,
+                       sha256=_digest("v1"))
+    with pytest.raises(TaxReviewError, match="no live claim"):  # a replay of a recorded result
+        record_observation(db, county="douglas", state="WA", token=token, hold="page_failed")
+    assert _serving(db)[0] == "unpublished"
+
+
+def test_an_expired_claim_cannot_record_even_without_a_takeover(db):
+    token = _claim(db)
+    _expire_lease(db)
+    with pytest.raises(TaxReviewError, match="no live claim"):
+        record_observation(db, county="douglas", state="WA", token=token, hold="page_failed")
+
+
+@pytest.mark.parametrize("change,match", [
+    ("status = 'ok'", "needs the live claim"),                                   # clear a hold, no claim
+    ("claim_token = claim_token + 1, status = 'ok'", "a claim only takes"),      # a claim that also clears it
+    ("claim_token = claim_token + 1, claim_expires_at = now() + interval '1 day'", "a claim only takes"),
+    ("claim_token = claim_token + 2, claim_expires_at = now() + interval '1 minute'", "needs the live claim"),
+])
+def test_a_hold_is_cleared_only_by_a_new_confirmation(db, change, match):
+    _publish(db, _version(db, "v1"))
+    record_observation(db, county="douglas", state="WA", token=_claim(db), hold="link_missing")
+    _refused(db, f"UPDATE tax_summons_observations SET {change} WHERE county = 'douglas'", {}, match=match)
+    assert _serving(db)[0] == "link_missing"
+
+
+def test_a_result_cannot_rewrite_the_held_copy(db):
+    _publish(db, _version(db, "v1"))
+    token = _claim(db)
+    _refused(db, "UPDATE tax_summons_observations SET claim_expires_at = NULL, status = 'page_failed', "
+                 "confirmed_at = now() WHERE county = 'douglas' AND claim_token = :t", {"t": token},
+             match="keeps the last confirmed copy")
+
+
+@pytest.mark.parametrize("columns,values", [
+    ("claim_expires_at", "now() + interval '1 day'"),
+    ("max_link_year", "2099"),
+    ("link_year", "2026"),
+    ("link_url", "'https://example.test/x.pdf'"),
+])
+def test_a_county_starts_unobserved(db, columns, values):
+    _refused(db, f"INSERT INTO tax_summons_observations (county, state, {columns}) VALUES ('douglas', 'WA', {values})",
+             {}, match="starts unobserved")
+
+
+def test_a_confirmation_keeps_the_year_high_water_mark(db):
+    _publish(db, _version(db, "v1"))  # confirmed for 2026
+    token = _claim(db)
+    _refused(db, "UPDATE tax_summons_observations SET claim_expires_at = NULL, status = 'ok', link_year = 2025 "
+                 "WHERE county = 'douglas' AND claim_token = :t", {"t": token}, match="is a rollback")
+    db.execute(text("UPDATE tax_summons_observations SET claim_expires_at = NULL, status = 'ok', link_year = 2027 "
+                    "WHERE county = 'douglas' AND claim_token = :t"), {"t": token})
+    assert db.execute(text("SELECT max_link_year FROM tax_summons_observations")).scalar() == 2027
+
+
+def test_a_hold_before_any_confirmation_is_reported_as_the_hold(db):
+    record_observation(db, county="douglas", state="WA", token=_claim(db), hold="page_failed")
+    assert _serving(db) == ("page_failed", None)
+
+
+@pytest.mark.parametrize("change,match", [
+    ("claim_token = claim_token - 1", "only moves forward"),
+    ("max_link_year = 2025", "only moves forward"),
+    ("max_link_year = NULL", "only moves forward"),
+    ("current_version_id = gen_random_uuid()", "one of this county"),
+])
+def test_the_observation_only_moves_forward(db, change, match):
+    _publish(db, _version(db, "v1"))
+    _refused(db, f"UPDATE tax_summons_observations SET {change} WHERE county = 'douglas'", {}, match=match)
+
+
+def test_the_observation_clock_is_the_databases_and_the_row_stays(db):
+    _version(db, "v1")
+    _refused(db, "UPDATE tax_summons_observations SET checked_at = '2000-01-01', confirmed_at = '2000-01-01' "
+                 "WHERE county = 'douglas'", {}, match="needs the live claim")
+    token = _claim(db)  # a result stamps the database's clock, whatever the writer sends
+    db.execute(text("UPDATE tax_summons_observations SET claim_expires_at = NULL, checked_at = '2000-01-01', "
+                    "confirmed_at = '2000-01-01' WHERE county = 'douglas' AND claim_token = :t"), {"t": token})
+    assert db.execute(text("SELECT checked_at > now() - interval '1 minute' AND confirmed_at > now() - "
+                           "interval '1 minute' FROM tax_summons_observations")).scalar()
+    _refused(db, "DELETE FROM tax_summons_observations", {}, match="never deleted")
+    _refused(db, "INSERT INTO tax_summons_observations (county, state, status) VALUES ('chelan', 'WA', 'ok')", {},
+             match="starts unobserved|ck_tax_summons_observations_ok")
+
+
 # ── races between connections (committed; cleaned up) ──
 
 @pytest.fixture
@@ -814,6 +1044,7 @@ def committed():
             conn.execute(text("SET LOCAL session_replication_role = replica"))
             ids = [r[0] for r in conn.execute(text(
                 "SELECT id FROM tax_summons_versions WHERE county = 'douglas' AND source_url = :u"), {"u": _URL})]
+            conn.execute(text("DELETE FROM tax_summons_observations WHERE county = 'douglas'"))
             for table in ("tax_summons_events", "tax_summons_rows"):
                 conn.execute(text(f"DELETE FROM {table} WHERE version_id = ANY(CAST(:i AS uuid[]))"), {"i": ids})
             conn.execute(text("DELETE FROM tax_summons_versions WHERE id = ANY(CAST(:i AS uuid[]))"), {"i": ids})
@@ -855,7 +1086,7 @@ def test_a_new_copy_opened_mid_publish_stops_the_older_copy_publishing(committed
         _wait_blocked(t)
         watcher.commit()
     t.join(10)
-    assert isinstance(out.get("error"), TaxReviewError) and "newer copy" in str(out["error"])
+    assert isinstance(out.get("error"), TaxReviewError) and "serves now" in str(out["error"])
 
 
 def test_a_load_waiting_on_a_publish_is_refused_not_applied(committed):
@@ -902,22 +1133,20 @@ def test_a_committed_revision_takes_no_more_rows(committed):
             publish(s, v1, actor="op-1", expected_revision=rev, pdf_sha256=_digest("v1"))
 
 
-def test_a_direct_publish_waits_for_an_uncommitted_newer_copy(committed):
-    """The seal trigger takes the county lock too: a raw insert of a newer copy holds it,
-    so a raw publish of the older copy waits, then sees the newer one and is refused."""
+def test_a_direct_publish_waits_for_the_watcher_recording_a_new_copy(committed):
+    """The seal trigger takes the county lock too: while the watcher records a new current
+    copy, a raw publish of the old one waits, then sees it is no longer current."""
     with Session(sync_engine) as s:
         v1 = _version(s, "v1")
         _load(s, v1, _row(6, 1, _A), _row(6, 2, _B))
         s.commit()
     with Session(sync_engine) as watcher:
-        watcher.execute(text("INSERT INTO tax_summons_versions (id, county, state, source_url, sha256, seen_order) "
-                             "VALUES (gen_random_uuid(), 'douglas', 'WA', :u, :d, 99)"),
-                        {"u": _URL, "d": _digest("v2")})
+        open_version(watcher, county="douglas", state="WA", source_url=_URL, sha256=_digest("v2"))
         t, out = _in_thread(lambda s: s.execute(text(_RAW_PUBLISH), {"v": v1}))
         _wait_blocked(t)
         watcher.commit()
     t.join(10)
-    assert isinstance(out.get("error"), DBAPIError) and "newer copy" in str(out["error"])
+    assert isinstance(out.get("error"), DBAPIError) and "serves now" in str(out["error"])
 
 
 def test_two_watchers_opening_one_digest_make_one_version(committed):
@@ -1033,7 +1262,7 @@ def test_a_draft_written_before_a_cleanup_failure_is_reported_as_written(c, db, 
             s.execute(text("SELECT * FROM tax_summons_no_such_table"))  # a real error on the way out
 
     out = tmp_path / "rows.json"
-    with pytest.raises(SystemExit, match="the draft file was written; closing the session failed"):
+    with pytest.raises(SystemExit, match="the --out file was written; closing the session failed"):
         cli.main(["--operator-email", email, "draft", "--version", vid, "--out", str(out)],
                  auth_factory=c.session_factory, session_factory=failing_close)
     assert out.exists()
@@ -1049,6 +1278,26 @@ def test_show_never_sends_a_control_character_to_the_terminal(c, db, capsys):
     _run(c, _operator(c), "show", "--version", vid)
     shown = capsys.readouterr().out
     assert _ESC not in shown and "OWNER" + chr(92) + "x1b[2K" in shown  # shown as a visible escape
+
+
+def test_fetch_refuses_a_copy_the_county_no_longer_serves(c, db, tmp_path):
+    v1 = _version(db, "v1")
+    _version(db, "v2")
+    db.commit()
+    out = tmp_path / "summons.pdf"
+    with pytest.raises(SystemExit, match="not the copy the county serves now"):
+        _run(c, _operator(c), "fetch", "--version", v1, "--out", str(out))
+    assert not out.exists()
+
+
+def test_fetched_bytes_must_be_this_versions_pdf():
+    pdf = b"%PDF-1.3 the county's summons"
+    sha = hashlib.sha256(pdf).hexdigest()
+    assert cli.verified_summons(pdf, sha) == pdf
+    with pytest.raises(SystemExit, match="different bytes"):
+        cli.verified_summons(pdf + b" re-stamped", sha)
+    with pytest.raises(SystemExit, match="not a PDF"):
+        cli.verified_summons(b"<html>sale results</html>", hashlib.sha256(b"<html>sale results</html>").hexdigest())
 
 
 def test_the_cli_refuses_an_operator_without_mfa(c, db):

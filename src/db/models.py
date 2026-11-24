@@ -2100,6 +2100,7 @@ class TaxSummonsVersion(Base):
     __table_args__ = (
         UniqueConstraint("county", "state", "sha256", name="uq_tax_summons_versions_digest"),
         UniqueConstraint("county", "state", "seen_order", name="uq_tax_summons_versions_seen"),
+        UniqueConstraint("county", "state", "published_seq", name="uq_tax_summons_versions_published_seq"),
         Index("uq_tax_summons_versions_one_published", "county", "state", unique=True,
               postgresql_where=text("status = 'published'")),
         CheckConstraint("status IN ('pending', 'published', 'superseded')", name="ck_tax_summons_versions_status"),
@@ -2112,7 +2113,9 @@ class TaxSummonsVersion(Base):
         CheckConstraint(
             "(published_at IS NULL) = (published_by IS NULL) "
             "AND (published_at IS NULL) = (published_revision IS NULL) "
-            "AND (published_at IS NULL OR (case_number IS NOT NULL AND published_revision > 0)) "
+            "AND (published_at IS NULL) = (published_seq IS NULL) "
+            "AND (published_at IS NULL OR (case_number IS NOT NULL AND published_revision > 0 "
+            "AND published_seq > 0)) "
             "AND (status <> 'published' OR published_at IS NOT NULL)",
             name="ck_tax_summons_versions_published"),
     )
@@ -2133,6 +2136,41 @@ class TaxSummonsVersion(Base):
     published_by = Column(String(64), nullable=True)
     published_at = Column(DateTime(timezone=True), nullable=True)
     published_revision = Column(Integer, nullable=True)
+    published_seq = Column(Integer, nullable=True)  # publication order, set by the seal trigger
+    superseded_after_seq = Column(Integer, nullable=True)  # set by the seal trigger when superseded
+
+
+class TaxSummonsObservation(Base):
+    """What the watcher last confirmed a county serves (migration 173): one row per county.
+
+    ``current_version_id`` is the copy confirmed at ``confirmed_at``; ``status`` is the
+    latest check's outcome (``ok``, or a hold: ``link_missing``, ``page_failed``,
+    ``download_failed``, ``ambiguous``, ``rollback``). Both clocks are the database's.
+    ``claim_token`` fences watcher runs: a run records only with the token it claimed, so a
+    late run never overwrites a newer one. Publication needs the version to be current."""
+
+    __tablename__ = "tax_summons_observations"
+    __table_args__ = (
+        CheckConstraint("status IN ('unknown', 'ok', 'link_missing', 'page_failed', 'download_failed', "
+                        "'ambiguous', 'rollback')", name="ck_tax_summons_observations_status"),
+        CheckConstraint("status <> 'ok' OR (current_version_id IS NOT NULL AND confirmed_at IS NOT NULL)",
+                        name="ck_tax_summons_observations_ok"),
+        CheckConstraint("claim_token >= 0 AND (link_year IS NULL OR link_year BETWEEN 2000 AND 2100)",
+                        name="ck_tax_summons_observations_values"),
+    )
+
+    county = Column(String(64), primary_key=True)
+    state = Column(String(4), primary_key=True)
+    status = Column(String(16), nullable=False, default="unknown", server_default="unknown")
+    current_version_id = Column(UUID(as_uuid=False), ForeignKey("tax_summons_versions.id", ondelete="RESTRICT"),
+                                nullable=True)
+    link_url = Column(Text, nullable=True)
+    link_year = Column(Integer, nullable=True)
+    max_link_year = Column(Integer, nullable=True)
+    checked_at = Column(DateTime(timezone=True), nullable=True)
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    claim_token = Column(BigInteger, nullable=False, default=0, server_default="0")
+    claim_expires_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class TaxSummonsRow(Base):

@@ -8,9 +8,11 @@ The county re-uploads the summons PDF as parcels redeem, stamping those rows RED
 Each distinct copy is a version; nothing from a version reaches customers until it is
 published here, and a newer copy holds the county's tax leads until it is published too.
 
-Steps for a new copy: download the PDF (show prints its URL and digest) and work only
-from that file: manifest and publish hash it and refuse a copy whose bytes differ (the
-county can replace the file at the same URL). Then
+Steps for a new copy (the watcher records it and alerts): download it with
+  fetch    --version V --out FILE
+           the copy the county serves now, saved owner-only after its digest is checked.
+           Work only from that file: manifest and publish hash it and refuse a copy whose
+           bytes differ (the county can replace the file at the same URL). Then
   manifest --version V --pdf FILE --case 26-2-00337-09 --pages 6:3,7:3,8:4,...
            the case number and how many rows each Exhibit A page holds, read off the PDF.
            A re-uploaded summons keeps its case; a later year's summons needs --new-case.
@@ -58,8 +60,11 @@ from src.db.models import TaxSummonsVersion as Version  # noqa: E402
 from src.utils.crypto import blind_index  # noqa: E402
 from src.workers.tax_summons import (  # noqa: E402
     TaxReviewError,
+    MAX_SUMMONS_BYTES,
+    SUMMONS_PAGES,
     counts_by_eligibility,
     draft_rows,
+    current_copy,
     load_rows,
     publish,
     set_manifest,
@@ -213,23 +218,76 @@ def _create_windows_owner_only(path: str) -> int:
         raise
 
 
-def cmd_draft(db, op, args) -> str:
-    payload = draft_rows(db, args.version)
-    db.rollback()
-    try:  # owner-only from creation: the file holds names. The path can carry a name: never echoed.
+def _create_private(path: str) -> int:
+    """A new file only its owner can read, from the moment it exists (it will hold names).
+    The path can carry a name: never echoed."""
+    try:
         if os.name == "nt":
-            fd = _create_windows_owner_only(args.out)
-        else:
-            fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            return _create_windows_owner_only(path)
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         raise SystemExit("the --out file exists; give a new file") from None
     except OSError as exc:
         if getattr(exc, "winerror", None) == 80:  # ERROR_FILE_EXISTS
             raise SystemExit("the --out file exists; give a new file") from None
         raise SystemExit(f"cannot write the --out file ({type(exc).__name__})") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+
+
+def cmd_draft(db, op, args) -> str:
+    payload = draft_rows(db, args.version)
+    db.rollback()
+    with os.fdopen(_create_private(args.out), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=1)
     return f"wrote {len(payload['rows'])} row(s) to the --out file, all unconfirmed"
+
+
+def verified_summons(body: bytes, expected_sha256: str) -> bytes:
+    """The county's bytes, only if they are a PDF and exactly this version's copy."""
+    if not body.startswith(b"%PDF-"):
+        raise SystemExit("the county's file is not a PDF; nothing was written")
+    if hashlib.sha256(body).hexdigest() != expected_sha256:
+        raise SystemExit("the county now serves different bytes at this address; the watcher will record "
+                         "the new copy (review that one); nothing was written")
+    return body
+
+
+def cmd_fetch(db, op, args) -> str:
+    """Download the current copy of the summons and check it is this version's bytes."""
+    import requests
+
+    from src.api.middleware.security import add_scrape_domain
+    from src.utils.safe_http import safe_get, same_origin
+
+    v = _version(db, args.version)
+    current = current_copy(db, v.id)
+    if current is None:
+        raise SystemExit("refused: this is not the copy the county serves now (or its latest check is a "
+                         "hold); fetch the current one")
+    url, sha = current  # the address the watcher last confirmed, not the first-seen one
+    page = SUMMONS_PAGES[(v.county, v.state)]
+    if not url or not url.startswith("https://") or not same_origin(url, page):
+        raise SystemExit("refused: the recorded address is not the county's site")
+    db.rollback()  # no database work waits on the download
+    add_scrape_domain(page.split("/")[2])
+    try:
+        resp = safe_get(url, require_allowlisted=True, timeout=60, max_bytes=MAX_SUMMONS_BYTES,
+                        headers={"Cache-Control": "no-cache", "User-Agent": "Mozilla/5.0 BridgeLeads/1.0"})
+    except (ValueError, requests.RequestException) as exc:
+        raise SystemExit(f"could not download the summons ({type(exc).__name__}); nothing was written") from None
+    media_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if resp.status_code != 200 or media_type != "application/pdf":
+        raise SystemExit(f"the county answered {resp.status_code} without a PDF; nothing was written")
+    body = verified_summons(resp.content, sha)
+    # The watcher may have moved on while we downloaded: write only if this is still the
+    # county's current copy, holding the county's lock until the file is written.
+    # The lock is released when main() closes the session, after it has noted the file
+    # as written (so a failure closing the session is never reported as "nothing written").
+    db.execute(text("SELECT pg_advisory_xact_lock(7173, hashtext(:k))"), {"k": f"{v.county}/{v.state}"})
+    if current_copy(db, v.id) != (url, sha):
+        raise SystemExit("refused: the county's current copy changed during the download; fetch again")
+    with os.fdopen(_create_private(args.out), "wb") as f:
+        f.write(body)
+    return f"wrote the summons ({len(body):,} bytes, digest {sha[:12]} verified) to the --out file"
 
 
 class _DuplicateKeyError(ValueError):
@@ -262,8 +320,8 @@ def cmd_publish(db, op, args) -> str:
 
 
 # list/show print as they go; the others return what to say once their work is kept.
-_COMMANDS = {"list": cmd_list, "show": cmd_show, "manifest": cmd_manifest, "draft": cmd_draft,
-             "load": cmd_load, "publish": cmd_publish}
+_COMMANDS = {"list": cmd_list, "show": cmd_show, "fetch": cmd_fetch, "manifest": cmd_manifest,
+             "draft": cmd_draft, "load": cmd_load, "publish": cmd_publish}
 _DATABASE_WRITES = {"manifest", "load", "publish"}
 
 
@@ -281,6 +339,9 @@ def _parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="command", required=True)  # subparsers are _QuietParser too
     sub.add_parser("list")
     sub.add_parser("show").add_argument("--version", required=True)
+    p = sub.add_parser("fetch")
+    p.add_argument("--version", required=True)
+    p.add_argument("--out", required=True)
     p = sub.add_parser("manifest")
     p.add_argument("--version", required=True)
     p.add_argument("--case", required=True)
@@ -339,14 +400,14 @@ def main(argv=None, auth_factory=operator_session, session_factory=None) -> None
                 stage = _UNKNOWN  # a commit that fails mid-way may still have landed
                 db.commit()
                 stage = "the change was saved; closing the session failed"
-            elif done is not None:  # draft: the file is written, the database untouched
-                stage = "the draft file was written; closing the session failed"
-            if done is not None:
-                print(done)
+            elif done is not None:  # draft / fetch: the file is written, the database untouched
+                stage = "the --out file was written; closing the session failed"
     except TaxReviewError as exc:
         raise SystemExit(f"refused: {exc}") from None
     except SQLAlchemyError as exc:
         raise _database_error(exc, stage) from None
+    if done is not None:  # only once the session (and any lock it held) is closed
+        print(done)
 
 
 if __name__ == "__main__":

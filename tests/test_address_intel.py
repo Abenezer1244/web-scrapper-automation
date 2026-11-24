@@ -511,7 +511,6 @@ class TestPunctuationAndSpacing:
             ("123 MAIN ST UNIT A 12345, SEATTLE, WA", "123 MAIN ST UNIT A, SEATTLE, WA"),
             ("123 MAIN ST BLDG 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 2, SEATTLE, WA 98101"),
             ("1420 E PINE ST UNIT A WA, SEATTLE, WA 98122", "1420 E PINE ST UNIT A, SEATTLE, WA 98122"),
-            ("1420 E PINE ST APT 5, SEATTLE, WA 98122", "1420 E PINE ST SPC 5, SEATTLE, WA 98122"),
             ("123 MAIN ST UNIT 1. 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 2, SEATTLE, WA 98101"),
             ("123 MAIN ST UNIT 5 & 6, SEATTLE, WA 98101", "123 MAIN ST UNIT 5 6, SEATTLE, WA 98101"),
             ("123 MAIN ST LOT 1 UNIT 2, SEATTLE, WA 98101", "123 MAIN ST LOT 2 UNIT 1, SEATTLE, WA 98101"),
@@ -603,3 +602,8 @@ class TestPunctuationAndSpacing:
         for a, b in (("1420 E PINE ST APT 5", "1420 E PINE ST UNIT 5"), ("1420 E PINE ST STE 5", "1420 E PINE ST #5"),
                      ("1420 E PINE ST SPC 5", "1420 E PINE ST # 5")):
             assert compute_owner_flags(f"{a}, SEATTLE, WA 98122", f"{b}, SEATTLE, WA 98122")["absentee_owner"] is False, a
+
+    def test_mobile_home_space_and_unit_are_one_dwelling(self):
+        # 17 owner-occupied Snohomish leads (2026-11-24): county "SPC 91", mail "UNIT 91".
+        f = compute_owner_flags("3333 228TH ST SE SPC 91, BOTHELL, WA 98021", "3333 228TH ST SE UNIT 91, BOTHELL, WA 98021")
+        assert f["absentee_owner"] is False

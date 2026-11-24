@@ -232,16 +232,21 @@ def _street_units(parsed: dict) -> str | None:
                      trim_state=not parsed.get("state"))
 
 
+# Kinds that name the one dwelling at an address. A lone one of these is just spelling:
+# "SPC 91" (county) and "UNIT 91" (owner's mail) are the same mobile home, measured on 17
+# owner-occupied Snohomish leads (2026-11-24); Codex's "APT 5" != "SPC 5" was rejected on
+# that evidence. Building, floor, dept and box stay distinct ("BLDG 2" != "UNIT 2").
+_DWELLING_KINDS = frozenset("HUSLRT")
+
+
 def _units_differ(a: str | None, b: str | None) -> bool:
-    """Two explicit units name two places. A bare "#" (kind H) is generic and matches any
-    single named kind ("SPC 9" == "#9"); named kinds stay apart ("APT 5" != "SPC 5",
-    Codex); UNIT/APT/STE are one kind. With several groups, "#" reads as a unit."""
+    """Two explicit units name two places (owner decision 2026-11-24)."""
     if not a or not b or a == b:
         return False
     ga, gb = a.split("|"), b.split("|")
     if len(ga) == 1 and len(gb) == 1:
         (ka, va), (kb, vb) = ga[0].split(":", 1), gb[0].split(":", 1)
-        return va != vb or ("H" not in (ka, kb) and ka != kb)
+        return va != vb or not (ka == kb or {ka, kb} <= _DWELLING_KINDS)
     return a.replace("H:", "U:") != b.replace("H:", "U:")
 
 
@@ -262,10 +267,12 @@ def _unit_ids(street: str | None, zip_in_street: bool = False,
     a trailing state / ZIP still sits in the street and is trimmed. Otherwise a 5-digit
     chunk is a unit id ("UNIT A 12345", Codex).
 
-    KNOWN LIMIT (owner-accepted 2026-11-24, Codex round 45): on a comma-less line,
-    parse_property_for_display lifts a trailing 5-digit number as the ZIP before this sees
-    it, so "UNIT A 98101" with ZIP 98101 reads as unit "A". Fixing it means changing the
-    shared parser every county uses; not seen in production data.
+    KNOWN LIMIT (owner-accepted 2026-11-24, Codex rounds 45 and 47): a unit whose last part
+    equals the address's own ZIP ("UNIT A 98101 ... 98101") reads as unit "A". The parser
+    lifts such a number on comma-less lines, and a county situs often repeats its ZIP after
+    the unit (52 real leads, "1420 E PINE ST #409 98122"), so it is trimmed here too.
+    Telling the two apart needs a change to the shared parser every county uses; no real
+    unit of that shape was seen in production.
     """
     s = _glue_named_units(_keep_meaningful_dots(street or "")).upper()
     s = _UNIT_LETTER_DIGIT_DOT_RE.sub("\u00b7", s)

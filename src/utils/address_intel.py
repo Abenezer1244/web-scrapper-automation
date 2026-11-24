@@ -205,6 +205,9 @@ _UNIT_START_RE = re.compile(
     rf"#|\b(?:{_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b", re.IGNORECASE)
 
 
+_UNIT_KIND = {"BLDG": "B", "BLD": "B", "FL": "F", "FLR": "F", "FLOOR": "F", "DEPT": "D", "BOX": "X"}
+
+
 def _unit_ids(street: str | None) -> str | None:
     """Every id in the unit tail, joined: "BLDG 1 UNIT 5" -> "15", "UNIT 5." -> "5",
     "#G304" and "UNIT G 304" -> "G304". Designator words, "#" and punctuation are dropped,
@@ -218,21 +221,25 @@ def _unit_ids(street: str | None) -> str | None:
     # One group per marker, so "BLDG 1 UNIT 23" ("1|23") never equals "BLDG 12 UNIT 3"
     # ("12|3"); the token right after a marker is always an id, so "UNIT FL" keeps "FL"
     # (Codex). Ids inside a group are joined: "UNIT G 304" == "#G304".
-    groups: list[str] = []
+    # Each group is "<kind>:<id>" (building vs floor vs unit), and groups compare as a set,
+    # so "BLDG 1 UNIT 23" != "UNIT 1 BLDG 23" but == "UNIT 23 BLDG 1" (Codex). A hyphen
+    # between digits stays ("1-23" != "12-3"); one between a letter and a digit does not
+    # ("F-203" == "F203").
+    groups: list[list[str]] = []
     expecting_id = False
-    for tok in re.findall(r"#|[A-Z0-9]+", s[m.start():]):
+    for tok in re.findall(r"#|[A-Z0-9]+(?:-[A-Z0-9]+)*", s[m.start():]):
         is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
         if is_marker and not expecting_id:
-            groups.append("")
+            groups.append([_UNIT_KIND.get(tok, "U"), ""])
             expecting_id = True
         elif tok == "#":
             continue  # "UNIT #5": the "#" belongs to the marker
         else:
             if not groups:
-                groups.append("")
-            groups[-1] += tok
+                groups.append(["U", ""])
+            groups[-1][1] += re.sub(r"(?<=[A-Z])-(?=\d)|(?<=\d)-(?=[A-Z])", "", tok)
             expecting_id = False
-    ids = "|".join(g for g in groups if g)
+    ids = "|".join(sorted(f"{k}:{v}" for k, v in groups if v))
     return ids or None
 
 

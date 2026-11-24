@@ -499,6 +499,8 @@ class TestPunctuationAndSpacing:
             ("1200 5TH AVE BLDG 1 UNIT 5, SEATTLE, WA 98101", "1200 5TH AVE BLDG 2 UNIT 5, SEATTLE, WA 98101"),
             ("123 MAIN ST BLDG 1 UNIT 23, SEATTLE, WA 98101", "123 MAIN ST BLDG 12 UNIT 3, SEATTLE, WA 98101"),
             ("123 MAIN ST UNIT FL, SEATTLE, WA 98101", "123 MAIN ST UNIT RM, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 1-23, SEATTLE, WA 98101", "123 MAIN ST UNIT 12-3, SEATTLE, WA 98101"),
+            ("123 MAIN ST BLDG 1 UNIT 23, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 BLDG 23, SEATTLE, WA 98101"),
             ("123 COUNTY ROAD NO. #5, WA 98801", "123 COUNTY ROAD NO. #6, WA 98801"),
             ("120 OLD LOT 5 WY, TACOMA, WA 98402", "120 OLD LOT 6 WY, TACOMA, WA 98402"),
             ("123 COUNTY ROAD #5.5 ACCESS ALY, TACOMA, WA 98402", "123 COUNTY ROAD #5.6 ACCESS ALY, TACOMA, WA 98402"),
@@ -551,3 +553,9 @@ class TestPunctuationAndSpacing:
                      ("7399 OLD REDMOND RD UNIT 212", "7399 OLD REDMOND RD"),
                      ("23120 SE BLACK NUGGET RD A3", "23120 SE BLACK NUGGET RD #A3")):
             assert compute_owner_flags(f"{a}, REDMOND, WA 98052", f"{b}, REDMOND, WA 98052")["absentee_owner"] is False, a
+
+    def test_unit_spellings_of_one_unit_match(self):
+        for a, b in (("123 MAIN ST BLDG 1 UNIT 23", "123 MAIN ST UNIT 23 BLDG 1"),
+                     ("123 MAIN ST UNIT F-203", "123 MAIN ST #F203"),
+                     ("123 MAIN ST UNIT G 304", "123 MAIN ST #G304")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98101", f"{b}, SEATTLE, WA 98101")["absentee_owner"] is False, a

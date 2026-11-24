@@ -201,6 +201,25 @@ def _unit_like(token: str) -> bool:
     return len(t) <= 2 and t not in _STREET_WORDS
 
 
+_UNIT_START_RE = re.compile(
+    rf"#|\b(?:{_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b", re.IGNORECASE)
+
+
+def _unit_ids(street: str | None) -> str | None:
+    """Every id in the unit tail, joined: "BLDG 1 UNIT 5" -> "15", "UNIT 5." -> "5",
+    "#G304" and "UNIT G 304" -> "G304". Designator words, "#" and punctuation are dropped,
+    so only the ids are compared (Codex). None when the street names no unit. A unit word
+    inside a street name ("OLD LOT 5 ACCESS ALY") is glued first and never starts a tail.
+    """
+    s = _glue_named_units(_keep_meaningful_dots(street or "")).upper()
+    m = _UNIT_START_RE.search(s)
+    if not m:
+        return None
+    tokens = re.findall(r"[A-Z0-9]+", s[m.start():])
+    ids = "".join(t for t in tokens if t not in _UNIT_DESIGNATOR_WORDS)
+    return ids or None
+
+
 def _glue_named_units(street: str) -> str:
     """Glue a designator + id that is NOT a trailing unit, so _UNIT_STRIP_RE keeps it.
 
@@ -476,7 +495,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     # Both sides name a unit / "#" number and they differ: two places, whatever the street
     # type ("UNIT 5" vs "UNIT 6", "COUNTY ROAD #5" vs "#6", Codex). Only a unit OMITTED on
     # one side is the product rule's same place (county situs drops the unit).
-    p_unit, m_unit = _marked_unit(p["street"]), _marked_unit(m["street"])
+    p_unit, m_unit = _unit_ids(p["street"]), _unit_ids(m["street"])
     if p_unit and m_unit and p_unit != m_unit:
         return True
 

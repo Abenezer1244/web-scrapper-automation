@@ -318,6 +318,56 @@ def rls_sync_session(user_id: str) -> Iterator[Session]:
         session.close()
 
 
+# ─── Watcher engine — the tax-summons watcher ONLY ────────────────────────────
+# Logs in as bridgeleads_watcher (DATABASE_URL_WATCHER), the only role migration 173's
+# triggers let record what a county serves. Built on first use (the setting is empty
+# everywhere but the worker), NullPool (one short claim and one short result per day, and
+# nothing pooled across Celery's fork), tight timeouts. Never falls back to another URL.
+WATCHER_ROLE = "bridgeleads_watcher"
+_watcher_engine = None
+
+
+class WatcherNotConfiguredError(RuntimeError):
+    """The watcher has no login of its own, or the database does not see it as one."""
+
+
+def _get_watcher_engine():
+    global _watcher_engine
+    if _watcher_engine is None:
+        url = settings.DATABASE_URL_WATCHER
+        if not url:
+            raise WatcherNotConfiguredError("DATABASE_URL_WATCHER is not set")
+        _watcher_engine = create_engine(
+            url,
+            poolclass=NullPool,
+            echo=False,
+            hide_parameters=True,  # P0-04
+            connect_args={
+                "connect_timeout": 10,
+                "options": "-c statement_timeout=30000 -c lock_timeout=10000",
+                **_ssl_connect_args(url, async_driver=False),
+            },
+        )
+    return _watcher_engine
+
+
+@contextmanager
+def watcher_sync_session() -> Iterator[Session]:
+    """A session as the watcher, after the database confirms both its login and its
+    current role are bridgeleads_watcher (a pooler that rewrote the user, or a URL for
+    another role, is refused before anything is read or written)."""
+    session = Session(_get_watcher_engine(), expire_on_commit=False)
+    try:
+        # Checked inside the transaction the caller then uses (NullPool: a rollback here
+        # would hand the caller a fresh, unchecked connection).
+        who = session.execute(text("SELECT session_user, current_user")).one()
+        if tuple(who) != (WATCHER_ROLE, WATCHER_ROLE):
+            raise WatcherNotConfiguredError("the watcher URL does not log in as the watcher role")
+        yield session
+    finally:
+        session.close()
+
+
 @contextmanager
 def system_sync_session() -> Iterator[Session]:
     """Open a sync session WITHOUT setting any RLS context.

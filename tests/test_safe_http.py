@@ -183,3 +183,68 @@ def test_read_capped_passes_a_normal_body_through_intact():
     assert out._content == b"hello world"
     assert out._content_consumed is True
     assert resp.closed is False
+
+
+
+# --- a redirect's body is never read to build Response.next -----------------------
+
+class _RedirectWithBody:
+    """A local server answering every GET with a 302 and a large body, counting how many
+    body bytes it got to write before the client hung up."""
+
+    def __init__(self, body_bytes: int):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        outer = self
+        self.sent = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 (http.server API)
+                self.send_response(302)
+                self.send_header("Location", "/elsewhere")
+                self.send_header("Content-Length", str(body_bytes))
+                self.end_headers()
+                chunk = b"x" * 65536
+                try:
+                    while outer.sent < body_bytes:
+                        self.wfile.write(chunk)
+                        outer.sent += len(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/summons.pdf"
+
+    def close(self):
+        self.server.shutdown()
+
+
+def test_a_redirect_body_is_never_read_by_the_pinned_session():
+    """requests reads a 3xx body to build Response.next even with allow_redirects=False;
+    the session safe_http uses must not (a hostile redirect could fill worker memory before
+    any byte cap). A plain adapter stands in for the pinned one only so the local server
+    is reachable; the session class is production."""
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    from src.utils.pinned_http import pinned_session
+
+    server = _RedirectWithBody(64 * 1024 * 1024)
+    try:
+        stock = requests.Session()
+        resp = stock.get(server.url, allow_redirects=False, stream=True, timeout=30)
+        assert resp.status_code == 302 and resp._content_consumed  # the problem, in requests itself
+        resp.close()
+
+        session = pinned_session(adapter_cls=HTTPAdapter)
+        resp = session.get(server.url, allow_redirects=False, stream=True, timeout=30)
+        assert resp.status_code == 302
+        assert not resp._content_consumed and resp.next is None
+        resp.close()
+    finally:
+        server.close()

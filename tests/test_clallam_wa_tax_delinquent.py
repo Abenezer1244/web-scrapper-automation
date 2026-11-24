@@ -197,7 +197,43 @@ def _scraper(monkeypatch, retries: int = 3):
     from src.config import settings
     monkeypatch.setattr(settings, "POLITE_DELAY_MS", 0)
     monkeypatch.setattr(settings, "MAX_RETRIES", retries)
+    monkeypatch.setattr(m, "_RETRY_WAITS_S", (0.0,))
     return m, m.ClallamWATaxDelinquentScraper()
+
+
+def _waits(monkeypatch, m) -> list[float]:
+    """The waits the scraper asks for between tries (timer-precision free, Codex P3)."""
+    asked: list[float] = []
+
+    async def _sleep(seconds):
+        asked.append(seconds)
+    monkeypatch.setattr(m.asyncio, "sleep", _sleep)
+    return asked
+
+
+def test_a_busy_portal_page_gets_seconds_to_clear_between_tries(monkeypatch):
+    """Three tries 300 ms apart all met the same busy page (canary down, 2026-11-16)."""
+    import asyncio
+    m, s = _scraper(monkeypatch)
+    monkeypatch.setattr(m, "_RETRY_WAITS_S", (2.0, 5.0))
+    asked = _waits(monkeypatch, m)
+    calls: list[str] = []
+    monkeypatch.setattr(m, "safe_get", _serve([_BUSY, _BUSY, _portal()], calls))
+    assert asyncio.run(s._portal_status("17038", 2026)) == parse_portal_status(_portal())
+    assert len(calls) == 3 and asked == [2.0, 5.0]
+
+
+def test_a_slower_configured_pacing_is_never_undercut_by_the_backoff(monkeypatch):
+    import asyncio
+
+    from src.config import settings
+    m, s = _scraper(monkeypatch)
+    monkeypatch.setattr(m, "_RETRY_WAITS_S", (2.0, 5.0))
+    monkeypatch.setattr(settings, "POLITE_DELAY_MS", 3000)
+    asked = _waits(monkeypatch, m)
+    monkeypatch.setattr(m, "safe_get", _serve([_BUSY, _BUSY, _portal()], []))
+    asyncio.run(s._portal_status("17038", 2026))
+    assert asked == [3.0, 5.0]
 
 
 def test_one_unreadable_portal_page_is_retried_and_logged_without_page_text(monkeypatch, caplog):

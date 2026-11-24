@@ -464,21 +464,65 @@ def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
     customers until a probe decides it, so one type of each such connector goes first:
     a random sample of them, capped so CANARY_ROUTINE_SLOTS stay for the random rotation
     through every other pair. A connector switched on used to wait for the rotation,
-    a day or more (Benton tax_delinquent, 2026-11-14)."""
+    a day or more (Benton tax_delinquent, 2026-11-14).
+
+    A 'down' connector is hidden too, so it shares those priority slots: a random sample,
+    one type each, the type paged down if its marker says so. One
+    transient failure used to hide a working source until the rotation came back to it,
+    30+ hours (Clallam tax_delinquent, 2026-11-16). Each group keeps a slot while the
+    other has a backlog. Recovery probes run last in the tick; a down connector's other
+    types stay in the rotation."""
     import random
 
     pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
-    first = [(c, random.choice(c.record_types))
-             for c in random.sample(pending, min(len(pending), max(k - CANARY_ROUTINE_SLOTS, 0)))]
+    waiting = {c.id for c in pending}
+    down = [c for c in connectors if c.record_types and c.id not in waiting and c.health_status == "down"]
+    slots = max(k - CANARY_ROUTINE_SLOTS, 0)
+    n_first = min(len(pending), slots - min(len(down), 1) if slots > 1 else slots)
+    first = [(c, random.choice(c.record_types)) for c in random.sample(pending, n_first)]
+    # A random sample, as for pending: a probe that times out every tick never records a
+    # verdict, so an oldest-first order would put it first again and stop each run (Codex P2).
+    recovering = random.sample(down, min(len(down), slots - n_first))
+    marked = _down_marked_types(recovering)
+    last = [(c, random.choice(marked.get(c.id) or c.record_types)) for c in recovering]
     # Pending connectors stay out of the rotation, so a stuck backlog gets only the
     # priority slots; their other types rotate in once a probe certifies them.
-    waiting = {c.id for c in pending}
-    rest = [(c, rt) for c in connectors if c.id not in waiting for rt in (c.record_types or [])]
-    units = first + random.sample(rest, min(k - len(first), len(rest)))
+    chosen = {(c.id, rt) for c, rt in last}
+    rest = [(c, rt) for c in connectors if c.id not in waiting
+            for rt in (c.record_types or []) if (c.id, rt) not in chosen]
+    # Recovery probes run last: one that times out every tick then costs only itself, never
+    # the routine probes, and a sibling type probed in the same tick cannot write the one
+    # shared status over the still-broken type's verdict (Codex P2s).
+    units = first + random.sample(rest, min(k - len(first) - len(last), len(rest)))
     # Slots the rotation cannot fill go to the rest of the pending pairs.
     chosen = {(c.id, rt) for c, rt in units}
     spare = [(c, rt) for c in pending for rt in c.record_types if (c.id, rt) not in chosen]
-    return units + random.sample(spare, min(k - len(units), len(spare)))
+    return units + random.sample(spare, min(k - len(units) - len(last), len(spare))) + last
+
+
+def _down_marked_types(connectors) -> dict:
+    """{connector id: [types paged down]} from their Redis markers, in one read.
+    Advisory only: unreadable -> {}, and the caller probes any type."""
+    pairs = [(c.id, rt) for c in connectors for rt in c.record_types]
+    if not pairs:
+        return {}
+    try:
+        r = _redis(timeout_s=2)  # advisory: a hung Redis must not stall the tick (Codex P2)
+        try:
+            values = r.mget([f"{_BAD_PREFIX}{cid}:{rt}" for cid, rt in pairs])
+        finally:
+            r.close()
+    except Exception as exc:  # noqa: BLE001 -- the canary must not depend on Redis
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
+        _logger.warning("Canary: down markers unreadable (%s); probing any type", type(exc).__name__)
+        return {}
+    marked: dict = {}
+    for (cid, rt), value in zip(pairs, values, strict=True):
+        if _text(value) in ("canary", _DOWN_UNSENT):
+            marked.setdefault(cid, []).append(rt)
+    return marked
 
 
 def _canary_check_impl() -> None:
@@ -535,10 +579,21 @@ def _canary_check_impl() -> None:
     committed_alerts: list[tuple[str, str, str, str]] = []
     # DOWN alert key -> its type's marker, promoted to paged once that page went out.
     down_markers: dict[str, str] = {}
+    # One status per connector (Codex P2s). A type that failed this tick keeps its connector
+    # down whatever a sibling probed after it finds, and a connector down at the start stays
+    # down until the last of its units this tick (its recovery probe runs last) has run, so
+    # an interrupted tick never relists it on a sibling's word alone.
+    was_down = {c.id for c, _ in units if c.health_status == "down"}
+    last_unit = {c.id: i for i, (c, _) in enumerate(units)}
+    failed: set = set()
     try:
-        for connector, record_type in units:
+        for i, (connector, record_type) in enumerate(units):
             unit_alerts: list[tuple[str, str, str, str]] = []
             mark = _probe_unit(connector, record_type, unit_alerts)
+            if connector.health_status == "down":
+                failed.add(connector.id)
+            elif connector.id in failed or (connector.id in was_down and i < last_unit[connector.id]):
+                connector.health_status = "down"
             connector.last_checked = datetime.now(UTC)
             if _record_unit(connector):
                 committed_alerts.extend(unit_alerts)
@@ -696,12 +751,17 @@ def _bad_key(connector, record_type: str) -> str:
     return f"{_BAD_PREFIX}{connector.id}:{record_type}"
 
 
-def _redis():
+def _redis(timeout_s: float | None = None):
     import redis as sync_redis
 
     from src.config import settings
 
-    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    if timeout_s is not None:
+        # After parsing: URL query options would otherwise win over from_url kwargs (Codex P2).
+        client.connection_pool.connection_kwargs.update(
+            socket_timeout=timeout_s, socket_connect_timeout=timeout_s)
+    return client
 
 
 def _text(value) -> str | None:

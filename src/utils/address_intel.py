@@ -220,8 +220,9 @@ def _glue_named_units(street: str) -> str:
     """
     def repl(m: re.Match) -> str:
         tail = street[m.end():].split()
-        road_number = ((m.group(1) or "NO").upper() == "NO"
-                       and _ROAD_WORD_RE.search(street[:m.start()]))
+        # "C.R.", "S.R.", "U.S." are the same road words once their dots are dropped (Codex).
+        before = re.sub("[.·](?=[A-Za-z])", "", street[:m.start()])
+        road_number = ((m.group(1) or "NO").upper() == "NO" and _ROAD_WORD_RE.search(before))
         if all(_unit_like(t) for t in tail) and not road_number:
             return m.group(0)
         # Glued without a "#" so neither _HASH_UNIT_RE nor _UNIT_STRIP_RE can see a unit.

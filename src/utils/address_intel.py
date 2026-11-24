@@ -172,9 +172,12 @@ _ROAD_NUMBER_RE = re.compile(r"\bNO\.?\s*(?=\d)", re.IGNORECASE)
 # A designator word or a bare "#", then an id of any length (Codex: "LOT 1234567",
 # "#5 ACCESS ALY").
 _UNIT_DESIGNATOR_RE = re.compile(
-    rf"(?:\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b\s*#?|#)\s*([A-Z0-9-]+)\b",
+    rf"(?:\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b\s*#?|#)\s*([A-Z0-9_-]+)",
     re.IGNORECASE,
 )
+# A number right after a road word is the road's number, not a unit: "COUNTY ROAD #5",
+# "HWY NO 9", "SR #20" (Codex). Kept even when it ends the street.
+_ROAD_WORD_RE = re.compile(r"\b(?:ROAD|RD|HWY|HIGHWAY|ROUTE|RTE|SR)\s*$", re.IGNORECASE)
 _UNIT_DESIGNATOR_WORDS = frozenset(
     _UNIT_WORDS.split("|") + ["NO", "BOX", "FL", "FLR", "FLOOR", "DEPT", "TRLR", "TRAILER", "BLD"])
 _STREET_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values()) | frozenset(_DIRECTIONAL) \
@@ -202,7 +205,7 @@ def _glue_named_units(street: str) -> str:
     """
     def repl(m: re.Match) -> str:
         tail = street[m.end():].split()
-        if all(_unit_like(t) for t in tail):
+        if all(_unit_like(t) for t in tail) and not _ROAD_WORD_RE.search(street[:m.start()]):
             return m.group(0)
         # Glued without a "#" so neither _HASH_UNIT_RE nor _UNIT_STRIP_RE can see a unit.
         return f"{m.group(1) or 'NUM'}_{m.group(2)}"

@@ -271,6 +271,14 @@ BEGIN
        AND NOT EXISTS (SELECT 1 FROM tax_summons_observations ob WHERE ob.county = NEW.county AND ob.state = NEW.state AND ob.current_version_id = NEW.id AND ob.status = 'ok') THEN
         RAISE EXCEPTION 'tax_summons_versions: not the copy the county serves now' USING ERRCODE = 'check_violation';
     END IF;
+    -- A summons never states its amounts as of a day still to come (the database's UTC day),
+    -- whether the date is being set or sealed by publication.
+    IF NEW.amount_as_of > (clock_timestamp() AT TIME ZONE 'UTC')::date
+       AND (NEW.amount_as_of IS DISTINCT FROM OLD.amount_as_of
+            OR (OLD.status = 'pending' AND NEW.status = 'published')) THEN
+        RAISE EXCEPTION 'tax_summons_versions: the as-of date is in the future'
+              USING ERRCODE = 'check_violation';
+    END IF;
     -- A re-uploaded summons keeps the case of the county's latest published copy; only a
     -- later year's case may start a new redemption history.
     IF NEW.case_number IS DISTINCT FROM OLD.case_number AND NEW.case_number IS NOT NULL THEN

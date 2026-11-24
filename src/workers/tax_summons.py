@@ -292,7 +292,8 @@ def set_manifest(db, version_id, *, case_number: str, rows_per_page: dict[int, i
     if not _CASE.fullmatch(case_number):
         raise TaxReviewError("case number must look like 26-2-00337-09")
     # The date the PDF states its amounts as of; a summons never states a future date.
-    if not isinstance(amount_as_of, date) or not date(2000, 1, 1) <= amount_as_of <= datetime.now(UTC).date():
+    if (not isinstance(amount_as_of, date) or isinstance(amount_as_of, datetime)
+            or not date(2000, 1, 1) <= amount_as_of <= datetime.now(UTC).date()):
         raise TaxReviewError("the as-of date must be the summons' own (e.g. 2026-08-01), not in the future")
     established = _established_case(db, v)
     if new_case:
@@ -342,6 +343,8 @@ def draft_rows(db, version_id) -> dict:
         raise TaxReviewError("no summons version with that id")
     if not v.manifest:
         raise TaxReviewError("the version has no manifest; record one first")
+    if v.amount_as_of is None:
+        raise TaxReviewError("the version has no as-of date; record the manifest again")
     prior = _prior_published(db, v)
     rows = [] if prior is None else _current_rows(db, prior, prior.published_revision)
     return {"version": str(v.id), "case": v.case_number, "as_of": v.amount_as_of.isoformat(),
@@ -500,6 +503,8 @@ def load_rows(db, version_id, payload, *, actor: str) -> tuple[int, dict[str, in
     _require_pending(v, "takes rows")
     if not v.manifest:
         raise TaxReviewError("the version has no manifest; record one first")
+    if v.amount_as_of is None:
+        raise TaxReviewError("the version has no as-of date; record the manifest again")
     if not isinstance(payload, dict) or set(payload) != {"version", "case", "as_of", "manifest", "rows"}:
         raise TaxReviewError("the file must hold exactly the version, case, as-of date, manifest and rows "
                              "a draft has")
@@ -543,6 +548,8 @@ def publish(db, version_id, *, actor: str, expected_revision: int, pdf_sha256: s
     version's id, if any."""
     v = _lock_version(db, version_id)
     _require_pending(v, "can be published")
+    if v.amount_as_of is None:  # before anything changes (the database refuses it too)
+        raise TaxReviewError("the version has no as-of date; record the manifest again")
     _require_same_pdf(v, pdf_sha256)
     if v.revision != expected_revision:
         raise TaxReviewError(f"the version is at revision {v.revision}, not {expected_revision}: "

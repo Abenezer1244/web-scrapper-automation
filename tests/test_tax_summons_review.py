@@ -15,7 +15,7 @@ import os
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -221,12 +221,31 @@ def test_the_manifest_is_validated(db, case, pages, match):
         set_manifest(db, vid, amount_as_of=_AS_OF, case_number=case, rows_per_page=pages, actor="op-1", pdf_sha256=_sha(db, vid))
 
 
-@pytest.mark.parametrize("as_of", [date(1999, 12, 31), date(2999, 1, 1), "2026-08-01"])
+@pytest.mark.parametrize("as_of", [date(1999, 12, 31), date(2999, 1, 1), "2026-08-01",
+                                   datetime(2026, 8, 1, tzinfo=UTC)])
 def test_the_as_of_date_is_the_summons_own(db, as_of):
     vid, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
     with pytest.raises(TaxReviewError, match="as-of date"):
         set_manifest(db, vid, amount_as_of=as_of, case_number=_CASE, rows_per_page={6: 2}, actor="op-1",
                      pdf_sha256=_sha(db, vid))
+
+
+def test_a_version_that_lost_its_as_of_date_is_refused_cleanly(db):
+    vid = _version(db, "v1")
+    rev = _load(db, vid, _row(6, 1, _A), _row(6, 2, _B))
+    db.execute(text("UPDATE tax_summons_versions SET amount_as_of = NULL, revision = revision + 1 WHERE id = :v"),
+               {"v": vid})
+    for call in (lambda: draft_rows(db, vid),
+                 lambda: load_rows(db, vid, _payload(vid, _row(6, 1, _A), _row(6, 2, _B)), actor="op-1"),
+                 lambda: publish(db, vid, actor="op-1", expected_revision=rev + 1, pdf_sha256=_sha(db, vid))):
+        with pytest.raises(TaxReviewError, match="no as-of date"):
+            call()
+
+
+def test_the_database_refuses_a_future_as_of_date(db):
+    vid = _version(db, "v1")
+    _refused(db, "UPDATE tax_summons_versions SET amount_as_of = (now() AT TIME ZONE 'UTC')::date + 1, "
+                 "revision = revision + 1 WHERE id = :v", {"v": vid}, match="as-of date is in the future")
 
 
 def test_a_draft_from_before_an_as_of_correction_is_refused(db):

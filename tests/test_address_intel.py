@@ -487,6 +487,7 @@ class TestPunctuationAndSpacing:
             ("123 COUNTY ROAD #5, TACOMA, WA 98402", "123 COUNTY ROAD #6, TACOMA, WA 98402"),
             ("123 COUNTY RD. #5, TACOMA, WA 98402", "123 COUNTY RD. #6, TACOMA, WA 98402"),
             ("120 CR #5, TACOMA, WA 98402", "120 CR #6, TACOMA, WA 98402"),
+            ("120 SH #5, WA 98001", "120 SH #6, WA 98001"),
             ("120 OLD LOT 5 WY, TACOMA, WA 98402", "120 OLD LOT 6 WY, TACOMA, WA 98402"),
             ("123 COUNTY ROAD #5.5 ACCESS ALY, TACOMA, WA 98402", "123 COUNTY ROAD #5.6 ACCESS ALY, TACOMA, WA 98402"),
             ("123 N.E. MAIN ST, SEATTLE, WA 98101", "123 N E MAIN ST, SEATTLE, WA 98101"),
@@ -531,3 +532,10 @@ class TestPunctuationAndSpacing:
         for a, b in (("24815 LAKE FENWICK RD S", "24815 LAKE FENWICK RD S UNIT 4 DZ"),
                      ("15330 40TH AVE W", "15330 40TH AVE W UNIT A AND B")):
             assert compute_owner_flags(f"{a}, KENT, WA 98032", f"{b}, KENT, WA 98032")["absentee_owner"] is False, b
+
+    def test_apartment_on_a_named_road_is_a_unit(self):
+        # 56 owner-occupied King leads (2026-11-24): "#321" after an ordinary RD is an apartment.
+        for a, b in (("7431 OLD REDMOND RD UNIT 321", "7431 OLD REDMOND RD #321"),
+                     ("7399 OLD REDMOND RD UNIT 212", "7399 OLD REDMOND RD"),
+                     ("23120 SE BLACK NUGGET RD A3", "23120 SE BLACK NUGGET RD #A3")):
+            assert compute_owner_flags(f"{a}, REDMOND, WA 98052", f"{b}, REDMOND, WA 98052")["absentee_owner"] is False, a

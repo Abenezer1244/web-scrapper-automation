@@ -506,6 +506,8 @@ class TestPunctuationAndSpacing:
             ("123 MAIN ST UNIT 1 / 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 2, SEATTLE, WA 98101"),
             ("123 MAIN ST UNIT A.B, SEATTLE, WA 98101", "123 MAIN ST UNIT A B, SEATTLE, WA 98101"),
             ("123 MAIN ST UNIT A.BC, SEATTLE, WA 98101", "123 MAIN ST UNIT A BC, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT A.1, SEATTLE, WA 98101", "123 MAIN ST UNIT A 1, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 1. 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 2, SEATTLE, WA 98101"),
             ("123 MAIN ST UNIT 5 & 6, SEATTLE, WA 98101", "123 MAIN ST UNIT 5 6, SEATTLE, WA 98101"),
             ("123 MAIN ST LOT 1 UNIT 2, SEATTLE, WA 98101", "123 MAIN ST LOT 2 UNIT 1, SEATTLE, WA 98101"),
             ("123 MAIN ST 1-23, SEATTLE, WA 98101", "123 MAIN ST #12-3, SEATTLE, WA 98101"),
@@ -572,3 +574,9 @@ class TestPunctuationAndSpacing:
     def test_trailing_period_on_a_unit_is_not_a_different_unit(self):
         f = compute_owner_flags("123 MAIN ST UNIT 5., SEATTLE, WA 98101", "123 MAIN ST UNIT 5, SEATTLE, WA 98101")
         assert f["absentee_owner"] is False
+
+    def test_zip_after_a_comma_less_unit_is_not_part_of_the_unit(self):
+        # 2026-11-24 dry run: the situs had no commas, so its ZIP sat after the unit.
+        for a, b in (("4120 S 225TH PL #26 98032", "4120 S 225TH PL #26, KENT, WA 98032"),
+                     ("2348 FAIRVIEW AVE E #203 98102", "2348 FAIRVIEW AVE E #203, SEATTLE, WA 98102")):
+            assert compute_owner_flags(a, b)["absentee_owner"] is not True, a

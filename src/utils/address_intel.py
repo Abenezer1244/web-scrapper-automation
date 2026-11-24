@@ -158,7 +158,7 @@ _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
 # A dot directly between two letters ("N.E.", "S.W.", a unit "A.BC") is kept too, so the
 # dot-dropping paths never equate it with a space: "N.E. MAIN" is not "N E MAIN" (North E
 # Main), "UNIT A.BC" is not "UNIT A BC" (Codex). A dot before a space ("AVE. S") still goes.
-_LETTER_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=[A-Z])", re.IGNORECASE)
+_LETTER_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=[A-Z0-9])", re.IGNORECASE)  # "A.1" too (Codex)
 
 
 def _keep_meaningful_dots(text: str) -> str:
@@ -242,9 +242,17 @@ def _unit_ids(street: str | None) -> str | None:
     expecting_id = False
     tail = re.sub(r"\s*([-/])\s*", r"\1", s[m.start():])  # "1 / 2" is "1/2" (Codex)
     # Whitespace-separated chunks, every other character kept ("A.B" != "A B", "5 & 6" !=
-    # "5 6", Codex); only a chunk's trailing period or comma goes ("UNIT 5." == "UNIT 5").
-    # ("_" is a protected digit dot; trailing, it is just the sentence's period.)
-    chunks = [c.rstrip(".,_") for c in re.sub("#", " # ", tail).split()]
+    # "5 6", Codex). Commas go; only the LAST chunk's period goes ("UNIT 5." == "UNIT 5",
+    # but "UNIT 1. 2" != "UNIT 1 2"); "_" is a protected digit dot.
+    chunks = [c.rstrip(",") for c in re.sub("#", " # ", tail).split()]
+    # A street parsed without commas still carries its state / ZIP ("#26 98032"): those
+    # are not unit ids (2026-11-24 dry run: "4120 S 225TH PL #26 98032" vs "#26, KENT").
+    # Never the id right after a marker ("# 98032" stays a unit).
+    while (len(chunks) > 1 and not _UNIT_START_RE.fullmatch(chunks[-2])
+           and re.fullmatch(r"\d{5}(?:[-_]\d{4})?|WA", chunks[-1].rstrip("._"))):
+        chunks.pop()
+    if chunks:
+        chunks[-1] = chunks[-1].rstrip("._")
     for tok in (c for c in chunks if c):
         is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
         if is_marker and not expecting_id:

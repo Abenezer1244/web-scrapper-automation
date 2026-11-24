@@ -188,7 +188,7 @@ BEGIN
         SELECT coalesce(max(o.seen_order), 0) + 1 INTO NEW.seen_order FROM tax_summons_versions o
          WHERE o.county = NEW.county AND o.state = NEW.state;
         IF NEW.status <> 'pending' OR NEW.revision <> 0 OR NEW.revision_txid IS NOT NULL
-           OR NEW.case_number IS NOT NULL
+           OR NEW.case_number IS NOT NULL OR NEW.amount_as_of IS NOT NULL
            OR NEW.manifest IS NOT NULL OR NEW.published_at IS NOT NULL OR NEW.published_by IS NOT NULL
            OR NEW.published_revision IS NOT NULL OR NEW.published_seq IS NOT NULL
            OR NEW.superseded_after_seq IS NOT NULL THEN
@@ -213,19 +213,19 @@ BEGIN
        -- publication approves the revision, case and manifest as they stand
        OR (OLD.status = 'pending' AND NEW.status = 'published'
            AND (NEW.published_revision IS DISTINCT FROM OLD.revision OR NEW.revision <> OLD.revision
-                OR NEW.case_number IS DISTINCT FROM OLD.case_number
+                OR (NEW.case_number, NEW.amount_as_of) IS DISTINCT FROM (OLD.case_number, OLD.amount_as_of)
                 OR NEW.manifest::text IS DISTINCT FROM OLD.manifest::text))
-       -- a pending case or manifest edit starts a new revision (loaded rows stop counting)
+       -- a pending case, as-of date or manifest edit starts a new revision (loaded rows stop counting)
        OR (OLD.status = 'pending'
-           AND (NEW.case_number IS DISTINCT FROM OLD.case_number
+           AND ((NEW.case_number, NEW.amount_as_of) IS DISTINCT FROM (OLD.case_number, OLD.amount_as_of)
                 OR NEW.manifest::text IS DISTINCT FROM OLD.manifest::text)
            AND NEW.revision <= OLD.revision)
        OR (OLD.status <> 'pending'
-           AND (NEW.case_number, NEW.manifest::text, NEW.revision, NEW.published_at, NEW.published_by,
-                NEW.published_revision, NEW.published_seq)
+           AND (NEW.case_number, NEW.amount_as_of, NEW.manifest::text, NEW.revision, NEW.published_at,
+                NEW.published_by, NEW.published_revision, NEW.published_seq)
                IS DISTINCT FROM
-               (OLD.case_number, OLD.manifest::text, OLD.revision, OLD.published_at, OLD.published_by,
-                OLD.published_revision, OLD.published_seq))
+               (OLD.case_number, OLD.amount_as_of, OLD.manifest::text, OLD.revision, OLD.published_at,
+                OLD.published_by, OLD.published_revision, OLD.published_seq))
        OR (OLD.status = 'pending' AND NEW.status <> 'published'
            AND (NEW.published_at, NEW.published_by, NEW.published_revision, NEW.published_seq)
                IS DISTINCT FROM (OLD.published_at, OLD.published_by, OLD.published_revision, OLD.published_seq))
@@ -265,8 +265,9 @@ BEGIN
         END IF;
     END IF;
     -- Only the county's current copy (tax_summons_observations) can be published, so only
-    -- it takes a case or manifest.
-    IF (NEW.case_number IS DISTINCT FROM OLD.case_number OR NEW.manifest::text IS DISTINCT FROM OLD.manifest::text)
+    -- it takes a case, an as-of date or a manifest.
+    IF ((NEW.case_number, NEW.amount_as_of) IS DISTINCT FROM (OLD.case_number, OLD.amount_as_of)
+        OR NEW.manifest::text IS DISTINCT FROM OLD.manifest::text)
        AND NOT EXISTS (SELECT 1 FROM tax_summons_observations ob WHERE ob.county = NEW.county AND ob.state = NEW.state AND ob.current_version_id = NEW.id AND ob.status = 'ok') THEN
         RAISE EXCEPTION 'tax_summons_versions: not the copy the county serves now' USING ERRCODE = 'check_violation';
     END IF;
@@ -531,6 +532,9 @@ def upgrade() -> None:
         sa.Column("status", sa.String(16), nullable=False, server_default="pending"),
         sa.Column("case_number", sa.String(32), nullable=True),
         sa.Column("manifest", sa.JSON, nullable=True),
+        # The date the summons' amounts are stated as of ("Taxes and Interest Due As Of ..."),
+        # read off the PDF by the operator with the manifest; sealed at publication.
+        sa.Column("amount_as_of", sa.Date, nullable=True),
         sa.Column("revision", sa.Integer, nullable=False, server_default="0"),
         # The transaction that opened the current revision (set by the seal trigger):
         # only it may add that revision's rows.
@@ -558,13 +562,15 @@ def upgrade() -> None:
         sa.CheckConstraint("seen_order > 0 AND revision >= 0", name="ck_tax_summons_versions_counters"),
         sa.CheckConstraint("case_number IS NULL OR case_number ~ '^[0-9]{2}-[0-9]-[0-9]{5}-[0-9]{2}$'",
                            name="ck_tax_summons_versions_case"),
+        sa.CheckConstraint("amount_as_of IS NULL OR amount_as_of BETWEEN DATE '2000-01-01' AND DATE '2100-12-31'",
+                           name="ck_tax_summons_versions_as_of"),
         # Published (now or once) means: who, when, which revision, under which case.
         sa.CheckConstraint(
             "(published_at IS NULL) = (published_by IS NULL) "
             "AND (published_at IS NULL) = (published_revision IS NULL) "
             "AND (published_at IS NULL) = (published_seq IS NULL) "
-            "AND (published_at IS NULL OR (case_number IS NOT NULL AND published_revision > 0 "
-            "AND published_seq > 0)) "
+            "AND (published_at IS NULL OR (case_number IS NOT NULL AND amount_as_of IS NOT NULL "
+            "AND published_revision > 0 AND published_seq > 0)) "
             "AND (status <> 'published' OR published_at IS NOT NULL)",
             name="ck_tax_summons_versions_published"),
     )

@@ -15,6 +15,7 @@ import os
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -52,6 +53,7 @@ migration_173 = _load_module("migration_173", "alembic", "versions", "173_tax_su
 
 _URL = "https://www.douglascountysheriff.org/DocumentCenter/View/0000/2026-Notice-and-Summons"
 _CASE = "26-2-00337-09"
+_AS_OF = date(2026, 8, 1)  # "Taxes and Interest Due As Of August 1, 2026"
 _ESC = chr(27)  # a terminal escape
 _A, _B, _C, _D = "41020600100", "41020600200", "41020600300", "41020600400"
 
@@ -149,7 +151,7 @@ def _version(db, tag: str, *, pages: dict[int, int] | None = None, case: str = _
              new_case: bool = False) -> str:
     vid, created = open_version(db, county="Douglas", state="wa", source_url=_URL, sha256=_digest(tag))
     assert created
-    set_manifest(db, vid, case_number=case, rows_per_page=pages or {6: 2}, actor="op-1", pdf_sha256=_sha(db, vid),
+    set_manifest(db, vid, amount_as_of=_AS_OF, case_number=case, rows_per_page=pages or {6: 2}, actor="op-1", pdf_sha256=_sha(db, vid),
                  new_case=new_case)
     return vid
 
@@ -164,13 +166,16 @@ def _row(page: int, row: int, parcel: str | None, eligibility: str = "eligible",
     return base | kw
 
 
-def _payload(vid: str, *rows: dict, manifest: dict | None = None, case: str = _CASE) -> dict:
-    return {"version": vid, "case": case, "manifest": manifest or {"6": 2}, "rows": list(rows)}
+def _payload(vid: str, *rows: dict, manifest: dict | None = None, case: str = _CASE,
+             as_of: date = _AS_OF) -> dict:
+    return {"version": vid, "case": case, "as_of": as_of.isoformat() if as_of else None, "manifest": manifest or {"6": 2},
+            "rows": list(rows)}
 
 
 def _load(db, vid, *rows, actor="op-1") -> int:
     v = db.get(Version, vid)
-    return load_rows(db, vid, _payload(vid, *rows, manifest=v.manifest, case=v.case_number), actor=actor)[0]
+    return load_rows(db, vid, _payload(vid, *rows, manifest=v.manifest, case=v.case_number, as_of=v.amount_as_of),
+                     actor=actor)[0]
 
 
 def _publish(db, vid, rows_a=_A, rows_b=_B, b="eligible", **kw) -> int:
@@ -213,13 +218,42 @@ def test_open_version_refuses_unknown_counties_and_bad_digests(db, kw, match):
 def test_the_manifest_is_validated(db, case, pages, match):
     vid, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
     with pytest.raises(TaxReviewError, match=match):
-        set_manifest(db, vid, case_number=case, rows_per_page=pages, actor="op-1", pdf_sha256=_sha(db, vid))
+        set_manifest(db, vid, amount_as_of=_AS_OF, case_number=case, rows_per_page=pages, actor="op-1", pdf_sha256=_sha(db, vid))
+
+
+@pytest.mark.parametrize("as_of", [date(1999, 12, 31), date(2999, 1, 1), "2026-08-01"])
+def test_the_as_of_date_is_the_summons_own(db, as_of):
+    vid, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
+    with pytest.raises(TaxReviewError, match="as-of date"):
+        set_manifest(db, vid, amount_as_of=as_of, case_number=_CASE, rows_per_page={6: 2}, actor="op-1",
+                     pdf_sha256=_sha(db, vid))
+
+
+def test_a_draft_from_before_an_as_of_correction_is_refused(db):
+    vid = _version(db, "v1")
+    stale = _payload(vid, _row(6, 1, _A), _row(6, 2, _B))
+    set_manifest(db, vid, amount_as_of=date(2026, 8, 3), case_number=_CASE, rows_per_page={6: 2}, actor="op-1",
+                 pdf_sha256=_sha(db, vid))
+    with pytest.raises(TaxReviewError, match="different case, as-of date or manifest"):
+        load_rows(db, vid, stale, actor="op-1")
+
+
+def test_the_as_of_date_is_sealed_with_the_publication(db):
+    vid = _version(db, "v1")
+    _publish(db, vid)
+    _refused(db, "UPDATE tax_summons_versions SET amount_as_of = '2026-09-01' WHERE id = :v", {"v": vid})
+    v2 = _version(db, "v2")
+    _refused(db, "UPDATE tax_summons_versions SET amount_as_of = '2026-09-01' WHERE id = :v", {"v": v2})  # no new revision
+    db.execute(text("UPDATE tax_summons_versions SET amount_as_of = NULL, revision = revision + 1 WHERE id = :v"),
+               {"v": v2})  # a pending copy may lose its date while under review...
+    _raw_eligible_rows(db, v2)
+    _refused(db, _RAW_PUBLISH, {"v": v2}, match="ck_tax_summons_versions_published")  # ...but not be published
 
 
 def test_a_new_manifest_discards_loaded_rows(db):
     vid = _version(db, "v1")
     _load(db, vid, _row(6, 1, _A), _row(6, 2, _B))
-    rev = set_manifest(db, vid, case_number=_CASE, rows_per_page={6: 2, 7: 1}, actor="op-1", pdf_sha256=_sha(db, vid))
+    rev = set_manifest(db, vid, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2, 7: 1}, actor="op-1", pdf_sha256=_sha(db, vid))
     with pytest.raises(TaxReviewError, match="no rows at this revision"):
         publish(db, vid, actor="op-1", expected_revision=rev, pdf_sha256=_sha(db, vid))
 
@@ -310,8 +344,8 @@ def test_load_must_account_for_exactly_the_manifest_rows(db, rows, match):
     (lambda vid: _payload(str(uuid.uuid4()), _row(6, 1, _A)), "different version"),
     (lambda vid: _payload(vid, _row(6, 1, _A)) | {"extra": 1}, "exactly"),
     (lambda vid: {"version": vid, "rows": [_row(6, 1, _A)]}, "exactly"),
-    (lambda vid: _payload(vid, _row(6, 1, _A), _row(6, 2, _B), manifest={"6": 2, "7": 1}), "different case or manifest"),
-    (lambda vid: _payload(vid, _row(6, 1, _A), _row(6, 2, _B), case="26-2-00338-09"), "different case or manifest"),
+    (lambda vid: _payload(vid, _row(6, 1, _A), _row(6, 2, _B), manifest={"6": 2, "7": 1}), "different case, as-of date or manifest"),
+    (lambda vid: _payload(vid, _row(6, 1, _A), _row(6, 2, _B), case="26-2-00338-09"), "different case, as-of date or manifest"),
 ])
 def test_load_refuses_a_bad_file(db, payload, match):
     vid = _version(db, "v1")
@@ -349,14 +383,14 @@ def test_a_published_version_takes_no_rows_or_manifest(db):
     with pytest.raises(TaxReviewError, match="only a pending version"):
         _load(db, vid, _row(6, 1, _A), _row(6, 2, _B))
     with pytest.raises(TaxReviewError, match="only a pending version"):
-        set_manifest(db, vid, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, vid))
+        set_manifest(db, vid, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, vid))
 
 
 @pytest.mark.parametrize("bad_id", ["not-a-uuid", str(uuid.uuid4())])
 def test_an_unknown_version_is_refused_cleanly(db, bad_id):
     for call in (lambda: load_rows(db, bad_id, {}, actor="op"),
                  lambda: publish(db, bad_id, actor="op", expected_revision=1, pdf_sha256="0" * 64),
-                 lambda: set_manifest(db, bad_id, case_number=_CASE, rows_per_page={6: 1}, actor="op",
+                 lambda: set_manifest(db, bad_id, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 1}, actor="op",
                                       pdf_sha256="0" * 64),
                  lambda: draft_rows(db, bad_id)):
         with pytest.raises(TaxReviewError, match="no summons version"):
@@ -423,15 +457,15 @@ def test_a_reupload_keeps_its_case(db, case, new_case, match):
     _publish(db, _version(db, "v1"), b="redeemed")
     v2, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v2"))
     with pytest.raises(TaxReviewError, match=match):
-        set_manifest(db, v2, case_number=case, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, v2),
+        set_manifest(db, v2, amount_as_of=_AS_OF, case_number=case, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, v2),
                      new_case=new_case)
 
 
 def test_manifest_and_publish_refuse_a_different_copy_of_the_pdf(db):
     vid, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
     with pytest.raises(TaxReviewError, match="not this version's copy"):
-        set_manifest(db, vid, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_digest("v2"))
-    set_manifest(db, vid, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_digest("v1"))
+        set_manifest(db, vid, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_digest("v2"))
+    set_manifest(db, vid, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_digest("v1"))
     rev = _load(db, vid, _row(6, 1, _A), _row(6, 2, _B))
     with pytest.raises(TaxReviewError, match="not this version's copy"):
         publish(db, vid, actor="op-1", expected_revision=rev, pdf_sha256=_digest("v2"))
@@ -589,9 +623,9 @@ def test_a_mistaken_new_case_on_a_pending_copy_does_not_become_the_rule(db):
     _version(db, "v2", case="27-2-00001-09", new_case=True)   # a mistake, never published
     v3, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v3"))
     with pytest.raises(TaxReviewError, match="summons is case 26-2-00337-09"):
-        set_manifest(db, v3, case_number="27-2-00001-09", rows_per_page={6: 2}, actor="op-1",
+        set_manifest(db, v3, amount_as_of=_AS_OF, case_number="27-2-00001-09", rows_per_page={6: 2}, actor="op-1",
                      pdf_sha256=_sha(db, v3))
-    set_manifest(db, v3, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, v3))
+    set_manifest(db, v3, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, v3))
     with pytest.raises(TaxReviewError, match="stamped this parcel redeemed"):  # case 26's history still binds
         _load(db, v3, _row(6, 1, _A), _row(6, 2, _B))
 
@@ -600,7 +634,7 @@ def test_an_older_copy_takes_no_manifest(db):
     v1, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
     _version(db, "v2")
     with pytest.raises(TaxReviewError, match="serves now"):
-        set_manifest(db, v1, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, v1))
+        set_manifest(db, v1, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, v1))
     _refused(db, "UPDATE tax_summons_versions SET case_number = :c, manifest = '{\"6\": 2}', "
                  "revision = revision + 1 WHERE id = :v", {"v": v1, "c": _CASE}, match="serves now")
 
@@ -608,7 +642,7 @@ def test_an_older_copy_takes_no_manifest(db):
 def test_a_page_past_9999_is_refused_by_review(db):
     vid, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
     with pytest.raises(TaxReviewError, match="pages 1-9999"):
-        set_manifest(db, vid, case_number=_CASE, rows_per_page={10000: 1}, actor="op-1", pdf_sha256=_sha(db, vid))
+        set_manifest(db, vid, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={10000: 1}, actor="op-1", pdf_sha256=_sha(db, vid))
 
 
 def test_only_a_newer_publication_supersedes_a_copy(db):
@@ -751,7 +785,7 @@ def test_a_case_number_in_other_digits_is_refused_plainly(db):
     vid, _ = open_version(db, county="douglas", state="WA", source_url=_URL, sha256=_digest("v1"))
     arabic_indic = "".join(chr(0x660 + int(d)) if d.isdigit() else d for d in _CASE)
     with pytest.raises(TaxReviewError, match="case number must look like"):
-        set_manifest(db, vid, case_number=arabic_indic, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, vid))
+        set_manifest(db, vid, amount_as_of=_AS_OF, case_number=arabic_indic, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, vid))
 
 
 def test_a_reinstated_event_needs_its_eligibility(db):
@@ -916,7 +950,7 @@ def test_what_may_be_served(db):
     assert _serving(db) == ("unobserved", None)
     vid = _observe(db, "v1")["version_id"]
     assert _serving(db) == ("unpublished", vid)
-    set_manifest(db, vid, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, vid))
+    set_manifest(db, vid, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, vid))
     _publish(db, vid)
     assert _serving(db) == ("ok", vid)
     for hold in ("link_missing", "page_failed", "download_failed", "ambiguous"):
@@ -969,7 +1003,7 @@ def test_a_pending_copy_served_again_can_still_be_published(db):
     b = _version(db, "b")
     c = _version(db, "c")
     assert _observe(db, "b")["version_id"] == b  # the county went back to B
-    set_manifest(db, b, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, b))
+    set_manifest(db, b, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, b))
     _publish(db, b)
     assert (db.get(Version, b).status, db.get(Version, c).status) == ("published", "superseded")
     assert _serving(db) == ("ok", b)
@@ -986,7 +1020,7 @@ def test_nothing_is_published_during_a_hold(db):
     _refused(db, _RAW_PUBLISH, {"v": b}, match="serves now")
     assert db.get(Version, a).status == "published"
     with pytest.raises(TaxReviewError, match="serves now"):
-        set_manifest(db, b, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, b))
+        set_manifest(db, b, amount_as_of=_AS_OF, case_number=_CASE, rows_per_page={6: 2}, actor="op-1", pdf_sha256=_sha(db, b))
 
 
 def test_a_copy_is_not_superseded_by_an_earlier_publication(db):
@@ -1281,12 +1315,13 @@ def test_the_cli_walks_manifest_draft_load_show_publish(c, db, tmp_path, capsys)
     pdf.write_bytes(b"v1")   # its sha256 is the version's digest
     other.write_bytes(b"v2")
     with pytest.raises(SystemExit, match="not this version's copy"):
-        _run(c, email, "manifest", "--version", vid, "--pdf", str(other), "--case", _CASE, "--pages", "6:2")
-    _run(c, email, "manifest", "--version", vid, "--pdf", str(pdf), "--case", _CASE, "--pages", "6:2")
+        _run(c, email, "manifest", "--version", vid, "--pdf", str(other), "--case", _CASE, "--as-of", "2026-08-01", "--pages", "6:2")
+    _run(c, email, "manifest", "--version", vid, "--pdf", str(pdf), "--case", _CASE, "--as-of", "2026-08-01", "--pages", "6:2")
     assert "revision 1" in capsys.readouterr().out
     out = tmp_path / "rows.json"
     _run(c, email, "draft", "--version", vid, "--out", str(out))
-    assert json.loads(out.read_text()) == {"version": vid, "case": _CASE, "manifest": {"6": 2}, "rows": []}
+    assert json.loads(out.read_text()) == {"version": vid, "case": _CASE, "as_of": "2026-08-01",
+                                           "manifest": {"6": 2}, "rows": []}
     with pytest.raises(SystemExit, match="exists"):
         _run(c, email, "draft", "--version", vid, "--out", str(out))
     out.write_text(json.dumps(_payload(vid, _row(6, 1, _A), _row(6, 2, _B, "redeemed"))))
@@ -1422,7 +1457,7 @@ def test_the_cli_reports_a_refusal_without_writing_or_echoing(c, db, tmp_path):
         _run(c, email, "load", "--version", vid, "--file", str(dup))
     assert "repeats a key" in str(exc.value) and "eligib" not in str(exc.value)
     with pytest.raises(SystemExit, match="--pages must be"):
-        _run(c, email, "manifest", "--version", vid, "--pdf", str(bad), "--case", _CASE, "--pages", "6:2,6:3")
+        _run(c, email, "manifest", "--version", vid, "--pdf", str(bad), "--case", _CASE, "--as-of", "2026-08-01", "--pages", "6:2,6:3")
     named = tmp_path / "JANE PLACEHOLDER DOE.json"   # a path that names someone is never echoed
     with pytest.raises(SystemExit) as exc:
         _run(c, email, "load", "--version", vid, "--file", str(named))
@@ -1448,7 +1483,7 @@ def test_the_cli_reports_a_database_error_by_reference_only(c, db, capsys, tmp_p
     pdf = tmp_path / "summons.pdf"
     pdf.write_bytes(b"v1")
     with pytest.raises(SystemExit) as exc:
-        cli.main(["--operator-email", email, "manifest", "--version", vid, "--pdf", str(pdf), "--case", _CASE,
+        cli.main(["--operator-email", email, "manifest", "--version", vid, "--pdf", str(pdf), "--case", _CASE, "--as-of", "2026-08-01",
                   "--pages", "6:3"],
                  auth_factory=c.session_factory, session_factory=read_only)
     assert "database error (ref " in str(exc.value) and "read-only" not in str(exc.value)

@@ -38,7 +38,7 @@ from __future__ import annotations
 import re
 import unicodedata
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import func, select, text
@@ -277,7 +277,7 @@ def serving_status(db, *, county: str, state: str) -> tuple[str, str | None]:
 
 
 def set_manifest(db, version_id, *, case_number: str, rows_per_page: dict[int, int], actor: str,
-                 pdf_sha256: str, new_case: bool = False) -> int:
+                 pdf_sha256: str, amount_as_of: date, new_case: bool = False) -> int:
     """Record the operator's reading of the PDF. Any rows loaded before it no longer
     count: the manifest starts a new, empty revision. Returns that revision.
 
@@ -291,6 +291,9 @@ def set_manifest(db, version_id, *, case_number: str, rows_per_page: dict[int, i
     case_number = (case_number or "").strip()
     if not _CASE.fullmatch(case_number):
         raise TaxReviewError("case number must look like 26-2-00337-09")
+    # The date the PDF states its amounts as of; a summons never states a future date.
+    if not isinstance(amount_as_of, date) or not date(2000, 1, 1) <= amount_as_of <= datetime.now(UTC).date():
+        raise TaxReviewError("the as-of date must be the summons' own (e.g. 2026-08-01), not in the future")
     established = _established_case(db, v)
     if new_case:
         if established is not None and int(case_number[:2]) <= int(established[:2]):
@@ -305,6 +308,7 @@ def set_manifest(db, version_id, *, case_number: str, rows_per_page: dict[int, i
         raise TaxReviewError(f"pages must be page:rows pairs, pages 1-{_MAX_PAGE}, 1-{_MAX_ROWS_PER_PAGE} rows "
                              f"a page, at most {_MAX_ROWS} rows in all")
     v.case_number = case_number
+    v.amount_as_of = amount_as_of
     v.manifest = {str(p): n for p, n in sorted(rows_per_page.items())}
     v.revision += 1
     _event(db, v, "manifest", actor, reason="new_case" if new_case and case_number != established else None)
@@ -340,7 +344,8 @@ def draft_rows(db, version_id) -> dict:
         raise TaxReviewError("the version has no manifest; record one first")
     prior = _prior_published(db, v)
     rows = [] if prior is None else _current_rows(db, prior, prior.published_revision)
-    return {"version": str(v.id), "case": v.case_number, "manifest": v.manifest, "rows": [{
+    return {"version": str(v.id), "case": v.case_number, "as_of": v.amount_as_of.isoformat(),
+            "manifest": v.manifest, "rows": [{
         "page": r.page, "row": r.row_no, "parcel": r.parcel_id, "vested_owner": r.vested_owner,
         "taxpayer": r.taxpayer, "property_address": r.property_address,
         "mailing_address": r.mailing_address,
@@ -495,12 +500,14 @@ def load_rows(db, version_id, payload, *, actor: str) -> tuple[int, dict[str, in
     _require_pending(v, "takes rows")
     if not v.manifest:
         raise TaxReviewError("the version has no manifest; record one first")
-    if not isinstance(payload, dict) or set(payload) != {"version", "case", "manifest", "rows"}:
-        raise TaxReviewError("the file must hold exactly the version, case, manifest and rows a draft has")
+    if not isinstance(payload, dict) or set(payload) != {"version", "case", "as_of", "manifest", "rows"}:
+        raise TaxReviewError("the file must hold exactly the version, case, as-of date, manifest and rows "
+                             "a draft has")
     if payload["version"] != str(v.id):
         raise TaxReviewError("the file was drafted for a different version")
-    if payload["case"] != v.case_number or payload["manifest"] != v.manifest:
-        raise TaxReviewError("the file was drafted under a different case or manifest; draft it again")
+    if (payload["case"] != v.case_number or payload["as_of"] != v.amount_as_of.isoformat()
+            or payload["manifest"] != v.manifest):
+        raise TaxReviewError("the file was drafted under a different case, as-of date or manifest; draft it again")
     raws = payload["rows"]
     if not isinstance(raws, list) or not raws:
         raise TaxReviewError("the file holds no rows")

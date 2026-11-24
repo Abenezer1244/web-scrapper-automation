@@ -239,9 +239,14 @@ def _unit_ids(street: str | None, zip_in_street: bool = False) -> str | None:
     "UNIT G 304" -> "U:G304". None when the street names no unit. A unit word inside a
     street name ("OLD LOT 5 ACCESS ALY") is glued first and never starts a tail.
 
-    zip_in_street: the parser found no ZIP on this address, so a trailing state / ZIP
-    still sits in the street and is trimmed. Otherwise a 5-digit chunk is a unit id
-    ("UNIT A 12345", Codex).
+    zip_in_street: the parser found no city, state or ZIP on this address (_unparsed), so
+    a trailing state / ZIP still sits in the street and is trimmed. Otherwise a 5-digit
+    chunk is a unit id ("UNIT A 12345", Codex).
+
+    KNOWN LIMIT (owner-accepted 2026-11-24, Codex round 45): on a comma-less line,
+    parse_property_for_display lifts a trailing 5-digit number as the ZIP before this sees
+    it, so "UNIT A 98101" with ZIP 98101 reads as unit "A". Fixing it means changing the
+    shared parser every county uses; not seen in production data.
     """
     s = _glue_named_units(_keep_meaningful_dots(street or "")).upper()
     s = _UNIT_LETTER_DIGIT_DOT_RE.sub("\u00b7", s)

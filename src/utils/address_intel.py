@@ -240,7 +240,11 @@ def _unit_ids(street: str | None) -> str | None:
     groups: list[list[str]] = []
     expecting_id = False
     tail = re.sub(r"\s*([-/])\s*", r"\1", s[m.start():])  # "1 / 2" is "1/2" (Codex)
-    for tok in re.findall(r"#|[A-Z0-9_]+(?:[-/][A-Z0-9_]+)*", tail):
+    # Whitespace-separated chunks, every other character kept ("A.B" != "A B", "5 & 6" !=
+    # "5 6", Codex); only a chunk's trailing period or comma goes ("UNIT 5." == "UNIT 5").
+    # ("_" is a protected digit dot; trailing, it is just the sentence's period.)
+    chunks = [c.rstrip(".,_") for c in re.sub("#", " # ", tail).split()]
+    for tok in (c for c in chunks if c):
         is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
         if is_marker and not expecting_id:
             groups.append([_UNIT_KIND.get(tok, "U"), ""])

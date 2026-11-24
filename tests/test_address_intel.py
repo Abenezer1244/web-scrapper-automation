@@ -504,6 +504,8 @@ class TestPunctuationAndSpacing:
             ("123 MAIN ST UNIT 1/2, SEATTLE, WA 98101", "123 MAIN ST UNIT 12, SEATTLE, WA 98101"),
             ("123 MAIN ST UNIT 1 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 12, SEATTLE, WA 98101"),
             ("123 MAIN ST UNIT 1 / 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 2, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT A.B, SEATTLE, WA 98101", "123 MAIN ST UNIT A B, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 5 & 6, SEATTLE, WA 98101", "123 MAIN ST UNIT 5 6, SEATTLE, WA 98101"),
             ("123 MAIN ST LOT 1 UNIT 2, SEATTLE, WA 98101", "123 MAIN ST LOT 2 UNIT 1, SEATTLE, WA 98101"),
             ("123 MAIN ST 1-23, SEATTLE, WA 98101", "123 MAIN ST #12-3, SEATTLE, WA 98101"),
             ("123 MAIN ST BLDG 1 UNIT 23, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 BLDG 23, SEATTLE, WA 98101"),
@@ -565,3 +567,7 @@ class TestPunctuationAndSpacing:
                      ("123 MAIN ST UNIT F-203", "123 MAIN ST #F203"),
                      ("123 MAIN ST UNIT G 304", "123 MAIN ST #G304")):
             assert compute_owner_flags(f"{a}, SEATTLE, WA 98101", f"{b}, SEATTLE, WA 98101")["absentee_owner"] is False, a
+
+    def test_trailing_period_on_a_unit_is_not_a_different_unit(self):
+        f = compute_owner_flags("123 MAIN ST UNIT 5., SEATTLE, WA 98101", "123 MAIN ST UNIT 5, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is False

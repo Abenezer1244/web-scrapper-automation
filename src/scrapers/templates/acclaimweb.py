@@ -18,6 +18,7 @@ import asyncio
 import html
 import json
 import re
+import time
 from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlparse
 from zoneinfo import ZoneInfo
@@ -41,6 +42,7 @@ from src.scrapers.reliability import (
     classify_results_page,
     detect_block,
 )
+from src.utils.celery_limits import reraise_time_limit
 from src.utils.logger import setup_logger
 
 # Substrings an AcclaimWeb results page renders for a genuine zero-result window.
@@ -230,6 +232,12 @@ _DETAIL_PACE_S = 1.5
 # A document-type search answering this many rows may be the portal's limit, not the
 # whole window (Douglas records ~33 NTS a year).
 _DOC_TYPE_ROW_CAP = 500
+# Douglas answers some searches in over 30 s: its grid wait, and the pause before its one retry.
+_DOUGLAS_SHELL_TIMEOUT_S = 90
+_DOUGLAS_RETRY_PAUSE_S = 15
+# Search time one Douglas run may spend under the long wait; past it, the shared wait.
+# Bounds what a slow portal adds to a canary tick's shared time limit (Codex).
+_DOUGLAS_SLOW_BUDGET_S = 600
 
 
 def parse_detail_apns(html_text: str) -> list[str] | None:
@@ -783,6 +791,7 @@ class AcclaimWebScraper(BridgeScraper):
             except ScraperExecutionError:
                 raise
             except Exception as exc:
+                reraise_time_limit(exc)  # out of time is not a stalled portal
                 raise _transient("the search never loaded its results grid", exc) from exc
             if shell.status != 200:
                 raise _transient(f"results grid shell answered HTTP {shell.status}")
@@ -849,6 +858,7 @@ class AcclaimWebScraper(BridgeScraper):
         try:
             first_text = await asyncio.wait_for(first.text(), _PORTAL_TIMEOUT_S)
         except Exception as exc:  # the body never arrived: worth a re-run
+            reraise_time_limit(exc)
             raise _transient("grid rows could not be read", exc) from exc
         try:
             total, rows = _total_rows(json.loads(first_text))
@@ -881,6 +891,7 @@ class AcclaimWebScraper(BridgeScraper):
                     [first.url, urlencode(form), _PORTAL_TIMEOUT_S * 1000],
                 ), _PORTAL_TIMEOUT_S + 5)
             except Exception as exc:  # the fetch failed or hung (network): worth a re-run
+                reraise_time_limit(exc)
                 raise _transient(f"grid page {page} request failed", exc) from exc
             if status != 200:
                 raise _transient(f"grid page {page} answered HTTP {status}")
@@ -1189,6 +1200,40 @@ class DouglasAcclaimWebScraper(AcclaimWebScraper):
             return
         await super()._submit_search()
 
+    async def _search_rows(self, date_from: str, date_to: str, shell_timeout_s: float = 30) -> list[dict]:
+        """Douglas can take over 30 s to answer a search (the canary failed on exactly
+        that wait, 2026-11-17 02:18 and 05:19 UTC): wait up to 90 s for its grid, until the
+        run has spent _DOUGLAS_SLOW_BUDGET_S searching."""
+        spent = getattr(self, "_douglas_search_s", 0.0)
+        wait = _DOUGLAS_SHELL_TIMEOUT_S if spent < _DOUGLAS_SLOW_BUDGET_S else shell_timeout_s
+        started = time.monotonic()
+        try:
+            return await super()._search_rows(date_from, date_to, shell_timeout_s=wait)
+        finally:
+            self._douglas_search_s = spent + time.monotonic() - started
+
+    async def _search_and_read(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
+        """A stalled search is retried once per run (Chelan's discovery does the same per
+        day); a second stall raises, so a day is never silently skipped, and one retry per
+        run bounds what slow days add to the job's time limit (Codex).
+
+        The retry loads the form as a new document: the stalled search's page, and any
+        late answer it would still act on, is gone, so its grid read cannot be taken for
+        the retry's (both carry the same dates, Codex)."""
+        try:
+            return await super()._search_and_read(date_from, date_to)
+        except TransientScrapeError:
+            if getattr(self, "_douglas_retried", False):
+                raise
+            self._douglas_retried = True
+            _logger.warning("Douglas search %s-%s stalled; retrying once on a fresh form", date_from, date_to)
+            await asyncio.sleep(_DOUGLAS_RETRY_PAUSE_S)
+            await self.page.goto(f"{self.base_url}/search/SearchTypeRecordDate",
+                                 wait_until="domcontentloaded", timeout=60_000)
+            await self._accept_disclaimer()
+            await self._fill_dates(date_from, date_to)
+            return await super()._search_and_read(date_from, date_to)
+
     async def collect_by_doc_type(self, date_from: str, date_to: str,
                                   descriptions: dict[str, str], readable) -> list[dict]:
         """Every recording of each document type in the window, with its detail page:
@@ -1250,8 +1295,9 @@ class DouglasAcclaimWebScraper(AcclaimWebScraper):
 
             self.page.on("request", _form_post)
             try:
-                # A months-long document-type search answers slower than one day's.
-                rows = await self._search_rows(date_from, date_to, shell_timeout_s=90)
+                # A months-long document-type search answers slower than one day's; the
+                # Douglas _search_rows already waits up to _DOUGLAS_SHELL_TIMEOUT_S for it.
+                rows = await self._search_rows(date_from, date_to)
             finally:
                 self.page.remove_listener("request", _form_post)
             sent = [dict(parse_qsl(p)) for p in posts]

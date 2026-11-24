@@ -768,3 +768,172 @@ async def test_a_type_the_site_has_no_vocabulary_for_is_refused_not_unfiltered()
     with pytest.raises(ScraperExecutionError, match="no document vocabulary"):
         await d.scrape("10/06/2026", "10/06/2026")
     assert d.page is None  # refused before any browser or portal request
+
+
+# ── Douglas's slow portal: a stalled search is retried once on a fresh form ─────
+
+class _FillsRecorded(DouglasAcclaimWebScraper):
+    """The real Douglas search, retry and form reload; the date fill is recorded (the
+    fixture page has no date inputs)."""
+
+    async def _fill_dates(self, date_from, date_to):
+        self.filled = (date_from, date_to)
+
+
+async def _douglas_portal(browser, data=None, *, shell=None):
+    """Douglas's fixture portal, counting form loads and grid reads. ``shell(n, route)``
+    may answer the n-th grid shell itself (return True) or leave it to the portal."""
+    page = await _portal(browser, [data or _DOUGLAS], first_body="sort=&group=&filter=")
+    seen = {"shells": 0, "grids": 0, "forms": 0}
+
+    async def on_shell(route):
+        seen["shells"] += 1
+        if not (shell and await shell(seen["shells"], route)):
+            await route.fallback()
+
+    async def on_grid(route):
+        seen["grids"] += 1
+        await route.fallback()
+
+    async def on_form(route):
+        seen["forms"] += 1
+        await route.fallback()
+
+    await page.route(f"{_HOST}/AcclaimWeb/Search/PartialGrid*", on_shell)
+    await page.route(f"{_HOST}/AcclaimWeb/Search/GridResults*", on_grid)
+    await page.route(f"{_SEARCH}*", on_form)
+    return page, seen
+
+
+def _fail_first(k):
+    async def shell(n, route):
+        if n <= k:
+            await route.fulfill(status=503, body="busy")
+            return True
+        return False
+    return shell
+
+
+@pytest.fixture
+def no_pause(monkeypatch):
+    import src.scrapers.templates.acclaimweb as aw
+
+    monkeypatch.setattr(aw, "_DOUGLAS_RETRY_PAUSE_S", 0)
+    return aw
+
+
+_LIS = [r for r in _DOUGLAS["Data"] if r["DocTypeDescription"] == "LIS PENDENS"]
+
+
+async def test_douglas_reads_the_day_after_one_stalled_search_on_a_new_page(browser, no_pause):
+    page, seen = await _douglas_portal(browser, shell=_fail_first(1))
+    s = _scraper(page, cls=_FillsRecorded, record_type="pre_foreclosure")
+    recs = await s._search_and_read("10/06/2026", "10/06/2026")
+    assert len(recs) == len(_LIS) >= 1
+    assert seen["shells"] == 2 and seen["forms"] == 1  # the form was loaded anew
+    assert s.filled == ("10/06/2026", "10/06/2026")
+
+
+async def test_douglas_two_stalled_searches_fail_the_day_not_skip_it(browser, no_pause):
+    page, seen = await _douglas_portal(browser, shell=_fail_first(2))
+    s = _scraper(page, cls=_FillsRecorded, record_type="pre_foreclosure")
+    with pytest.raises(TransientScrapeError):
+        await s._search_and_read("10/06/2026", "10/06/2026")
+    assert seen["shells"] == 2  # one retry, no more
+
+
+async def test_douglas_retries_once_per_run_not_once_per_day(browser, no_pause):
+    async def first_and_third(n, route):
+        if n in (1, 3):
+            await route.fulfill(status=503, body="busy")
+            return True
+        return False
+
+    page, seen = await _douglas_portal(browser, shell=first_and_third)
+    s = _scraper(page, cls=_FillsRecorded, record_type="pre_foreclosure")
+    assert await s._search_and_read("10/06/2026", "10/06/2026")
+    with pytest.raises(TransientScrapeError):  # a later stalled day is not retried again
+        await s._search_and_read("10/06/2026", "10/06/2026")
+    assert seen["shells"] == 3 and seen["forms"] == 1
+
+
+async def test_a_late_answer_to_the_stalled_search_is_never_read_as_the_retry(browser, monkeypatch, no_pause):
+    """The stalled search's shell answers after its wait gave up; on the old page that
+    answer would post a grid read the retry could take for its own (Codex). The retry's
+    new page means it never posts."""
+    monkeypatch.setattr(no_pause, "_DOUGLAS_SHELL_TIMEOUT_S", 1)
+
+    async def late_first(n, route):
+        if n == 1:
+            await asyncio.sleep(2.5)
+            try:
+                await route.fallback()
+            except Exception:  # noqa: BLE001 -- the page that asked is gone
+                pass
+            return True
+        return False
+
+    page, seen = await _douglas_portal(browser, shell=late_first)
+    s = _scraper(page, cls=_FillsRecorded, record_type="pre_foreclosure")
+    recs = await s._search_and_read("10/06/2026", "10/06/2026")
+    await page.wait_for_timeout(3_000)  # past the late answer
+    assert len(recs) == len(_LIS)
+    assert seen["grids"] == 1  # only the retry's own grid read
+
+
+async def test_douglas_schema_drift_is_not_retried(browser, no_pause):
+    data = copy.deepcopy(_DOUGLAS)
+    data["Total"] = len(data["Data"]) + 5  # rows short of the portal's own count
+    page, seen = await _douglas_portal(browser, data)
+    s = _scraper(page, cls=_FillsRecorded, record_type="pre_foreclosure")
+    with pytest.raises(ScraperExecutionError) as err:
+        await s._search_and_read("10/06/2026", "10/06/2026")
+    assert not isinstance(err.value, TransientScrapeError)
+    assert seen["forms"] == 0
+
+
+async def test_douglas_waits_past_the_shared_30s_for_its_grid(browser, no_pause, monkeypatch):
+    # Scaled down: the shell answers after 1.5 s; the caller's wait would be 1 s.
+    monkeypatch.setattr(no_pause, "_DOUGLAS_SHELL_TIMEOUT_S", 3)
+
+    async def slow(n, route):
+        await asyncio.sleep(1.5)
+        return False
+
+    page, seen = await _douglas_portal(browser, shell=slow)
+    s = _scraper(page, cls=_FillsRecorded, record_type="pre_foreclosure")
+    assert await s._search_rows("10/06/2026", "10/06/2026", shell_timeout_s=1)
+    assert seen["forms"] == 0
+
+
+async def test_douglas_falls_back_to_the_shared_wait_once_its_slow_budget_is_spent(browser, no_pause, monkeypatch):
+    # Scaled down: long wait 3 s, shared wait 1 s, shell answers after 1.5 s.
+    monkeypatch.setattr(no_pause, "_DOUGLAS_SHELL_TIMEOUT_S", 3)
+    monkeypatch.setattr(no_pause, "_DOUGLAS_SLOW_BUDGET_S", 1)
+
+    async def slow(n, route):
+        await asyncio.sleep(1.5)
+        return False
+
+    page, seen = await _douglas_portal(browser, shell=slow)
+    s = _scraper(page, cls=_FillsRecorded, record_type="pre_foreclosure")
+    assert await s._search_rows("10/06/2026", "10/06/2026", shell_timeout_s=1)  # in budget
+    with pytest.raises(TransientScrapeError):  # budget spent: the 1 s shared wait applies
+        await s._search_rows("10/06/2026", "10/06/2026", shell_timeout_s=1)
+
+
+class SoftTimeLimitExceeded(Exception):
+    """Named as Celery's: the scraper layer matches its time limits by class name."""
+
+
+class _OutOfTimeMidSearch(_FillsRecorded):
+    async def _submit_search(self):
+        raise SoftTimeLimitExceeded()
+
+
+async def test_running_out_of_time_mid_search_is_not_a_stall_and_is_not_retried(browser, no_pause):
+    page, seen = await _douglas_portal(browser)
+    s = _scraper(page, cls=_OutOfTimeMidSearch, record_type="pre_foreclosure")
+    with pytest.raises(SoftTimeLimitExceeded):
+        await s._search_and_read("10/06/2026", "10/06/2026")
+    assert seen["forms"] == 0

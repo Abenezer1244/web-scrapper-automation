@@ -19,6 +19,29 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-24 — Benton no-address leads: honest labels + review-only parcel candidate (#675)
+
+**Built / Shipped:** #675 merged as `a36d4acf`, worker deployed. Started from the owner asking why 9 Benton probate / death-certificate leads in one run had no address.
+- `recording_cover_sheet`: separator punctuation around a value is stripped (a form printing `No .: N/A`), so a filer's N/A is read as a blank parcel (`none`) instead of `unreadable`.
+- `pacs_parcel.parse_prefix_results` / `resolve_prefixes`: for an `unreadable` row whose recorder index carries a parcel prefix of at least 10 characters, distinct 10–14 digit prefixes are searched on Benton PACS by account number. At most one search POST per prefix per call, under its own admission lease with the same admission mechanism, source-health check and ownership-year logic as `resolve_mailing`; a 403 or 429 marks the source blocked and stops.
+- `eagleweb._resolve_index_prefixes`: when a complete, parseable grid holds exactly one distinct 15-digit Geo ID starting with the prefix, the row gets `apn_candidates=[geo]`, outcome `ambiguous` and evidence text ("needs review"). It **never** sets `parcel_id`.
+
+**Tried / Decided:**
+- Auto-attaching the prefix match, gated on a surname check against the assessor owner, was built and then removed. Codex review found repeated ways the check passed for the wrong parcel: truncated compound surnames, a surname that is the prefix of a longer one, first-name prefixes, and a stale index naming another parcel. Owner chose **review only**.
+- OCR was evaluated for the remaining rows and does not help: one document has a text layer but is a title-company cover page with no parcel field (I first wrongly called it image-only); another is an `.A1` attachment whose PDF layout the OCR child (one image per page only) rejects.
+
+**Attribution of the 9 rows:** 2 blank parcel field on the county document; 2 filer wrote N/A (one was mislabelled `unreadable`, now fixed); 1 names two parcels (held for review); 2 handwritten parcels (one now has a single review candidate, the other's 8-digit prefix is too short to search); 2 where OCR cannot help (above). Separately, one pre-foreclosure lead has no address because the county has none on file. Net: one row is our gap closed, one gained a candidate, the rest are what the county documents contain.
+
+**Caught & fixed:** a Geo ID cell is accepted only if it is digits and dashes with digits at both ends, otherwise the result is `unparsed` (a malformed cell could otherwise yield a valid-looking ID). A grid whose heading shows more rows than are on the page ("1 - 1 of 25") is `ambiguous`, not `found`. The first prefix test used hand-made HTML that `_grid_is_complete` rejected; replaced with a real Benton results fixture.
+
+**Failed / Blocked:** CI Test failed once on a date-bound Snohomish test (`test_the_live_revision_is_inside_the_ceiling`), unrelated; merging origin/main, which already had the fix, cleared it. Auto-merge through the PR tool was denied by the permission classifier; the merge was queued with `gh pr merge --squash --auto` after the owner typed the merge command.
+
+**Pending / Handoff:** every Benton config is `manual` (no scheduled run), so the new labels appear only on the next manual run. The one review candidate needs a human decision before any parcel is attached; nothing downstream does it automatically.
+
+**Facts learned:** Benton PACS account-number search behaves as a prefix search. A result grid counts as complete only when its "1 - N of M" heading parses, there are no paging links, and the heading agrees with the rows parsed.
+
+---
+
 ## 2026-11-24 — Absentee owner, part 2: punctuation, explicit units, and 47 Codex rounds (#679)
 
 **Built / Shipped:** #679 merged as `65319b8e`, deployed. Comparison-only (`address_match_key` untouched):

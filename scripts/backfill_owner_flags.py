@@ -39,15 +39,15 @@ from src.utils.address_intel import compute_owner_flags
 
 _SELECT = text(
     """
-    SELECT id, property_address, mailing_address
+    SELECT id, property_address, mailing_address, property_city, property_state, property_zip
     FROM results
     WHERE owner_state IS NULL
       AND property_state IS NULL
       AND absentee_owner IS NULL
       AND out_of_state_owner IS NULL
+      AND id > :after
     ORDER BY id
     LIMIT :lim
-    OFFSET :off
     """
 )
 
@@ -59,47 +59,18 @@ _UPDATE = text(
         absentee_owner = :absentee_owner,
         out_of_state_owner = :out_of_state_owner
     WHERE id = :id
+      AND property_address IS NOT DISTINCT FROM :pa
+      AND mailing_address IS NOT DISTINCT FROM :ma
+      AND property_city IS NOT DISTINCT FROM :pc
+      AND property_zip IS NOT DISTINCT FROM :pz
+      AND absentee_owner IS NOT DISTINCT FROM :cur_absentee
+      AND owner_state IS NOT DISTINCT FROM :cur_owner_state
+      AND property_state IS NOT DISTINCT FROM :cur_property_state
+      AND out_of_state_owner IS NOT DISTINCT FROM :cur_out_of_state
     """
-)
-
-
-# Targeted recompute (2026-09-02): rows already flagged absentee_owner=TRUE whose
-# mailing street merely EXTENDS the property street (county situs dropped the
-# suffix / post-directional: "20508 ISLAND PKWY" vs "20508 ISLAND PKWY E …").
-# compute_owner_flags now reads those as unknown (NULL), not absentee. The NULL
-# window above never revisits them, so this mode re-evaluates exactly that set.
-_SELECT_SUFFIXLESS = text(
-    """
-    SELECT id, property_address, mailing_address
-    FROM results
-    WHERE absentee_owner IS TRUE
-      AND property_address IS NOT NULL
-      AND mailing_address IS NOT NULL
-      AND UPPER(mailing_address) LIKE UPPER(property_address) || ' %'
-    ORDER BY id
-    """
-)
-
-
-def recompute_suffixless(commit: bool) -> None:
-    changed = 0
-    scanned = 0
-    with system_sync_session() as db:
-        rows = db.execute(_SELECT_SUFFIXLESS).fetchall()
-        for rid, prop, mail in rows:
-            scanned += 1
-            flags = compute_owner_flags(prop, mail)
-            if flags["absentee_owner"] is True:
-                continue  # still a different place (e.g. different ZIP) — keep
-            print(f"  {rid}: absentee True -> {flags['absentee_owner']}  [{prop!r} vs {mail!r}]", flush=True)
-            changed += 1
-            if commit:
-                db.execute(_UPDATE, {"id": rid, **flags})
-        if commit:
-            db.commit()
-    print("\n=== suffixless absentee recompute ===")
-    print(f"scanned:   {scanned}")
-    print(f"corrected: {changed}" + ("" if commit else "  (DRY RUN — re-run with --commit)"))
+)  # guarded: a row a worker changed after it was read is skipped, never clobbered (Codex)
+_NULL_FLAGS = {"cur_absentee": None, "cur_owner_state": None, "cur_property_state": None,
+               "cur_out_of_state": None}
 
 
 # Recompute (2026-11-15) of every absentee_owner=TRUE row after the same-place fixes
@@ -111,7 +82,7 @@ _SELECT_ABSENTEE = text(
     """
     SELECT id, property_address, mailing_address, property_city, property_state, property_zip
     FROM results
-    WHERE absentee_owner IS TRUE AND id > :after
+    WHERE absentee_owner = :cur AND id > :after
       AND property_address IS NOT NULL AND mailing_address IS NOT NULL
     ORDER BY id
     LIMIT :lim
@@ -120,7 +91,7 @@ _SELECT_ABSENTEE = text(
 _UPDATE_ABSENTEE = text(
     """
     UPDATE results SET absentee_owner = :absentee
-    WHERE id = :id AND absentee_owner IS TRUE
+    WHERE id = :id AND absentee_owner = :cur
       AND property_address IS NOT DISTINCT FROM :pa AND mailing_address IS NOT DISTINCT FROM :ma
       AND property_city IS NOT DISTINCT FROM :pc AND property_state IS NOT DISTINCT FROM :ps
       AND property_zip IS NOT DISTINCT FROM :pz
@@ -128,41 +99,45 @@ _UPDATE_ABSENTEE = text(
 )
 
 
-def recompute_absentee(commit: bool, batch: int) -> None:
+def recompute_absentee(commit: bool, batch: int, cur: bool = True) -> None:
+    """Re-evaluate every row whose absentee_owner is `cur`; write only rows that change.
+
+    cur=False (2026-11-17) re-checks rows an earlier, looser rule cleared: Codex judged
+    the spaced house letter ("2651 B" vs "2651B") ambiguous, so those go back to True.
+    """
     after = "00000000-0000-0000-0000-000000000000"
-    scanned = to_false = to_none = written = skipped = 0
+    scanned = written = skipped = 0
+    changed: dict[object, int] = {}
     shown = 0
     with system_sync_session() as db:
         while True:
-            rows = db.execute(_SELECT_ABSENTEE, {"after": after, "lim": batch}).fetchall()
+            rows = db.execute(_SELECT_ABSENTEE, {"after": after, "lim": batch, "cur": cur}).fetchall()
             if not rows:
                 break
             for rid, pa, ma, pc, ps, pz in rows:
                 scanned += 1
                 new = compute_owner_flags(pa, ma, property_city=pc, property_state=ps,
                                           property_zip=pz)["absentee_owner"]
-                if new is True:
+                if new is cur:
                     continue
-                if new is False:
-                    to_false += 1
-                else:
-                    to_none += 1
+                changed[new] = changed.get(new, 0) + 1
                 if shown < 40:  # sample for operator review in the run log
-                    print(f"  {rid}: True -> {new}  [{pa!r} vs {ma!r}]", flush=True)
+                    print(f"  {rid}: {cur} -> {new}  [{pa!r} vs {ma!r}]", flush=True)
                     shown += 1
                 if commit:
-                    n = db.execute(_UPDATE_ABSENTEE, {"id": rid, "absentee": new, "pa": pa, "ma": ma,
-                                                      "pc": pc, "ps": ps, "pz": pz}).rowcount
+                    n = db.execute(_UPDATE_ABSENTEE, {"id": rid, "absentee": new, "cur": cur,
+                                                      "pa": pa, "ma": ma, "pc": pc, "ps": ps,
+                                                      "pz": pz}).rowcount
                     written += n
                     skipped += 1 - n
             after = str(rows[-1][0])
             if commit:
                 db.commit()
-            print(f"  scanned={scanned} true->false={to_false} true->none={to_none}", flush=True)
+            print(f"  scanned={scanned} changed={changed}", flush=True)
     print("\n=== absentee recompute ===")
-    print(f"scanned:       {scanned}")
-    print(f"True -> False: {to_false}")
-    print(f"True -> None:  {to_none}")
+    print(f"scanned rows with absentee={cur}: {scanned}")
+    for new, n in changed.items():
+        print(f"{cur} -> {new}: {n}")
     if commit:
         print(f"written: {written}  skipped (row changed meanwhile): {skipped}")
     else:
@@ -174,19 +149,17 @@ def main() -> None:
     ap.add_argument("--commit", action="store_true", help="apply updates (default: dry run)")
     ap.add_argument("--batch", type=int, default=1000, help="rows per chunk (Codex: 1k-5k)")
     ap.add_argument(
-        "--recompute-suffixless", action="store_true",
-        help="only re-evaluate absentee=TRUE rows whose mailing street extends the property street",
-    )
-    ap.add_argument(
         "--recompute-absentee", action="store_true",
         help="re-evaluate every absentee=TRUE row with the structured situs parts; writes absentee_owner only",
     )
+    ap.add_argument(
+        "--recompute-not-absentee", action="store_true",
+        help="re-evaluate every absentee=FALSE row the same way (rows a looser rule cleared)",
+    )
     args = ap.parse_args()
-    if args.recompute_absentee:
-        recompute_absentee(args.commit, max(100, min(args.batch, 5000)))
-        return
-    if args.recompute_suffixless:
-        recompute_suffixless(args.commit)
+    if args.recompute_absentee or args.recompute_not_absentee:
+        recompute_absentee(args.commit, max(100, min(args.batch, 5000)),
+                           cur=not args.recompute_not_absentee)
         return
     batch = max(100, min(args.batch, 5000))
 
@@ -194,24 +167,24 @@ def main() -> None:
     would_set = {"property_state": 0, "owner_state": 0, "absentee": 0, "out_of_state": 0}
     committed = 0
 
-    # The SELECT window is "all four flags still NULL". On --commit, a row that gets
-    # any non-NULL flag leaves the window; rows that stay all-NULL (no parseable
-    # data at all) remain, so OFFSET must skip PAST them or the next read re-fetches
-    # them forever. `offset` counts intentionally-left-NULL rows and PERSISTS across
-    # reconnects (below), so a dropped pooler connection just resumes where it was.
-    offset = 0
+    # Keyset paging by id: a row leaving the all-NULL window (written here or by a
+    # worker) can never shift the next page, so nothing is skipped (Codex). `after`
+    # persists across reconnects, so a dropped pooler connection resumes in place.
+    after = "00000000-0000-0000-0000-000000000000"
     done = False
     while not done:
         try:
             with system_sync_session() as db:
                 while True:
-                    rows = db.execute(_SELECT, {"lim": batch, "off": offset}).fetchall()
+                    rows = db.execute(_SELECT, {"lim": batch, "after": after}).fetchall()
                     if not rows:
                         done = True
                         break
-                    chunk_left_null = 0
-                    for rid, prop, mail in rows:
-                        flags = compute_owner_flags(prop, mail)
+                    for rid, prop, mail, pc, ps, pz in rows:
+                        # With the structured situs parts, exactly as the worker does, so
+                        # a row is never settled on a weaker verdict than live rows get.
+                        flags = compute_owner_flags(prop, mail, property_city=pc,
+                                                    property_state=ps, property_zip=pz)
                         scanned += 1
                         if flags["property_state"]:
                             would_set["property_state"] += 1
@@ -222,22 +195,20 @@ def main() -> None:
                         if flags["out_of_state_owner"] is not None:
                             would_set["out_of_state"] += 1
                         has_any = any(v is not None for v in flags.values())
-                        if not has_any:
-                            chunk_left_null += 1  # stays in the NULL window — skip past it
-                        elif args.commit:
-                            db.execute(_UPDATE, {"id": rid, **flags})
+                        if has_any and args.commit:
+                            # Selected from the all-NULL window, so all four were NULL.
+                            db.execute(_UPDATE, {"id": rid, **flags, "pa": prop, "ma": mail,
+                                                 "pc": pc, "pz": pz, **_NULL_FLAGS})
                             committed += 1
                     if args.commit:
                         db.commit()
-                        offset += chunk_left_null  # committed rows left the window already
-                    else:
-                        offset += len(rows)  # dry run changes nothing; walk the whole table
-                    print(f"  scanned={scanned} committed={committed} offset={offset}", flush=True)
+                    after = str(rows[-1][0])
+                    print(f"  scanned={scanned} committed={committed} after={after}", flush=True)
         except OperationalError as exc:
             # Supavisor drops long-lived sessions; commits are per-chunk so progress
-            # is durable. Reconnect and resume from the preserved offset.
+            # is durable. Reconnect and resume after the last id read.
             print(f"  [reconnect] pooler dropped the session ({str(exc).splitlines()[0][:60]}); "
-                  f"resuming at offset={offset} in 5s", flush=True)
+                  f"resuming after {after} in 5s", flush=True)
             time.sleep(5)
 
     print("\n=== owner-flag backfill ===")

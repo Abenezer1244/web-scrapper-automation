@@ -3,7 +3,12 @@
 Real parsing, no mocks. Pins the absentee/out-of-state semantics Codex specified:
 component compare, unit-only difference is NOT absentee, NULL when unknown.
 """
-from src.utils.address_intel import _normalize_street, compose_situs, compute_owner_flags
+from src.utils.address_intel import (
+    _compare_street,
+    _normalize_street,
+    compose_situs,
+    compute_owner_flags,
+)
 
 
 class TestNormalizeStreet:
@@ -296,10 +301,14 @@ class TestSamePlaceWrittenDifferently:
         ):
             assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
 
-    def test_split_house_letter(self):
-        f = compute_owner_flags("2651B NW 57TH ST, SEATTLE, WA 98107",
-                                "2651 B NW 57TH ST, SEATTLE, WA 98107")
-        assert f["absentee_owner"] is False
+    def test_spaced_house_letter_is_not_matched(self):
+        # "123 B MAIN ST" may be B Main Street (Codex), so a spaced letter keeps today's
+        # answer, and so does the hyphenated "2651-B".
+        for a, b in (("2651B NW 57TH ST", "2651 B NW 57TH ST"), ("123B MAIN ST", "123 B MAIN ST")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98107", f"{b}, SEATTLE, WA 98107")["absentee_owner"] is True
+            assert compute_owner_flags(f"{b}, SEATTLE, WA 98107", f"{a}, SEATTLE, WA 98107")["absentee_owner"] is True
+        f = compute_owner_flags("2651B NW 57TH ST, SEATTLE, WA 98107", "2651-B NW 57TH ST, SEATTLE, WA 98107")
+        assert f["absentee_owner"] is True
 
     # Collisions Codex flagged: these must stay different places.
     def test_lettered_street_is_not_a_unit(self):
@@ -334,4 +343,267 @@ class TestSamePlaceWrittenDifferently:
     def test_hyphenated_bare_unit_vs_marked_unit(self):
         f = compute_owner_flags("22222 24TH AVE S C-22, DES MOINES, WA 98198",
                                 "22222 24TH AVE S #C-22, DES MOINES, WA 98198")
+        assert f["absentee_owner"] is False
+
+
+class TestPunctuationAndSpacing:
+    """King leads 2026-11-17: same letters and digits, different punctuation/spacing."""
+
+    def test_real_shapes_are_the_same_place(self):
+        for prop, mail in (
+            ("5639 16TH AVE SW, SEATTLE WA 98106", "5639 16TH AVE. S.W., SEATTLE, WA 98106"),
+            ("5233 19TH AVE SW, SEATTLE WA 98106", "5233 19 TH AVE SW, SEATTLE, WA 98106"),
+        ):
+            assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
+
+    def test_house_number_ordinal_is_not_joined(self):
+        # "19 TH" only joins after the house number; a house "19" on "TH ST" is untouched.
+        assert _compare_street("19 TH ST") == "19 TH ST"
+
+    def test_hyphenated_unit_keeps_its_hyphen(self):
+        f = compute_owner_flags("22222 24TH AVE S C-22, DES MOINES, WA 98198",
+                                "22222 24TH AVE S #C-22, DES MOINES, WA 98198")
+        assert f["absentee_owner"] is False
+
+    def test_house_letter_hyphen_is_not_a_directional(self):
+        # "1508-E" is house 1508E; "1508 E" (East) must not merge with it.
+        f = compute_owner_flags("1508-E SW WEBSTER ST, SEATTLE, WA 98106", "1508 E SW WEBSTER ST, SEATTLE, WA 98106")
+        assert f["absentee_owner"] is True
+
+    def test_typo_is_still_different(self):
+        f = compute_owner_flags("504 29TH AVE S, SEATTLE WA 98144", "504 29THAVE S, SEATTLE, WA 98144")
+        assert f["absentee_owner"] is True
+
+    def test_different_ordinals_stay_different(self):
+        f = compute_owner_flags("5233 19TH AVE SW, SEATTLE WA 98106", "5233 18 TH AVE SW, SEATTLE, WA 98106")
+        assert f["absentee_owner"] is True
+
+    # Codex review (FAIL on the first version): these must stay different places.
+    def test_north_e_street_is_not_ne(self):
+        for a in ("123 N E ST, SEATTLE, WA 98101", "123 NORTH E ST, SEATTLE, WA 98101"):
+            assert compute_owner_flags(a, "123 NE ST, SEATTLE, WA 98101")["absentee_owner"] is True, a
+
+    def test_hyphenated_street_name_is_not_a_unit(self):
+        f = compute_owner_flags("123 LOT-AB RD, SEATTLE, WA 98101", "123 LOT-AC RD, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_road_number_is_not_an_ordinal(self):
+        f = compute_owner_flags("123 23 ROAD, SEATTLE, WA 98101", "123 23RD, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_letter_letter_unit_still_matches(self):
+        f = compute_owner_flags("123 MAIN ST A-B, SEATTLE, WA 98101", "123 MAIN ST #A-B, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is False
+
+    def test_spaced_house_range_keeps_its_dash(self):
+        f = compute_owner_flags("1508 - 1510 MAIN ST, SEATTLE, WA 98101", "1508 1510 MAIN ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_more_real_shapes(self):
+        for prop, mail in (
+            ("4606 247TH PL SE, SAMMAMISH, WA 98029", "4606 247 th Place SE, SAMMAMISH, WA 98029"),
+        ):
+            assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
+
+    def test_every_strippable_designator_blocks_the_hyphen_split(self):
+        for word in ("BLD", "BLDG", "LOT", "TRLR", "DEPT", "SPC"):
+            f = compute_owner_flags(f"123 {word}-AB RD, SEATTLE, WA 98101", f"123 {word}-AC RD, SEATTLE, WA 98101")
+            assert f["absentee_owner"] is True, word
+
+    def test_road_number_with_directional_is_not_an_ordinal(self):
+        f = compute_owner_flags("123 23 ROAD WEST, SEATTLE, WA 98101", "123 23RD W, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_north_e_without_suffix_is_not_ne_street(self):
+        f = compute_owner_flags("123 NORTH E, SEATTLE, WA 98101", "123 NE ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_road_word_never_becomes_an_ordinal(self):
+        f = compute_owner_flags("123 23 ROAD AVE, SEATTLE, WA 98101", "123 23RD AVE, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_lettered_house_range_keeps_its_dash(self):
+        f = compute_owner_flags("1508 - 1510A MAIN ST, SEATTLE, WA 98101", "1508 1510A MAIN ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_house_letter_spellings_keep_todays_answer(self):
+        # No house-letter rule at all (Codex): "123-A-LINE RD" may be A-Line Road.
+        for x, y in (("8337A 12TH AVE NW", "8337-A 12TH AVE NW"), ("123-A-LINE RD", "123A LINE RD")):
+            assert compute_owner_flags(f"{x}, SEATTLE, WA 98117", f"{y}, SEATTLE, WA 98117")["absentee_owner"] is True, x
+            assert compute_owner_flags(f"{y}, SEATTLE, WA 98117", f"{x}, SEATTLE, WA 98117")["absentee_owner"] is True, x
+
+    def test_unit_after_spaced_dash_keeps_todays_answer(self):
+        # The " -" left after the unit strip is not cleaned up: "MAIN ST - LOT A RD" may
+        # be a street name (Codex), so this pair keeps today's answer.
+        f = compute_owner_flags("14703 NE 35th St - Unit D-33, Bellevue WA 98007", "14703 NE 35TH ST, BELLEVUE, WA 98007")
+        assert f["absentee_owner"] is True
+
+    def test_range_guard_is_order_independent(self):
+        a, b = "1508-A - 1510 MAIN ST, SEATTLE, WA 98101", "1508A 1510 MAIN ST, SEATTLE, WA 98101"
+        assert compute_owner_flags(a, b)["absentee_owner"] is True
+        assert compute_owner_flags(b, a)["absentee_owner"] is True
+
+    def test_hyphenated_name_vs_unit_designator(self):
+        for w in ("LOT", "BLD"):
+            a, b = f"123 {w}-AB RD, SEATTLE, WA 98101", f"123 {w} AB RD, SEATTLE, WA 98101"
+            assert compute_owner_flags(a, b)["absentee_owner"] is True, w
+            assert compute_owner_flags(b, a)["absentee_owner"] is True, w
+
+    def test_missing_space_between_words_stays_different(self):
+        for a, b in (("123 RIDGE WOOD RD", "123 RIDGEWOOD RD"), ("15328 SE MAY VALLEY RD", "15328 SE MAYVALLEY RD")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98101", f"{b}, SEATTLE, WA 98101")["absentee_owner"] is True, a
+
+    def test_spelled_out_direction_is_not_half_a_compass_pair(self):
+        a, b = "123 N WEST LAKE RD, SEATTLE, WA 98101", "123 NW LAKE RD, SEATTLE, WA 98101"
+        assert compute_owner_flags(a, b)["absentee_owner"] is True
+        assert compute_owner_flags(b, a)["absentee_owner"] is True
+
+    def test_round_six_pairs_stay_different(self):
+        for a, b in (
+            ("123 N E MAIN ST, SEATTLE, WA 98101", "123 NE MAIN ST, SEATTLE, WA 98101"),
+            ("123-A MAIN ST, SEATTLE, WA 98101", "123 A MAIN ST, SEATTLE, WA 98101"),
+            ("123 LOT.AB RD, SEATTLE, WA 98101-0001", "123 LOT AB RD, SEATTLE, WA 98101-0002"),
+            ("123 23 RD AVE, SEATTLE, WA 98101", "123 23RD AVE, SEATTLE, WA 98101"),
+            ("123 AVENUE N E, SEATTLE, WA 98101", "123 AVENUE NE, SEATTLE, WA 98101"),
+            ("120-122 ND AVE, SEATTLE, WA 98101", "120-122ND AVE, SEATTLE, WA 98101"),
+            ("123 A-B ST, SEATTLE, WA 98101", "123 A B ST, SEATTLE, WA 98101"),
+            ("123-AB MAIN ST, SEATTLE, WA 98101", "123 AB MAIN ST, SEATTLE, WA 98101"),
+            ("123-45-AB MAIN ST, SEATTLE, WA 98101", "123-45 AB MAIN ST, SEATTLE, WA 98101"),
+            ("123-NORTH MAIN ST, SEATTLE, WA 98101", "123-N MAIN ST, SEATTLE, WA 98101"),
+            ("1508 1/2-1510A MAIN ST, SEATTLE, WA 98101", "1508 1/2 1510A MAIN ST, SEATTLE, WA 98101"),
+            ("12.5 MAIN ST, SEATTLE, WA 98101", "12 5 MAIN ST, SEATTLE, WA 98101"),
+            ("123 NORTH-STAR RD, SEATTLE, WA 98101", "123 N-STAR RD, SEATTLE, WA 98101"),
+            ("123 22-ND AVE, SEATTLE, WA 98144", "123 22ND AVE, SEATTLE, WA 98144"),
+            ("12 - 22 ND AVE, SEATTLE, WA 98144", "12 - 22ND AVE, SEATTLE, WA 98144"),
+            ("12 - 22. ND AVE, SEATTLE, WA 98101", "12 - 22 ND AVE, SEATTLE, WA 98101"),
+            ("12 - 22. ND AVE, SEATTLE, WA 98101", "12 - 22 ND AVE, SEATTLE, WA 98101-1234"),
+            ("123 COUNTY ROAD NO 5, WA 98022", "123 COUNTY ROAD NO 7, WA 98022"),
+            ("123 COUNTY ROAD NO. 5, WA 98022", "123 COUNTY ROAD NO 7, WA 98022"),
+            ("123 OLD LOT 5 RD, WA 98052", "123 OLD LOT 7 RD, WA 98052"),
+            ("123 OLD LOT 5 ACCESS RD, WA 98023", "123 OLD, WA 98023"),
+            ("123 OLD LOT 5 ACCESS ALY, SEATTLE, WA 98101", "123 OLD, SEATTLE, WA 98101"),
+            ("123 OLD LOT 1234567 ACCESS ALY, SEATTLE, WA 98101", "123 OLD, SEATTLE, WA 98101"),
+            ("123 COUNTY ROAD #5 ACCESS ALY, SEATTLE, WA 98101", "123 COUNTY ROAD, SEATTLE, WA 98101"),
+            ("123 COUNTY ROAD #5, TACOMA, WA 98402", "123 COUNTY ROAD #6, TACOMA, WA 98402"),
+            ("123 COUNTY RD. #5, TACOMA, WA 98402", "123 COUNTY RD. #6, TACOMA, WA 98402"),
+            ("120 CR #5, TACOMA, WA 98402", "120 CR #6, TACOMA, WA 98402"),
+            ("120 SH #5, WA 98001", "120 SH #6, WA 98001"),
+            ("123 C.R. #5, WA 98801", "123 C.R. #6, WA 98801"),
+            ("123 S.R. #5, WA 98801", "123 S.R. #6, WA 98801"),
+            ("123 TOWNSHIP ROAD #5, WA 98801", "123 TOWNSHIP ROAD #6, WA 98801"),
+            ("123 FOREST SERVICE ROAD #23, RANDLE, WA 98377", "123 FOREST SERVICE ROAD #25, RANDLE, WA 98377"),
+            ("123 FSR #23, RANDLE, WA 98377", "123 FSR #25, RANDLE, WA 98377"),
+            ("123 NFD ROAD #23, RANDLE, WA 98377", "123 NFD ROAD #25, RANDLE, WA 98377"),
+            ("123 MAIN ST UNIT 5, SEATTLE, WA 98101", "123 MAIN ST UNIT 6, SEATTLE, WA 98101"),
+            ("1200 5TH AVE UNIT 5., SEATTLE, WA 98101", "1200 5TH AVE UNIT 6., SEATTLE, WA 98101"),
+            ("1200 5TH AVE BLDG 1 UNIT 5, SEATTLE, WA 98101", "1200 5TH AVE BLDG 2 UNIT 5, SEATTLE, WA 98101"),
+            ("123 MAIN ST BLDG 1 UNIT 23, SEATTLE, WA 98101", "123 MAIN ST BLDG 12 UNIT 3, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT FL, SEATTLE, WA 98101", "123 MAIN ST UNIT RM, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 1-23, SEATTLE, WA 98101", "123 MAIN ST UNIT 12-3, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 1.23, SEATTLE, WA 98101", "123 MAIN ST UNIT 123, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 1/2, SEATTLE, WA 98101", "123 MAIN ST UNIT 12, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 1 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 12, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 1 / 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 2, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT A.B, SEATTLE, WA 98101", "123 MAIN ST UNIT A B, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT A.BC, SEATTLE, WA 98101", "123 MAIN ST UNIT A BC, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT A.1, SEATTLE, WA 98101", "123 MAIN ST UNIT A 1, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT A 12345, SEATTLE, WA 98101", "123 MAIN ST UNIT A, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT A 12345, SEATTLE, WA", "123 MAIN ST UNIT A, SEATTLE, WA"),
+            ("123 MAIN ST BLDG 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 2, SEATTLE, WA 98101"),
+            ("1420 E PINE ST UNIT A WA, SEATTLE, WA 98122", "1420 E PINE ST UNIT A, SEATTLE, WA 98122"),
+            ("123 MAIN ST UNIT 1. 2, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 2, SEATTLE, WA 98101"),
+            ("123 MAIN ST UNIT 5 & 6, SEATTLE, WA 98101", "123 MAIN ST UNIT 5 6, SEATTLE, WA 98101"),
+            ("123 MAIN ST LOT 1 UNIT 2, SEATTLE, WA 98101", "123 MAIN ST LOT 2 UNIT 1, SEATTLE, WA 98101"),
+            ("123 MAIN ST 1-23, SEATTLE, WA 98101", "123 MAIN ST #12-3, SEATTLE, WA 98101"),
+            ("123 MAIN ST BLDG 1 UNIT 23, SEATTLE, WA 98101", "123 MAIN ST UNIT 1 BLDG 23, SEATTLE, WA 98101"),
+            ("123 COUNTY ROAD NO. #5, WA 98801", "123 COUNTY ROAD NO. #6, WA 98801"),
+            ("120 OLD LOT 5 WY, TACOMA, WA 98402", "120 OLD LOT 6 WY, TACOMA, WA 98402"),
+            ("123 COUNTY ROAD #5.5 ACCESS ALY, TACOMA, WA 98402", "123 COUNTY ROAD #5.6 ACCESS ALY, TACOMA, WA 98402"),
+            ("123 N.E. MAIN ST, SEATTLE, WA 98101", "123 N E MAIN ST, SEATTLE, WA 98101"),
+            ("123 MAIN ST - LOT A RD, SEATTLE, WA 98144", "123 MAIN ST, SEATTLE, WA 98144"),
+            ("1817 29TH AVE W, SEATTLE, WA 98199", "1817 - 29TH AVENUE WEST, SEATTLE, WA 98199"),
+            ("123 MAIN AVE N E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
+            ("123 MAIN AVE N. E, SEATTLE, WA 98101", "123 MAIN AVE NE, SEATTLE, WA 98101"),
+            ("123 - N MAIN ST, SEATTLE, WA 98101", "123N MAIN ST, SEATTLE, WA 98101"),
+            ("123-N MAIN ST, SEATTLE, WA 98101", "123N MAIN ST, SEATTLE, WA 98101"),
+            ("1508-E SW WEBSTER ST, SEATTLE, WA 98106", "1508E SW WEBSTER ST, SEATTLE, WA 98106"),
+        ):
+            assert compute_owner_flags(a, b)["absentee_owner"] is True, a
+            assert compute_owner_flags(b, a)["absentee_owner"] is True, a
+
+    def test_hyphen_vs_space_keeps_todays_answer(self):
+        # Owner decision 2026-11-17 after Codex: "OLD-MILL RD" may not be "OLD MILL RD",
+        # so no hyphen re-spelling is matched, even for real same-place shapes.
+        for a, b in (
+            ("13570 BEL RED RD, BELLEVUE, WA 98005", "13570 BEL-RED RD, BELLEVUE, WA 98005"),
+            ("123 OLD-MILL RD, SEATTLE, WA 98144", "123 OLD MILL RD, SEATTLE, WA 98144"),
+        ):
+            assert compute_owner_flags(a, b)["absentee_owner"] is True, a
+            assert compute_owner_flags(b, a)["absentee_owner"] is True, a
+
+    def test_words_starting_with_a_designator_are_not_units(self):
+        # "NORTH" / "NOBLE" start with "NO"; "LOTUS" with "LOT" (regression guard).
+        for a, b in (("411 N 90TH ST #406", "411 NORTH 90TH STREET UNIT #406"),
+                     ("123 NOBLE ST", "123 NOBLE STREET"), ("123 LOTUS LN", "123 LOTUS LANE")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98103", f"{b}, SEATTLE, WA 98103")["absentee_owner"] is False, a
+
+    def test_trailing_unit_only_difference_stays_same_place(self):
+        # Product rule: a unit-only difference on the same street + ZIP is not absentee.
+        for a, b in (("12602 109TH CT NE #G304", "12602 109TH CT NE UNIT G 304"),
+                     ("6021 199TH ST NE", "6021 199TH ST NE BLDG B")):
+            assert compute_owner_flags(f"{a}, KIRKLAND, WA 98034", f"{b}, KIRKLAND, WA 98034")["absentee_owner"] is False, a
+
+    def test_dotted_pre_directional_matches(self):
+        f = compute_owner_flags("22218 SE 272ND PL, MAPLE VALLEY, WA 98038", "22218 S.E. 272ND PL., MAPLE VALLEY, WA 98038")
+        assert f["absentee_owner"] is False
+
+    def test_unit_tail_shapes_stay_same_place(self):
+        for a, b in (("24815 LAKE FENWICK RD S", "24815 LAKE FENWICK RD S UNIT 4 DZ"),
+                     ("15330 40TH AVE W", "15330 40TH AVE W UNIT A AND B")):
+            assert compute_owner_flags(f"{a}, KENT, WA 98032", f"{b}, KENT, WA 98032")["absentee_owner"] is False, b
+
+    def test_apartment_on_a_named_road_is_a_unit(self):
+        # 56 owner-occupied King leads (2026-11-24): "#321" after an ordinary RD is an apartment.
+        for a, b in (("7431 OLD REDMOND RD UNIT 321", "7431 OLD REDMOND RD #321"),
+                     ("7399 OLD REDMOND RD UNIT 212", "7399 OLD REDMOND RD"),
+                     ("23120 SE BLACK NUGGET RD A3", "23120 SE BLACK NUGGET RD #A3")):
+            assert compute_owner_flags(f"{a}, REDMOND, WA 98052", f"{b}, REDMOND, WA 98052")["absentee_owner"] is False, a
+
+    def test_unit_spellings_of_one_unit_match(self):
+        for a, b in (("123 MAIN ST BLDG 1 UNIT 23", "123 MAIN ST UNIT 23 BLDG 1"),
+                     ("123 MAIN ST UNIT F-203", "123 MAIN ST #F203"),
+                     ("123 MAIN ST UNIT G 304", "123 MAIN ST #G304")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98101", f"{b}, SEATTLE, WA 98101")["absentee_owner"] is False, a
+
+    def test_trailing_period_on_a_unit_is_not_a_different_unit(self):
+        f = compute_owner_flags("123 MAIN ST UNIT 5., SEATTLE, WA 98101", "123 MAIN ST UNIT 5, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is False
+
+    def test_zip_after_a_comma_less_unit_is_not_part_of_the_unit(self):
+        # 2026-11-24 dry run: the situs had no commas, so its ZIP sat after the unit.
+        for a, b in (("4120 S 225TH PL #26 98032", "4120 S 225TH PL #26, KENT, WA 98032"),
+                     ("2348 FAIRVIEW AVE E #203 98102", "2348 FAIRVIEW AVE E #203, SEATTLE, WA 98102")):
+            assert compute_owner_flags(a, b)["absentee_owner"] is not True, a
+
+    def test_dry_run_regressions_stay_same_place(self):
+        # 2026-11-24 dry run: these were wrongly flipped by earlier unit/dot rules.
+        for a, b in (("23708 LOCUST WAY SPC 38-B, BOTHELL, WA 98021", "23708 LOCUST WAY # 38B, BOTHELL, WA 98021"),
+                     ("20102 67TH AVE NE SPC 9, ARLINGTON, WA 98223", "20102 67TH AVE NE #9, ARLINGTON, WA 98223"),
+                     ("4420 S 200TH ST, KENT, WA 98032", "4420 S.200TH ST., KENT, WA 98032")):
+            assert compute_owner_flags(a, b)["absentee_owner"] is False, a
+
+    def test_own_zip_after_a_comma_less_unit_is_trimmed(self):
+        # 2026-11-24 dry run: structured ZIP beside a comma-less situs line.
+        f = compute_owner_flags("1420 E PINE ST #409 98122", "1420 E PINE ST #409, SEATTLE, WA 98122",
+                                property_state="WA", property_zip="98122")
+        assert f["absentee_owner"] is False
+
+    def test_unit_synonyms_and_generic_hash_match(self):
+        for a, b in (("1420 E PINE ST APT 5", "1420 E PINE ST UNIT 5"), ("1420 E PINE ST STE 5", "1420 E PINE ST #5"),
+                     ("1420 E PINE ST SPC 5", "1420 E PINE ST # 5")):
+            assert compute_owner_flags(f"{a}, SEATTLE, WA 98122", f"{b}, SEATTLE, WA 98122")["absentee_owner"] is False, a
+
+    def test_mobile_home_space_and_unit_are_one_dwelling(self):
+        # 17 owner-occupied Snohomish leads (2026-11-24): county "SPC 91", mail "UNIT 91".
+        f = compute_owner_flags("3333 228TH ST SE SPC 91, BOTHELL, WA 98021", "3333 228TH ST SE UNIT 91, BOTHELL, WA 98021")
         assert f["absentee_owner"] is False

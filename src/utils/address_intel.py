@@ -151,13 +151,346 @@ _MARKED_UNIT_RE = re.compile(
 )
 
 
+# A dot right after a digit stays with the number in every comparison path: "12.5 MAIN"
+# is not "12 5 MAIN" and "12 - 22. ND AVE" is not "12 - 22 ND AVE" (Codex). Dots after
+# letters ("AVE.", "S.W.", "ST. JOHN") are abbreviations and are still dropped.
+_DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
+# A dot directly between two letters ("N.E.", "S.W.", a unit "A.BC") is kept too, so the
+# dot-dropping paths never equate it with a space: "N.E. MAIN" is not "N E MAIN" (North E
+# Main), "UNIT A.BC" is not "UNIT A BC" (Codex). A dot before a space ("AVE. S") still goes.
+_LETTER_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=[A-Z])", re.IGNORECASE)
+# Inside a unit id a letter-digit dot is kept too ("UNIT A.1" != "UNIT A 1", Codex). Not in
+# the street itself: "S.200TH ST" is "S 200TH ST" (2026-11-24 dry run).
+_UNIT_LETTER_DIGIT_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=\d)", re.IGNORECASE)
+
+
+def _keep_meaningful_dots(text: str) -> str:
+    return _LETTER_DOT_RE.sub("\u00b7", _DIGIT_DOT_RE.sub("_", text))
+
+
+# "NO 5" names a road ("COUNTY ROAD NO 5"), so in comparisons it is kept, never stripped
+# as a unit (Codex). Glued as "NO_5" so _UNIT_STRIP_RE cannot see a designator.
+_ROAD_NUMBER_RE = re.compile(r"\bNO\.?\s*(?=\d)", re.IGNORECASE)
+
+
+# A designator word or a bare "#", then an id of any length (Codex: "LOT 1234567",
+# "#5 ACCESS ALY").
+_UNIT_DESIGNATOR_RE = re.compile(
+    rf"(?:\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b\s*#?|#)\s*([A-Z0-9_-]+)",
+    re.IGNORECASE,
+)
+_UNIT_DESIGNATOR_WORDS = frozenset(
+    _UNIT_WORDS.split("|") + ["NO", "BOX", "FL", "FLR", "FLOOR", "DEPT", "TRLR", "TRAILER", "BLD"])
+# Common USPS street-type abbreviations (Publication 28, C1) beyond _SUFFIX, so a short
+# type such as "WY" is never read as a unit id ("OLD LOT 5 WY", Codex).
+_USPS_TYPES = frozenset(
+    "ALY ANX ARC AV AVE AVN BCH BLF BLV BLVD BND BR BRG BTM BV BYP CIR CMN COR CP CPE CR CRK "
+    "CRT CRES CSWY CT CTR CV CYN DL DM DR DV EST EXPY EXT FLS FRD FRK FRST FRY FT FWY GDN GLN "
+    "GRN GRV GTWY HBR HL HLS HOLW HTS HVN HW HWY INLT IS JCT KNL KY LCK LDG LK LN LNDG LOOP MDW "
+    "ML MNR MT MTN NCK OPAS ORCH OVAL PARK PASS PATH PIKE PK PKWY PL PLN PLZ PNE PR PRT PT PY "
+    "RADL RD RDG RIV RNCH ROW RPD RST RTE RUN SHR SMT SPG SQ ST STA STRA TER TPKE TR TRAK TRCE "
+    "TRL TUNL UN VIA VIS VL VLG VLY VW WALK WAY WL WY XING".split())
+_STREET_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values()) | frozenset(_DIRECTIONAL) \
+    | frozenset(_DIRECTIONAL.values()) | _USPS_TYPES
+
+
+def _unit_like(token: str) -> bool:
+    """A token that can only be part of a unit tail: a designator, "AND"/"&", an id with
+    a digit, or a 1-2 letter id that is not a street word ("UNIT 4 DZ", "UNIT A AND B")."""
+    t = token.upper().strip("#,.-")
+    if not t or t in _UNIT_DESIGNATOR_WORDS or t in ("AND", "&"):
+        return True
+    if any(ch.isdigit() for ch in t):
+        return True
+    return len(t) <= 2 and t not in _STREET_WORDS
+
+
+_UNIT_START_RE = re.compile(
+    rf"#|\b(?:{_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b", re.IGNORECASE)
+
+
+# The kind of each marker, so "LOT 1 UNIT 2" != "LOT 2 UNIT 1" (Codex). Spellings of the
+# same kind share a letter ("APT 5" == "UNIT 5" == "#5").
+_UNIT_KIND = {"BLDG": "B", "BLD": "B", "FL": "F", "FLR": "F", "FLOOR": "F", "DEPT": "D",
+              "BOX": "X", "LOT": "L", "SPC": "S", "SPACE": "S", "RM": "R", "ROOM": "R",
+              "TRLR": "T", "TRAILER": "T"}
+
+
+def _unit_id(token: str) -> str:
+    """One unit id, comparable: a hyphen between a letter and a digit is spelling
+    ("F-203" == "F203"); one between digits, and a decimal point, are not ("1-23",
+    "1.23" kept apart from "123", Codex)."""
+    t = token.upper().replace(".", "_")
+    return re.sub(r"(?<=[A-Z])-(?=\d)|(?<=\d)-(?=[A-Z])", "", t)
+
+
+def _street_units(parsed: dict) -> str | None:
+    """_unit_ids for a parsed address: its own ZIP, when known, is never part of a unit
+    ("1420 E PINE ST #409 98122" with ZIP 98122, 2026-11-24 dry run), nor is a trailing
+    "WA" when the parser found no state ("UNIT A WA, SEATTLE, WA" keeps its "WA", Codex)."""
+    return _unit_ids(parsed["street"], _unparsed(parsed), _zip5(parsed.get("zip")) or None,
+                     trim_state=not parsed.get("state"))
+
+
+# Kinds that name the one dwelling at an address. A lone one of these is just spelling:
+# "SPC 91" (county) and "UNIT 91" (owner's mail) are the same mobile home, measured on 17
+# owner-occupied Snohomish leads (2026-11-24); Codex's "APT 5" != "SPC 5" was rejected on
+# that evidence. Building, floor, dept and box stay distinct ("BLDG 2" != "UNIT 2").
+_DWELLING_KINDS = frozenset("HUSLRT")
+
+
+def _units_differ(a: str | None, b: str | None) -> bool:
+    """Two explicit units name two places (owner decision 2026-11-24)."""
+    if not a or not b or a == b:
+        return False
+    ga, gb = a.split("|"), b.split("|")
+    if len(ga) == 1 and len(gb) == 1:
+        (ka, va), (kb, vb) = ga[0].split(":", 1), gb[0].split(":", 1)
+        return va != vb or not (ka == kb or {ka, kb} <= _DWELLING_KINDS)
+    return a.replace("H:", "U:") != b.replace("H:", "U:")
+
+
+def _unparsed(parsed: dict) -> bool:
+    """The parser found no city, state or ZIP: the whole line sits in "street", so a
+    trailing state / ZIP there is not part of a unit. With any locality parsed, a
+    5-digit chunk after a unit is the unit's id ("UNIT A 12345, SEATTLE, WA", Codex)."""
+    return not (parsed.get("zip") or parsed.get("city") or parsed.get("state"))
+
+
+def _unit_ids(street: str | None, zip_in_street: bool = False,
+              known_zip: str | None = None, trim_state: bool = True) -> str | None:
+    """The unit tail as comparable ids: "BLDG 1 UNIT 23" -> "B:1|U:23", "#G304" and
+    "UNIT G 304" -> "U:G304". None when the street names no unit. A unit word inside a
+    street name ("OLD LOT 5 ACCESS ALY") is glued first and never starts a tail.
+
+    zip_in_street: the parser found no city, state or ZIP on this address (_unparsed), so
+    a trailing state / ZIP still sits in the street and is trimmed. Otherwise a 5-digit
+    chunk is a unit id ("UNIT A 12345", Codex).
+
+    KNOWN LIMIT (owner-accepted 2026-11-24, Codex rounds 45 and 47): a unit whose last part
+    equals the address's own ZIP ("UNIT A 98101 ... 98101") reads as unit "A". The parser
+    lifts such a number on comma-less lines, and a county situs often repeats its ZIP after
+    the unit (52 real leads, "1420 E PINE ST #409 98122"), so it is trimmed here too.
+    Telling the two apart needs a change to the shared parser every county uses; no real
+    unit of that shape was seen in production.
+    """
+    s = _glue_named_units(_keep_meaningful_dots(street or "")).upper()
+    s = _UNIT_LETTER_DIGIT_DOT_RE.sub("\u00b7", s)
+    m = _UNIT_START_RE.search(s)
+    if not m:
+        return None
+    # One group per marker, so "BLDG 1 UNIT 23" ("1|23") never equals "BLDG 12 UNIT 3"
+    # ("12|3"); the token right after a marker is always an id, so "UNIT FL" keeps "FL"
+    # (Codex). Ids inside a group are joined: "UNIT G 304" == "#G304".
+    # Each group is "<kind>:<id>" (building vs floor vs unit), and groups compare as a set,
+    # so "BLDG 1 UNIT 23" != "UNIT 1 BLDG 23" but == "UNIT 23 BLDG 1" (Codex). A hyphen
+    # between digits stays ("1-23" != "12-3"); one between a letter and a digit does not
+    # ("F-203" == "F203").
+    groups: list[list[str]] = []
+    expecting_id = False
+    tail = re.sub(r"\s*([-/])\s*", r"\1", s[m.start():])  # "1 / 2" is "1/2" (Codex)
+    # Whitespace-separated chunks, every other character kept ("A.B" != "A B", "5 & 6" !=
+    # "5 6", Codex). Commas go; only the LAST chunk's period goes ("UNIT 5." == "UNIT 5",
+    # but "UNIT 1. 2" != "UNIT 1 2"); "_" is a protected digit dot.
+    chunks = [c.rstrip(",") for c in re.sub("#", " # ", tail).split()]
+    # A street parsed without commas still carries its state / ZIP ("#26 98032"): those
+    # are not unit ids (2026-11-24 dry run: "4120 S 225TH PL #26 98032" vs "#26, KENT").
+    # Never the id right after a marker ("# 98032" stays a unit).
+    def _locality(tok: str) -> bool:
+        t = tok.rstrip("._")
+        if (t == "WA" and trim_state) or (known_zip and t[:5] == known_zip and re.fullmatch(r"\d{5}(?:[-_]\d{4})?", t)):
+            return True  # this address's own state / ZIP left in a comma-less line
+        return zip_in_street and bool(re.fullmatch(r"\d{5}(?:[-_]\d{4})?", t))
+    while len(chunks) > 1 and not _UNIT_START_RE.fullmatch(chunks[-2]) and _locality(chunks[-1]):
+        chunks.pop()
+    if chunks:
+        chunks[-1] = chunks[-1].rstrip("._")
+    for tok in (c for c in chunks if c):
+        is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
+        if is_marker and not expecting_id:
+            groups.append(["H" if tok == "#" else _UNIT_KIND.get(tok, "U"), ""])
+            expecting_id = True
+        elif tok == "#":
+            continue  # "UNIT #5": the "#" belongs to the marker
+        else:
+            if not groups:
+                groups.append(["U", ""])
+            prev = groups[-1][1]
+            # Only a lone letter glues to the number after it ("G 304" == "G304"); any
+            # other pieces stay apart ("1/2" != "12", Codex).
+            sep = "" if not prev or (len(prev) == 1 and prev.isalpha() and tok[0].isdigit()) else " "
+            groups[-1][1] = prev + sep + _unit_id(tok)
+            expecting_id = False
+    groups = [g for g in groups if g[1]]
+    ids = "|".join(sorted(f"{k}:{v}" for k, v in groups))
+    return ids or None
+
+
+def _glue_named_units(street: str) -> str:
+    """Glue a designator + id that is NOT a trailing unit, so _UNIT_STRIP_RE keeps it.
+
+    In comparisons a unit is stripped only when everything after it looks like part of a
+    unit; any real word after it ("OLD LOT 5 ACCESS ALY", "OLD LOT 5 RD") makes it part
+    of the street name (Codex). A trailing unit ("UNIT G 304", "BLDG B") is still stripped:
+    a unit-only difference is not absentee (product rule, module docstring).
+    """
+    def repl(m: re.Match) -> str:
+        tail = street[m.end():].split()
+        if all(_unit_like(t) for t in tail):
+            return m.group(0)
+        # Glued without a "#" so neither _HASH_UNIT_RE nor _UNIT_STRIP_RE can see a unit.
+        return f"{m.group(1) or 'NUM'}_{m.group(2)}"
+    return _UNIT_DESIGNATOR_RE.sub(repl, street)
+
+
 def _compare_street(street: str | None) -> str:
-    return _normalize_street(_DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _keep_meaningful_dots(_DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+    s = _glue_named_units(s)
+    s = _ROAD_NUMBER_RE.sub("NO_", s)
+    # No trailing " -" cleanup: "MAIN ST - LOT A RD" may be a street name (Codex).
+    return _normalize_street(s)
+
+
+# Punctuation/spacing variants of one street, measured on King leads 2026-11-17 (210
+# rows flagged absentee with identical letters and digits on both sides):
+# "BEL-RED RD" / "BEL RED RD", "AVE. S.W." / "AVE SW", "19 TH AVE" / "19TH AVE",
+# "1508-E" / "1508E". PAIRWISE on the raw streets (Codex, after three rounds of
+# one-sided rules that kept merging different streets): both sides must carry the
+# same letters and digits, and every place where only one side has a break must be a
+# break that cannot change the meaning.
+_SEP_RE = re.compile(r"[\s.\-]+")
+_COMPASS = frozenset("NSEW")
+_STREET_TYPE_WORDS = frozenset(_SUFFIX) | frozenset(_SUFFIX.values())
+# Every designator _UNIT_STRIP_RE strips: a break after one is never just spacing.
+_UNIT_WORD_SET = frozenset(re.findall(r"[A-Z]+", _UNIT_STRIP_RE.pattern.split(r")\b")[0]))
+_ORDINALS = {"1": "ST", "2": "ND", "3": "RD"}
+
+
+def _ordinal_ok(num: str, suffix: str) -> bool:
+    if num[-2:] in ("11", "12", "13"):
+        return suffix == "TH"
+    return suffix == _ORDINALS.get(num[-1], "TH")
+
+
+def _chunks(street: str) -> tuple[list[str], list[str], list[str]]:
+    """(raw chunks, canonical chunks, separators) split on space / dot / hyphen."""
+    s = _DIGIT_DOT_RE.sub("_", street.upper()).strip(" .-")  # letter dots stay separators
+    raw = _SEP_RE.split(s) if s else []
+    seps = _SEP_RE.findall(s)
+    # Abbreviate only free-standing words: "NORTH-STAR RD" is a name, not "N-STAR" (Codex).
+    canon = [
+        c if "-" in (seps[i - 1] if i > 0 else "") + (seps[i] if i < len(seps) else "")
+        else _SUFFIX.get(c, _DIRECTIONAL.get(c, c))
+        for i, c in enumerate(raw)
+    ]
+    return raw, canon, seps
+
+
+def _sep_kind(sep: str) -> str:
+    """Exact separator only: '.' and '-' are proof only when they stand alone ("S.W.",
+    "8337-A"); "N. E" or "123 - N" are mixed and prove nothing (Codex)."""
+    if sep.isspace():
+        return " "
+    if sep[0] == "." and sep[1:].isspace():
+        return " "  # ". " ends an abbreviation ("S.E. 272ND", "AVE. S"): it is a space
+    return sep if sep in (".", "-") else "mixed:" + "".join(sep.split())
+
+
+def _break_is_spacing(raw: list[str], canon: list[str], seps: list[str], i: int,
+                      kind: str) -> bool:
+    """A break between chunk i and i+1 that the other address does not have.
+
+    Deliberately narrow (six Codex rounds): only shapes that cannot be read two ways.
+    Anything else keeps today's answer (absentee), never a merge of two properties.
+    No word|word rule: "RIDGE WOOD" vs "RIDGEWOOD" may be two streets.
+    """
+    nxt = canon[i + 2] if i + 2 < len(canon) else None
+    if (kind == " " and canon[i].isdigit() and len(canon[i]) <= 3
+            and raw[i + 1] in ("TH", "ND") and _ordinal_ok(canon[i], raw[i + 1])
+            and nxt in _STREET_TYPE_WORDS
+            and all(s.isspace() for s in seps[:i])
+            and all(c in _TRAILING_OPTIONAL_TOKENS for c in canon[:i])):
+        # "5233 19 TH AVE", "14703 NE 35 TH ST": the first number after the house id
+        # (or its compass words), plain spaces only, so "120-122 ND AVE" never feeds it
+        # (Codex). Not ST/RD: "23 RD AVE" may be 23 Road Avenue.
+        return True
+    if raw[i] in ("N", "S") and raw[i + 1] in ("E", "W") and kind == ".":
+        # "16TH AVE. S.W.", "N.E. 8TH ST": a pair joined by a lone dot is an abbreviation.
+        # A spaced "N E" may be North E Main, Avenue N East or unit E at Main Ave N, and
+        # "N. E" is mixed (Codex), so "EARL AV N W" keeps today's answer.
+        return True
+    # No house-letter rule: "123-A-LINE RD" may be A-Line Road and "123-N MAIN" North
+    # Main (Codex), so "8337-A" vs "8337A" keeps today's answer.
+    return False
+
+
+_HOUSE_SPLIT_RE = re.compile(r"\s*(\S+)\s*([.\-]*)\s*(.*)$")
+
+
+def _split_house(street: str) -> tuple[str, str, str] | None:
+    """(house id, punctuation right after it, rest). The house id is everything up to
+    the first space and is compared RAW and whole: "123-45-AB", "123-NORTH", "1508-E"
+    are house ids, never re-spelled (Codex)."""
+    m = _HOUSE_SPLIT_RE.match(street.upper())
+    if not m or not any(ch.isdigit() for ch in m.group(1)):
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+def _same_street_modulo_punctuation(a: str, b: str) -> bool:
+    ha, hb = _split_house(a), _split_house(b)
+    # Same house id, same punctuation after it ("1508 - 1510A" is a range).
+    if ha is None or hb is None or ha[:2] != hb[:2]:
+        return False
+    # Punctuation after the house id ("12 - 22 ND AVE") may make the next number part
+    # of a range, so only identical streets pass then (Codex).
+    if ha[1] and ha[2] != hb[2]:
+        return False
+    ra, ca, sa = _chunks(ha[2])
+    rb, cb, sb = _chunks(hb[2])
+    if not ca or "".join(ca) != "".join(cb):
+        return False
+
+    def breaks(canon, seps):
+        out, pos = {}, 0
+        for i, sep in enumerate(seps):
+            pos += len(canon[i])
+            out[pos] = (i, _sep_kind(sep))
+        return out
+
+    ba, bb = breaks(ca, sa), breaks(cb, sb)
+    for pos in set(ba) | set(bb):
+        if pos in ba and pos in bb:
+            (ia, kind_a), (ib, kind_b) = ba[pos], bb[pos]
+            if kind_a == kind_b:
+                continue
+            # A hyphen is never just spacing: "OLD-MILL RD" may not be "OLD MILL RD"
+            # (Codex; owner decision 2026-11-17), so "BEL-RED" keeps today's answer.
+            if "-" in kind_a + kind_b:
+                return False
+            for canon, k in ((ca, ia), (cb, ib)):  # both sides, so order never matters
+                # Never re-spell a break beside a number: "1508 1/2-1510A" may be a
+                # range, "12-34" a compound house id (Codex).
+                if any(ch.isdigit() for ch in canon[k] + canon[k + 1]):
+                    return False
+                # "LOT-AB RD" / "LOT.AB RD" is a street name; "LOT AB" is a unit.
+                if canon[k] in _UNIT_WORD_SET:
+                    return False
+                # A single letter before a re-spelled break may be a unit, a house letter
+                # or a lettered street. "AVE. S.W." (letter after) stays allowed.
+                if len(canon[k]) == 1:
+                    return False
+            continue
+        raw, canon, seps, (idx, kind) = ((ra, ca, sa, ba[pos]) if pos in ba
+                                         else (rb, cb, sb, bb[pos]))
+        if not _break_is_spacing(raw, canon, seps, idx, kind):
+            return False
+    return True
 
 
 def _marked_unit(street: str | None) -> str | None:
     m = _MARKED_UNIT_RE.search((street or "").upper())
-    return m.group(1).replace("-", "") if m else None
+    return _unit_id(m.group(1)) if m else None
 
 
 def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_street: str) -> bool:
@@ -166,32 +499,21 @@ def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_s
     the other side marks that exact unit id, so "123 E AVENUE A" never loses its "A".
 
       * bare vs marked unit: "22222 24TH AVE S C22" vs "22222 24TH AVE S #C22"
-      * split house letter: "2651B NW 57TH ST" vs "2651 B NW 57TH ST", only when a
-        real street word follows (not "2651 B ST", which may be B Street).
+    A SPACED house letter ("2651 B NW 57TH ST" vs "2651B") is deliberately not matched:
+    "123 B MAIN ST" may be B Main Street (Codex, 2026-11-17). Only the hyphenated form
+    ("8337-A") is, in _same_street_modulo_punctuation.
     The caller still needs a matching ZIP / city before it returns same-place.
     """
     tp, tm = p_street.split(" "), m_street.split(" ")
     for long_t, short_t, short_raw in ((tp, tm, m_raw), (tm, tp, p_raw)):
         if len(long_t) == len(short_t) + 1 and long_t[:-1] == short_t:
-            if _marked_unit(short_raw) == long_t[-1].replace("-", ""):
+            if _marked_unit(short_raw) == _unit_id(long_t[-1]):
                 return True
-    for a, b in ((tp, tm), (tm, tp)):
-        if (
-            len(b) == len(a) + 1
-            and re.fullmatch(r"\d+[A-Z]", a[0])
-            and b[0].isdigit()
-            # N/S/E/W excluded: "123 N MAIN ST" is North Main, not house 123N (Codex).
-            and re.fullmatch(r"[A-DF-MO-RT-VX-Z]", b[1])
-            and a[0] == b[0] + b[1]
-            and a[1:] == b[2:]
-            and any(t not in _TRAILING_OPTIONAL_TOKENS for t in a[1:])
-        ):
-            return True
     return False
 
 
 def _normalize_full(addr: str) -> str:
-    s = _PUNCT_RE.sub(" ", addr).upper()
+    s = _PUNCT_RE.sub(" ", _keep_meaningful_dots(addr)).upper()
     return _WS_RE.sub(" ", s).strip()
 
 
@@ -255,11 +577,13 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
 
     # Byte-identical (post-normalize) is unambiguous same-place → confirmed False,
     # even with no parsed ZIP/city/state to discriminate.
-    if _normalize_full(property_address) == _normalize_full(mailing_address):
-        return False
-
     p = parse_property_for_display(property_address)
     m = parse_property_for_display(mailing_address)
+    # ...unless the explicit units differ in a way that normalizing erased ("UNIT A.1"
+    # vs "UNIT A 1", Codex). Read from the parsed street, never the whole line.
+    if (_normalize_full(property_address) == _normalize_full(mailing_address)
+            and not _units_differ(_street_units(p), _street_units(m))):
+        return False
     p_street = _compare_street(p["street"])
     m_street = _compare_street(m["street"])
 
@@ -272,7 +596,15 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
         and not _same_street_modulo_trailing_tokens(p_street, m_street)
         and not _street_absorbed_city(p, m, p_street, m_street)
         and not _same_street_modulo_unit_spelling(p["street"] or "", m["street"] or "", p_street, m_street)
+        and not _same_street_modulo_punctuation(p["street"] or "", m["street"] or "")
     ):
+        return True
+
+    # Both sides name a unit / "#" number and they differ: two places, whatever the street
+    # type ("UNIT 5" vs "UNIT 6", "COUNTY ROAD #5" vs "#6", Codex). Only a unit OMITTED on
+    # one side is the product rule's same place (county situs drops the unit).
+    p_unit, m_unit = _street_units(p), _street_units(m)
+    if _units_differ(p_unit, m_unit):
         return True
 
     # Base street matches — need a positive discriminator to call it same vs diff.

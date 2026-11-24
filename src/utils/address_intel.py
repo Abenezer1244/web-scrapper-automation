@@ -155,9 +155,10 @@ _MARKED_UNIT_RE = re.compile(
 # is not "12 5 MAIN" and "12 - 22. ND AVE" is not "12 - 22 ND AVE" (Codex). Dots after
 # letters ("AVE.", "S.W.", "ST. JOHN") are abbreviations and are still dropped.
 _DIGIT_DOT_RE = re.compile(r"(?<=\d)\.")
-# A dot between single letters ("N.E.", "S.W.") is kept too, so "N.E. MAIN" is never
-# equated with a spaced "N E MAIN" (North E Main) by the dot-dropping paths (Codex).
-_LETTER_DOT_RE = re.compile(r"(?<=\b[A-Z])\.(?=[A-Z]\b)", re.IGNORECASE)
+# A dot directly between two letters ("N.E.", "S.W.", a unit "A.BC") is kept too, so the
+# dot-dropping paths never equate it with a space: "N.E. MAIN" is not "N E MAIN" (North E
+# Main), "UNIT A.BC" is not "UNIT A BC" (Codex). A dot before a space ("AVE. S") still goes.
+_LETTER_DOT_RE = re.compile(r"(?<=[A-Z])\.(?=[A-Z])", re.IGNORECASE)
 
 
 def _keep_meaningful_dots(text: str) -> str:

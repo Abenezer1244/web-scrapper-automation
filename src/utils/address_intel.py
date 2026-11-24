@@ -175,16 +175,6 @@ _UNIT_DESIGNATOR_RE = re.compile(
     rf"(?:\b({_UNIT_WORDS}|NO|BOX|FL|FLR|FLOOR|DEPT|TRLR|TRAILER|BLD)\b\s*#?|#)\s*([A-Z0-9_-]+)",
     re.IGNORECASE,
 )
-# A "#"/"NO" number right after a NUMBERED-road word is the road's number, not a unit:
-# "COUNTY ROAD #5", "HWY NO 9", "SR #20", "CR #5" (Codex). Kept even when it ends the
-# street. A plain "... RD" is not one: "7431 OLD REDMOND RD #321" is an apartment
-# (56 such owner-occupied King leads, 2026-11-24), and so is anything marked UNIT/APT.
-_ROAD_WORD_RE = re.compile(
-    r"\b(?:(?:COUNTY|CO|STATE|ST|FOREST(?:\s+SERVICE)?|FARM|TOWNSHIP|TWP|FS)\s+"
-    r"(?:ROAD|RD|ROUTE|RTE|HWY|HIGHWAY)"
-    r"|HWY|HIGHWAY|ROUTE|RTE|SR|SH|CR|FM|US|FSR)\.?,?(?:\s+NO\.?)?\s*$",  # "COUNTY ROAD NO. #5"
-    re.IGNORECASE,
-)  # "RD. #5", "CR #5" (Codex)
 _UNIT_DESIGNATOR_WORDS = frozenset(
     _UNIT_WORDS.split("|") + ["NO", "BOX", "FL", "FLR", "FLOOR", "DEPT", "TRLR", "TRAILER", "BLD"])
 # Common USPS street-type abbreviations (Publication 28, C1) beyond _SUFFIX, so a short
@@ -221,10 +211,7 @@ def _glue_named_units(street: str) -> str:
     """
     def repl(m: re.Match) -> str:
         tail = street[m.end():].split()
-        # "C.R.", "S.R.", "U.S." are the same road words once their dots are dropped (Codex).
-        before = re.sub("[.·](?=[A-Za-z])", "", street[:m.start()])
-        road_number = ((m.group(1) or "NO").upper() == "NO" and _ROAD_WORD_RE.search(before))
-        if all(_unit_like(t) for t in tail) and not road_number:
+        if all(_unit_like(t) for t in tail):
             return m.group(0)
         # Glued without a "#" so neither _HASH_UNIT_RE nor _UNIT_STRIP_RE can see a unit.
         return f"{m.group(1) or 'NUM'}_{m.group(2)}"
@@ -484,6 +471,13 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
         and not _same_street_modulo_unit_spelling(p["street"] or "", m["street"] or "", p_street, m_street)
         and not _same_street_modulo_punctuation(p["street"] or "", m["street"] or "")
     ):
+        return True
+
+    # Both sides name a unit / "#" number and they differ: two places, whatever the street
+    # type ("UNIT 5" vs "UNIT 6", "COUNTY ROAD #5" vs "#6", Codex). Only a unit OMITTED on
+    # one side is the product rule's same place (county situs drops the unit).
+    p_unit, m_unit = _marked_unit(p["street"]), _marked_unit(m["street"])
+    if p_unit and m_unit and p_unit != m_unit:
         return True
 
     # Base street matches — need a positive discriminator to call it same vs diff.

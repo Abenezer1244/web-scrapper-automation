@@ -280,12 +280,19 @@ Codex consult folded in (4 High, 2 Medium). Connector stays INACTIVE until the P
     command downloads the current copy and verifies its digest (no artifact store: a copy the county no
     longer serves is not current, so it cannot be published anyway). Phase C predicate (defined here):
     status ok AND current version published AND confirmed_at within 36 h of the DB clock.
-  - [ ] **B2 — watcher** (tax_summons_watch.py, beat entry, worker include, safe_http content-type check,
-    tests): claim -> page GET (allowlisted, 200, no-cache) -> exact-origin anchor parse, highest year, hold on
-    two distinct same-year links -> PDF stream (no redirects, https, 30 MB cap, deadline, application/pdf,
-    %PDF-) in a private temp dir -> record. Task soft/hard limits ~10/12 min, beat expiry, DB lock/statement
-    timeouts. Alerts after commit (send_ops_alert, no PII): new copy (key = version), daily reminder while
-    current is pending (key = version + day), hold episodes (key = county + status).
+  - [x] **B2 — watcher** (built 2026-11-24, branch feat/douglas-tax-watch, stacked on #680). As built:
+    `src/workers/tax_summons_watch.py` (check_county: claim + commit -> page GET (allowlisted, 200, exact
+    text/html, no-cache) -> exact-origin anchor parse (years 2000-2100, highest year, two different same-year
+    links = ambiguous) -> PDF GET in memory via safe_get (200, exact application/pdf, %PDF-, 30 MB cap) ->
+    record + serving_status in a new transaction -> alerts after commit), `watch_tax_summons` task (soft 600 /
+    hard 720 s, lease 900 s; a soft timeout mid-fetch records the hold and alerts before re-raising), beat
+    `watch-tax-summons` 08:40 UTC expires 3600, worker include. `DATABASE_URL_WATCHER` + `watcher_sync_session`
+    (own NullPool engine; refuses unless session_user = current_user = bridgeleads_watcher; no fallback).
+    Shared fix: `pinned_session` no longer reads a redirect's body to build Response.next (requests 2.34 did,
+    before any byte cap); a webhook test now expects redirect_not_followed for a malformed Location. Codex
+    B2: pass 1 NO-GO (1 High, fixed), pass 2 GO. 1535 tests across safe HTTP/webhook/dialer/summons/beat
+    suites; live smoke on the test DB confirmed the real 2026 summons (cde73f30cb65). Tracked (Medium):
+    safe_http._read_capped leaves response cleanup to GC when a read raises (shared code).
 - [ ] ~~**Phase B — summons watcher.**~~ (original wording, superseded by B1/B2 above) Daily beat: find the PDF from the county foreclosure page (not a fixed URL),
   hash it, record last-checked; a new digest opens a pending version and alerts ops. Fetch failures / replacement by
   sale results are source-health events, bounded. Tests. Must handle the county re-serving an OLDER digest

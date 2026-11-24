@@ -48,6 +48,8 @@ app = Celery(
         "src.workers.owner_recovery",
         # Asotin per-parcel tax crawl (pacs_tax_status): a BEAT task, same trap.
         "src.workers.pacs_tax_crawler",
+        # Tax-summons watcher (Douglas): a BEAT task, same trap as above.
+        "src.workers.tax_summons_watch",
         # King code-violation owner-name recovery: a BEAT task, same trap as above.
         "src.workers.cv_owner_recovery",
         # Deferred King property-address recovery: a BEAT task, same trap as above.

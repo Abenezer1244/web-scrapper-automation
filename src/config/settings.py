@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     DATABASE_URL_SYNC: str
     DATABASE_URL_MIGRATE: str = ""
+    # The tax-summons watcher's OWN login (bridgeleads_watcher, provision_rls_roles.sql
+    # Role 5). Only that login may record what a county serves (migration 173 triggers);
+    # the watcher never falls back to another URL. Empty = the watcher does not run.
+    DATABASE_URL_WATCHER: str = ""
 
     # ─── Redis ────────────────────────────────────────────────────────────────
     REDIS_URL: str

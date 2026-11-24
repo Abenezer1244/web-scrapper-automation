@@ -174,12 +174,15 @@ def test_public_addresses_stay_allowed(addr):
 
 def test_a_malformed_redirect_location_neither_crashes_nor_leaks(local_endpoint, caplog):
     # urlparse raises on this authority; uncaught, the task would fail and its
-    # exception text land in Celery's failure log and result backend.
+    # exception text land in Celery's failure log and result backend. The pinned
+    # session no longer parses a 3xx Location to build Response.next (it read the
+    # redirect's whole body to do so), so this is now the plain redirect refusal,
+    # whose log names the Location's host only (log_host gives "?" here).
     with caplog.at_level(logging.DEBUG):
         result = wd.deliver_job_webhook.apply(
             args=("job-badloc", f"{local_endpoint}/badredirect", {"event": "job.completed"})
         ).get()
-    assert result["status"] == "failed" and result["reason"] == "invalid_response"
+    assert result["status"] == "failed" and result["reason"] == "redirect_not_followed"
     assert "LOCATIONSECRET123" not in caplog.text
 
 

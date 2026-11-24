@@ -370,6 +370,16 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.purge_nts_recorder_staging",
         "schedule": crontab(hour=9, minute=40),  # 09:40 UTC daily
     },
+    "watch-tax-summons": {
+        # Tax-summons watcher (Douglas): confirm which copy of the county's foreclosure
+        # summons it serves; a new copy opens a version for operator review and holds the
+        # county's tax leads until published; a failed check holds them at once. Daily,
+        # under its own login (DATABASE_URL_WATCHER; unset = it alerts and does nothing).
+        # A run that misses its hour is dropped, never queued behind the next.
+        "task": "src.workers.tax_summons_watch.watch_tax_summons",
+        "schedule": crontab(hour=8, minute=40),  # 08:40 UTC daily
+        "options": {"expires": 3600},
+    },
     "crawl-pacs-tax": {
         # Asotin has no delinquent list: walk every parcel's PACS tax table a batch an
         # hour (20 min budget, the county's PACS lease shared with mailing recovery).

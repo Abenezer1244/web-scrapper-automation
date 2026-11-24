@@ -124,9 +124,25 @@ class PinnedAdapter(HTTPAdapter):
         raise ValueError("Proxies are not permitted for pinned outbound requests")
 
 
+class _PinnedSession(requests.Session):
+    """requests.Session that never reads a redirect's body just to describe it.
+
+    With allow_redirects=False, Session.send still builds ``Response.next`` by walking
+    resolve_redirects(yield_requests=True), and that generator reads the redirect
+    response's whole body first ("consume socket", requests 2.34). A hostile 3xx with an
+    endless body would then fill worker memory before any byte cap (safe_http's
+    _read_capped) could run. Nothing here uses ``Response.next``, so the peek is skipped;
+    a session told to follow redirects still does."""
+
+    def resolve_redirects(self, resp, req, *args, yield_requests=False, **kwargs):
+        if yield_requests:
+            return iter(())
+        return super().resolve_redirects(resp, req, *args, yield_requests=yield_requests, **kwargs)
+
+
 def pinned_session(adapter_cls: type[PinnedAdapter] = PinnedAdapter) -> requests.Session:
     """A Session that resolves and connects locally, to approved addresses only."""
-    session = requests.Session()
+    session = _PinnedSession()
     session.trust_env = False  # an ambient HTTPS_PROXY would bypass the pin
     session.mount("http://", adapter_cls())
     session.mount("https://", adapter_cls())

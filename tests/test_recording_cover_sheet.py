@@ -338,3 +338,9 @@ def test_an_ocr_garbled_parcel_elsewhere_on_the_page_is_not_no_parcel():
     tail = "Legal Description: LOT 1\n" + "\n" * 8 + "Additional parcel: 1-2798-1O2-0005-003\n"
     assert read_cover_sheet_parcel("TAX PARCEL NUMBER(S)\nN/A\n" + tail).outcome == "ambiguous"
 
+
+
+def test_n_a_after_separator_punctuation_is_no_parcel():
+    """2026-028804's filer wrote 'Assessor's Tax Parcel No .: N/A'."""
+    got = read_cover_sheet_parcel("Assessor's Tax Parcel No .: N/A\nGrantor: X\n")
+    assert (got.outcome, got.parcel) == ("none", None)

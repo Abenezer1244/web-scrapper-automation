@@ -121,7 +121,7 @@ def _field_values(lines: list[str], i: int, label_end: int) -> tuple[list[str], 
             # Past blank lines and "N/A"-style markers: any parcel-shaped number after them
             # is still this field's (read, then judged), except the recording's own
             # instrument number, which some sheets print after a gap ("2026-027909").
-            nxt = next((ln for ln in lines[j + 1:] if ln.strip() and not _NO_VALUE.match(ln.strip(" :"))), "")
+            nxt = next((ln for ln in lines[j + 1:] if ln.strip() and not _NO_VALUE.match(ln.strip(" :."))), "")
             if not any(not _INSTRUMENT.fullmatch(t) for t in _TOKEN.findall(nxt)):
                 return values, False
             j += 1
@@ -167,7 +167,8 @@ def read_cover_sheet_parcel(text: str, prefix: str | None = None,
         stray = stray or cut_short
         evidence.append(" | ".join(v.strip() for v in [line[:m.end()], *values] if v.strip())[:200])
         for v in values:
-            v = v.strip(" :")
+            # Separator punctuation around a value is the form's ("No .: N/A", 2026-028804).
+            v = v.strip(" :.")
             if not v or _UNASSIGNED.search(v) or _NO_VALUE.match(v):
                 continue
             written = True

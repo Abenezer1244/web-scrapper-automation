@@ -92,3 +92,21 @@ def test_a_malformed_attachment_link_is_rejected_not_raised():
     from src.scrapers.templates.eagleweb import _recorded_document_url
 
     assert _recorded_document_url("erecording.co.benton.wa.us", "https://[bad/recorder?docName=Deed&id=DOC1.A0&parent=DOC1") is None
+
+
+def test_prefix_results_need_a_complete_grid_and_one_match():
+    """The real Benton results page for one parcel ("1 - 1 of 1"), searched by prefix."""
+    from pathlib import Path
+
+    from src.scrapers.enrichment.pacs_parcel import parse_prefix_results
+
+    page = (Path(__file__).parent / "fixtures" / "benton_pacs_results_131073011125003.html").read_text(encoding="utf-8")
+    assert parse_prefix_results(page, "1310730111") == ("found", "131073011125003")
+    assert parse_prefix_results(page, "1310730112")[0] == "parcel_not_found"   # the row does not start with it
+    # More rows than the page shows: never "found", however few match.
+    more = page.replace("1 - 1 of 1", "1 - 1 of 25")
+    assert parse_prefix_results(more, "1310730111")[0] == "ambiguous"
+    assert parse_prefix_results("<html>None found</html>", "131083000001")[0] == "parcel_not_found"
+    # A malformed id cell is never turned into a parcel (Codex).
+    bad = page.replace(">131073011125003<", ">131073011X125003<")
+    assert bad != page and parse_prefix_results(bad, "1310730111")[0] == "unparsed"

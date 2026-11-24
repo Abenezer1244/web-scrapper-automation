@@ -15,6 +15,7 @@ Benton, Clallam, Grant, Grays Harbor, Island, Jefferson, Kitsap,
 Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 """
 
+import asyncio
 import re
 
 from src.api.middleware.security import add_scrape_domain
@@ -490,9 +491,35 @@ class EagleWebScraper(BridgeScraper):
                 record.enrichment_data["parcel_source"] = "recorded_document"
             elif got.candidates:
                 record.enrichment_data["apn_candidates"] = got.candidates
+        await self._resolve_index_prefixes(todo)
         outcomes = [r.enrichment_data["recording_apn_lookup"] for r in todo]
         _logger.info("%s: cover-sheet parcels %s", self.county,
                      {o: outcomes.count(o) for o in sorted(set(outcomes))})
+
+    async def _resolve_index_prefixes(self, records: list[ScrapedRecord]) -> None:
+        """An unreadable cover sheet whose index shows 10+ digits of the parcel: the single
+        parcel on the assessor's roll starting with them, kept as a REVIEW candidate.
+
+        Never attached on its own: a unique prefix on today's roll does not prove the
+        recording's parcel (a renumbered parcel or an index typo could name another), and
+        no name check can settle it (Codex). The row reads "ambiguous" with the candidate
+        and its evidence. Any lookup failure leaves the row as it was."""
+        from src.scrapers.enrichment import pacs_parcel
+
+        rows = [r for r in records if r.enrichment_data.get("recording_apn_lookup") == "unreadable"
+                and len(getattr(r, "_index_parcel_prefix", None) or "") >= 10]
+        if not rows:
+            return
+        found = await asyncio.to_thread(pacs_parcel.resolve_prefixes, self.county,
+                                        [r._index_parcel_prefix for r in rows])
+        for r in rows:
+            geo = found.get(r._index_parcel_prefix)
+            if geo:
+                r.enrichment_data["recording_apn_lookup"] = "ambiguous"
+                r.enrichment_data["apn_candidates"] = [geo]
+                r.enrichment_data["recording_apn_evidence"] = (
+                    f"handwritten parcel; index prefix {r._index_parcel_prefix} -> only parcel {geo} "
+                    f"on the assessor roll (needs review)")
 
     async def _read_cover_sheet(self, url: str, name: str, prefix: str | None, *, delay_first: bool,
                                 instrument: str | None = None):

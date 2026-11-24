@@ -212,3 +212,92 @@ Completeness (stale grid, pagination, "of N" check, single-date `date_to`) was f
 - Next.js dev server printed a known-vulnerability upgrade notice for bridgeleads-web's Next 16.4.3 (not acted on).
 - Deploy order: migrations 171 + 172 (renumbered after #667 took 170); Phase 2 precondition (no queued/running Douglas job; hold Douglas dispatch until
   old workers stop); trustee_sale stays inactive until the activation steps above.
+
+## Phase 5 (2026-11-24): tax_delinquent by operator review — owner APPROVED 2026-11-24
+
+Owner picked operator review. Source: the Treasurer's 2026 Notice and Summons PDF (Superior Court 26-2-00337-09,
+"Taxes and Interest Due As Of August 1, 2026", ~16 parcels). The county re-stamps redeemed rows and re-uploads.
+Codex consult folded in (4 High, 2 Medium). Connector stays INACTIVE until the Phase D drill passes.
+
+- [ ] **Phase A — review store + CLI (no delivery).** Migration 173:
+  `tax_summons_versions` (source URL, sha256, case no, first_seen, last_checked, state pending|published|superseded,
+  published_by/at), `tax_summons_rows` (version, page + row locator, parcel as text, vested owner, taxpayer, situs,
+  mailing, amount, tax years, eligibility eligible|redeemed|unreadable|excluded), `tax_summons_events` (append-only:
+  entered, corrected, published, reinstated; reason codes, no free-text PII). RLS system-only like `pacs_tax_status`.
+  `scripts/tax_summons_review.py` with `nts_review.py`'s admin+MFA operator check: `show`, `load` (rows from an
+  operator-prepared JSON file, so no names/addresses in CLI args or logs; prior version's rows carried forward),
+  `publish` (atomic; refuses unless every row has an eligibility and the digest is still the latest seen).
+  A redeemed parcel stays ineligible for the case unless reinstated with a reason. Tests.
+  Built 2026-11-24 on `feat/douglas-tax-review` (5 code files): migration 173, 3 models, `src/workers/tax_summons.py`
+  (open_version / set_manifest / draft_rows / load_rows / publish), `scripts/tax_summons_review.py` (list, show,
+  manifest, draft, load, publish), `tests/test_tax_summons_review.py` (82 pass).
+  Codex review 1: 6 High + 5 Medium -> reworked: per-county advisory lock + populate_existing (races, with
+  two-connection tests); rows append-only per load revision and `publish --revision` (approves what was shown);
+  operator manifest (case number + rows per page) that every load/publish must match exactly; redeemed rows need a
+  parcel; rows/events have only SELECT+INSERT policies + REVOKE (append-only even under the provisioner's blanket
+  UPDATE grant); stricter CHECKs; the latest published decision per parcel binds (a published reinstatement
+  holds); no echo of unknown fields; DB errors by reference; models mirror the schema (0 autogenerate diffs).
+  "Carry forward" = `draft` writes the last published rows to a file, every row `confirmed: false`.
+  - **Open (Medium, tracked, not fixed here): operator identity = caller-supplied email** checked for admin+MFA,
+    the same as `nts_review.py` and the privacy CLIs. Anyone with the worker's DB credentials can name another
+    admin. Fix needs an authenticated operator session across all operator CLIs: cross-cutting follow-up.
+  - Codex passes 2-11 (2026-11-24) hardened it further; pass 11 = **VERDICT: GO** (no Critical/High). Final design:
+    `manifest`/`publish` take `--pdf FILE` and refuse a copy whose sha256 is not the version's; a re-upload keeps
+    the latest PUBLISHED case (`--new-case` needs a later filing year); DB triggers seal everything review decided
+    (seen_order and published_at set by the DB, county advisory lock, READ COMMITTED only, rows only from the
+    transaction that opened the revision, publication re-checks manifest/newest/redemptions, no DELETE/TRUNCATE,
+    audit never updated, deferred "superseded only by a newer published copy"); drafts are owner-only from creation
+    (POSIX 0600; Windows CreateFileW with a protected DACL, refused on volumes without persistent ACLs); no control
+    characters in names; `show` escapes anything non-printable. 152 tests pass (1 POSIX-only skip on Windows).
+  - Also tracked (not fixed): migration-before-role-provisioning leaves no policies (fails closed; prod role
+    exists); a writer bypassing the module can deadlock with it (Postgres aborts one side); on a rejected FAT
+    volume the empty draft is deleted by path after the handle closes (Low race).
+- [ ] **Phase B (revised 2026-11-24 after Codex consult: 4 High, 4 Medium).** "Current copy" is a durable
+  per-county observation, not a timestamp sort. Split:
+  - [x] **B1 — observation store** (folded into migration 173 / PR #680 while unmerged; models, tax_summons.py,
+    review CLI, tests). Built 2026-11-24 (39140c90), 182 tests, live `fetch` smoke verified the real 4.9 MB
+    summons. Codex B1 reviews 1-3 fixed: publish during a hold, supersede by an earlier publication, fetch URL,
+    token replay, clocks, two-transition observation guard, year watermark, insert guard.
+  - [x] **B1b — dedicated watcher role** (owner chose 2026-11-24 to fix the last B1 High: a holder of the
+    worker's bridgeleads_system credentials could act as the watcher). Fail-closed trigger check
+    (tax_summons_require_watcher: current_user = bridgeleads_watcher, login is the watcher or a superuser) on
+    every observation write and version insert; a watcher update of a version touches only last_checked_at;
+    trigger functions pin search_path; ROLE_POLICIES matrix (system reviews; watcher records). Provisioner
+    Role 5 (`-v watch_pw`, optional, never rotates; attribute/membership/DDL checks every run) and the cutover
+    mirror converge the same matrix after the blanket grant; both executed on the test cluster. Codex: GO.
+    Tracked (Medium/Low): cutover Part A runs in autocommit (pre-existing script design); no test with a
+    non-superuser login acting as the watcher (needs a real login role in the test cluster).
+    **Owner, before B2 runs in prod:** rerun provision_rls_roles.sql with `-v watch_pw=...`, add
+    DATABASE_URL_WATCHER (that login) to the worker service. Until then watcher writes are refused (tax held).
+    Original design notes:
+    `tax_summons_observations` (one row per county: current_version_id, status ok|link_missing|page_failed|
+    download_failed|ambiguous|rollback, checked_at/confirmed_at by the DB clock, link_url, link_year,
+    max_link_year, claim_token + claim_expires_at). `claim_watch` (lease; a second watcher skips) before any
+    fetch; `record_observation(token, ...)` under the county lock refuses a stale token (fencing), opens the
+    digest's version and points current at it. Publication and manifests require the version to be CURRENT
+    (replaces "newest seen_order", in module and trigger) so pending B -> C -> B can be published and a
+    re-served superseded copy holds. A lower link year than max_link_year = rollback hold. `fetch` CLI
+    command downloads the current copy and verifies its digest (no artifact store: a copy the county no
+    longer serves is not current, so it cannot be published anyway). Phase C predicate (defined here):
+    status ok AND current version published AND confirmed_at within 36 h of the DB clock.
+  - [ ] **B2 — watcher** (tax_summons_watch.py, beat entry, worker include, safe_http content-type check,
+    tests): claim -> page GET (allowlisted, 200, no-cache) -> exact-origin anchor parse, highest year, hold on
+    two distinct same-year links -> PDF stream (no redirects, https, 30 MB cap, deadline, application/pdf,
+    %PDF-) in a private temp dir -> record. Task soft/hard limits ~10/12 min, beat expiry, DB lock/statement
+    timeouts. Alerts after commit (send_ops_alert, no PII): new copy (key = version), daily reminder while
+    current is pending (key = version + day), hold episodes (key = county + status).
+- [ ] ~~**Phase B — summons watcher.**~~ (original wording, superseded by B1/B2 above) Daily beat: find the PDF from the county foreclosure page (not a fixed URL),
+  hash it, record last-checked; a new digest opens a pending version and alerts ops. Fetch failures / replacement by
+  sale results are source-health events, bounded. Tests. Must handle the county re-serving an OLDER digest
+  (open_version then only moves last_checked_at on a superseded row): "current copy" = the digest served now, not the
+  newest first_seen_at.
+- [ ] **Phase C — scraper (connector inactive).** `DouglasWATaxDelinquentScraper` serves only the published version's
+  eligible rows; any unpublished newer digest = typed hold failure (never a short success). Recheck eligibility at the
+  delivery gate before claims/persist. `date_recorded` = as-of 8/1/2026, amount labelled "Taxes and interest as of
+  August 1, 2026", foreclosure-stage. Source added to `_TRUSTED_TAX_SOURCES`; register the tables with
+  suppression/erasure (checked on load). Inactive connector migration 174.
+- [ ] **Phase D — activation drill (owner).** Enter + publish the current exhibit; simulate a re-stamped PDF: hold ->
+  review -> fresh delivery; then switch on.
+- **Owner decided 2026-11-24: exempt** the Douglas summons source from the default 18-month tax cap
+  (`TAX_CAP_EXEMPT_SOURCES`, Phase C): foreclosure-stage parcels' oldest tax year is older than the cap.
+- Delivered leads stay as historical snapshots (Clallam/Benton precedent); withdrawn parcels never enter new deliveries.

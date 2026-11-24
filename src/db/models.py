@@ -10,6 +10,7 @@ from sqlalchemy import (
     Computed,
     Date,
     DateTime,
+    FetchedValue,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -2084,6 +2085,194 @@ class PacsTaxStatus(Base):
     privacy_suppression_id = Column(
         UUID(as_uuid=False), ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
         nullable=True)
+
+
+class TaxSummonsVersion(Base):
+    """One distinct digest of a county Treasurer's tax-foreclosure Notice and Summons PDF
+    (migration 173). The county re-uploads the PDF as parcels redeem, so each digest is
+    reviewed on its own: pending -> published (by an operator) -> superseded. At most one
+    published version per county; ``seen_order`` is the order digests were first seen.
+    ``manifest`` (rows per exhibit page) and ``case_number`` are the operator's reading of
+    the PDF; ``revision`` names the current load, ``published_revision`` the approved one.
+    Shared, system-only like PacsTaxStatus. tax_summons.py documents the review flow."""
+
+    __tablename__ = "tax_summons_versions"
+    __table_args__ = (
+        UniqueConstraint("county", "state", "sha256", name="uq_tax_summons_versions_digest"),
+        UniqueConstraint("county", "state", "seen_order", name="uq_tax_summons_versions_seen"),
+        UniqueConstraint("county", "state", "published_seq", name="uq_tax_summons_versions_published_seq"),
+        Index("uq_tax_summons_versions_one_published", "county", "state", unique=True,
+              postgresql_where=text("status = 'published'")),
+        CheckConstraint("status IN ('pending', 'published', 'superseded')", name="ck_tax_summons_versions_status"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_tax_summons_versions_sha256"),
+        CheckConstraint("county ~ '^[a-z]+( [a-z]+)*$' AND state ~ '^[A-Z]{2}$'",
+                        name="ck_tax_summons_versions_place"),
+        CheckConstraint("seen_order > 0 AND revision >= 0", name="ck_tax_summons_versions_counters"),
+        CheckConstraint("case_number IS NULL OR case_number ~ '^[0-9]{2}-[0-9]-[0-9]{5}-[0-9]{2}$'",
+                        name="ck_tax_summons_versions_case"),
+        CheckConstraint("amount_as_of IS NULL OR amount_as_of BETWEEN DATE '2000-01-01' AND DATE '2100-12-31'",
+                        name="ck_tax_summons_versions_as_of"),
+        CheckConstraint(
+            "(published_at IS NULL) = (published_by IS NULL) "
+            "AND (published_at IS NULL) = (published_revision IS NULL) "
+            "AND (published_at IS NULL) = (published_seq IS NULL) "
+            "AND (published_at IS NULL OR (case_number IS NOT NULL AND amount_as_of IS NOT NULL "
+            "AND published_revision > 0 AND published_seq > 0)) "
+            "AND (status <> 'published' OR published_at IS NOT NULL)",
+            name="ck_tax_summons_versions_published"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    county = Column(String(64), nullable=False)
+    state = Column(String(4), nullable=False)
+    source_url = Column(Text, nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    seen_order = Column(Integer, nullable=False, server_default=FetchedValue())  # set by the seal trigger
+    status = Column(String(16), nullable=False, default="pending", server_default="pending")
+    case_number = Column(String(32), nullable=True)
+    manifest = Column(JSON(none_as_null=True), nullable=True)
+    amount_as_of = Column(Date, nullable=True)  # the summons' "Taxes and Interest Due As Of" date  # {"<page>": <rows on that page>}
+    revision = Column(Integer, nullable=False, default=0, server_default="0")
+    revision_txid = Column(BigInteger, nullable=True)  # set by the seal trigger: who may fill the revision
+    first_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    published_by = Column(String(64), nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    published_revision = Column(Integer, nullable=True)
+    published_seq = Column(Integer, nullable=True)  # publication order, set by the seal trigger
+    superseded_after_seq = Column(Integer, nullable=True)  # set by the seal trigger when superseded
+
+
+class TaxSummonsObservation(Base):
+    """What the watcher last confirmed a county serves (migration 173): one row per county.
+
+    ``current_version_id`` is the copy confirmed at ``confirmed_at``; ``status`` is the
+    latest check's outcome (``ok``, or a hold: ``link_missing``, ``page_failed``,
+    ``download_failed``, ``ambiguous``, ``rollback``). Both clocks are the database's.
+    ``claim_token`` fences watcher runs: a run records only with the token it claimed, so a
+    late run never overwrites a newer one. Publication needs the version to be current."""
+
+    __tablename__ = "tax_summons_observations"
+    __table_args__ = (
+        CheckConstraint("status IN ('unknown', 'ok', 'link_missing', 'page_failed', 'download_failed', "
+                        "'ambiguous', 'rollback')", name="ck_tax_summons_observations_status"),
+        CheckConstraint("status <> 'ok' OR (current_version_id IS NOT NULL AND confirmed_at IS NOT NULL)",
+                        name="ck_tax_summons_observations_ok"),
+        CheckConstraint("claim_token >= 0 AND (link_year IS NULL OR link_year BETWEEN 2000 AND 2100)",
+                        name="ck_tax_summons_observations_values"),
+    )
+
+    county = Column(String(64), primary_key=True)
+    state = Column(String(4), primary_key=True)
+    status = Column(String(16), nullable=False, default="unknown", server_default="unknown")
+    current_version_id = Column(UUID(as_uuid=False), ForeignKey("tax_summons_versions.id", ondelete="RESTRICT"),
+                                nullable=True)
+    link_url = Column(Text, nullable=True)
+    link_year = Column(Integer, nullable=True)
+    max_link_year = Column(Integer, nullable=True)
+    checked_at = Column(DateTime(timezone=True), nullable=True)
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    claim_token = Column(BigInteger, nullable=False, default=0, server_default="0")
+    claim_expires_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class TaxSummonsRow(Base):
+    """A summons row as an operator typed it, under one load ``revision`` of one version
+    (migration 173). Append-only: a reload adds a revision. Only an ``eligible`` row of a
+    published version's ``published_revision`` may become a lead; ``redeemed`` (the
+    county's stamp), ``unreadable`` and ``excluded`` rows prove every row was accounted for."""
+
+    __tablename__ = "tax_summons_rows"
+    __table_args__ = (
+        UniqueConstraint("version_id", "revision", "page", "row_no", name="uq_tax_summons_rows_locator"),
+        Index("uq_tax_summons_rows_parcel", "version_id", "revision", "parcel_id", unique=True,
+              postgresql_where=text("parcel_id IS NOT NULL")),
+        CheckConstraint("eligibility IN ('eligible', 'redeemed', 'unreadable', 'excluded')",
+                        name="ck_tax_summons_rows_eligibility"),
+        CheckConstraint("eligibility <> 'redeemed' OR parcel_id IS NOT NULL",
+                        name="ck_tax_summons_rows_redeemed_parcel"),
+        CheckConstraint("revision > 0 AND page > 0 AND row_no > 0", name="ck_tax_summons_rows_locator"),
+        CheckConstraint("parcel_id IS NULL OR parcel_id ~ '^[0-9]{4,32}$'", name="ck_tax_summons_rows_parcel"),
+        CheckConstraint("amount_due IS NULL OR (amount_due > 0 AND amount_due <= 10000000)",
+                        name="ck_tax_summons_rows_amount"),
+        CheckConstraint(
+            "CASE WHEN tax_years IS NULL THEN true WHEN json_typeof(tax_years) <> 'array' THEN false "
+            "ELSE json_array_length(tax_years) > 0 AND NOT jsonb_path_exists(tax_years::jsonb, "
+            "'$[*] ? (@.type() != \"number\" || @ < 1990 || @ > 2100 || @ != @.floor())') END",
+            name="ck_tax_summons_rows_tax_years"),
+        CheckConstraint(
+            "eligibility <> 'eligible' OR (parcel_id IS NOT NULL AND amount_due IS NOT NULL "
+            "AND tax_years IS NOT NULL)",
+            name="ck_tax_summons_rows_eligible_complete"),
+        CheckConstraint(
+            "(eligibility = 'excluded') = (exclusion_reason IS NOT NULL) AND (exclusion_reason IS NULL OR "
+            "exclusion_reason IN ('duplicate', 'not_a_parcel', 'privacy_request', 'entered_in_error'))",
+            name="ck_tax_summons_rows_exclusion_reason"),
+        CheckConstraint(
+            "reinstate_reason IS NULL OR (eligibility = 'eligible' AND "
+            "reinstate_reason IN ('redemption_reversed', 'entered_in_error'))",
+            name="ck_tax_summons_rows_reinstate_reason"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    version_id = Column(UUID(as_uuid=False), ForeignKey("tax_summons_versions.id", ondelete="RESTRICT"),
+                        nullable=False)
+    revision = Column(Integer, nullable=False)
+    page = Column(Integer, nullable=False)
+    row_no = Column(Integer, nullable=False)
+    parcel_id = Column(String(32), nullable=True)
+    vested_owner = Column(String(512), nullable=True)
+    taxpayer = Column(String(512), nullable=True)
+    property_address = Column(String(512), nullable=True)
+    mailing_address = Column(String(512), nullable=True)
+    amount_due = Column(Numeric(12, 2), nullable=True)
+    # none_as_null: no years is SQL NULL, never a JSON null (ck_tax_summons_rows_tax_years).
+    tax_years = Column(JSON(none_as_null=True), nullable=True)
+    eligibility = Column(String(16), nullable=False)  # eligible | redeemed | unreadable | excluded
+    exclusion_reason = Column(String(32), nullable=True)
+    reinstate_reason = Column(String(32), nullable=True)
+    entered_by = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    privacy_suppression_id = Column(
+        UUID(as_uuid=False), ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
+        nullable=True)
+
+
+class TaxSummonsEvent(Base):
+    """Append-only audit of summons review (migration 173): codes, revisions and parcel
+    numbers, never names. The system role may insert and read, never update or delete."""
+
+    __tablename__ = "tax_summons_events"
+    __table_args__ = (
+        CheckConstraint("action IN ('manifest', 'loaded', 'entered', 'reinstated', 'published')",
+                        name="ck_tax_summons_events_action"),
+        CheckConstraint("eligibility IS NULL OR eligibility IN ('eligible', 'redeemed', 'unreadable', 'excluded')",
+                        name="ck_tax_summons_events_eligibility"),
+        CheckConstraint(
+            "reason IS NULL OR (action = 'entered' AND reason IN "
+            "('duplicate', 'not_a_parcel', 'privacy_request', 'entered_in_error')) "
+            "OR (action = 'reinstated' AND reason IN ('redemption_reversed', 'entered_in_error')) "
+            "OR (action = 'manifest' AND reason = 'new_case')",
+            name="ck_tax_summons_events_reason"),
+        CheckConstraint(
+            "(action <> 'reinstated' OR (parcel_id IS NOT NULL AND eligibility IS NOT DISTINCT FROM 'eligible' "
+            "AND reason IS NOT NULL)) AND (action <> 'entered' OR eligibility IS NOT NULL)",
+            name="ck_tax_summons_events_shape"),
+        CheckConstraint("parcel_id IS NULL OR parcel_id ~ '^[0-9]{4,32}$'", name="ck_tax_summons_events_parcel"),
+        CheckConstraint("revision > 0", name="ck_tax_summons_events_revision"),
+        Index("ix_tax_summons_events_version", "version_id", "at"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    version_id = Column(UUID(as_uuid=False), ForeignKey("tax_summons_versions.id", ondelete="RESTRICT"),
+                        nullable=False)
+    revision = Column(Integer, nullable=False)
+    action = Column(String(16), nullable=False)  # manifest | loaded | entered | reinstated | published
+    parcel_id = Column(String(32), nullable=True)
+    eligibility = Column(String(16), nullable=True)
+    reason = Column(String(32), nullable=True)
+    actor = Column(String(64), nullable=False)
+    at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class ProbateNoticeRow(Base):

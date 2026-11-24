@@ -70,7 +70,8 @@ _UPDATED_RE = re.compile(r"Last Update\s+(\d{1,2}/\d{1,2}/\d{4})")
 _COUNT_RE = re.compile(r"Count\s*=\s*(\d+)")
 _CAUSE_RE = re.compile(r"Cause Number\s+([\w-]+)")
 _TITLE_LINK_RE = re.compile(r"(\d+):\s*https://apps\.co\.cowlitz\.wa\.us/Foreclosures/\d{4}/(\d+)_(\w+)\.pdf")
-_BID_RE = re.compile(r"(\d[\d,]*\.\d{2})\s*$")
+# The whole last token: a sign or a stray character before it (-5.00) is not a bid (Codex).
+_BID_RE = re.compile(r"(?:^|\s)(\d[\d,]*\.\d{2})\s*$")
 _STREET_START_RE = re.compile(r"\s(\d+\s+[A-Z0-9])")
 
 
@@ -250,8 +251,9 @@ def build_records(cycle: Cycle, listing: Listing, today: date,
         rec.date_recorded = None  # a foreclosure listing has a cycle, not a filing date
         rec.enrichment_data = {
             "source": SOURCE,
-            "delinquent_amount": str(p.minimum_bid.quantize(Decimal("0.01"))),
-            "delinquent_amount_basis": "foreclosure_minimum_bid",
+            # No balance owed: the listing publishes only the minimum bid (the redemption
+            # total, costs included), which is not one. It goes out as the Foreclosure
+            # Minimum Bid, never under "Tax Balance Owed" (as Benton's bid does).
             "bill_year": None,
             "as_of_date": listing.last_update.strftime("%m/%d/%Y"),
             "account_number": p.property_id,

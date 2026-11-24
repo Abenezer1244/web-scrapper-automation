@@ -172,7 +172,9 @@ tax_src AS (
            -- ->> reads a JSON null as SQL NULL, so a null key is not data.
            OR enrichment_data ->> 'billed_amount' IS NOT NULL
            OR enrichment_data ->> 'paid_amount' IS NOT NULL
-           OR enrichment_data ->> 'account_status' IS NOT NULL)
+           OR enrichment_data ->> 'account_status' IS NOT NULL
+           -- A bid-only listing (Cowlitz) has no balance: its bid is its tax data.
+           OR enrichment_data ->> 'foreclosure_minimum_bid' IS NOT NULL)
     ORDER BY bucket, (delinquent_amount IS NULL), job_created_at DESC NULLS LAST, id DESC
 ),
 auction_src AS (
@@ -305,6 +307,8 @@ SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs
        -- Record-type groups come from their own source rows (_GROUP_SOURCE_CTES).
        ts.src_delinquent_amount AS delinquent_amount,
        ts.src_delinquent_bill_year AS delinquent_bill_year,
+       -- From the same tax row as the amount, whatever type represents the property.
+       ts.tax_enrichment ->> 'foreclosure_minimum_bid' AS foreclosure_minimum_bid,
        rk.phone, rk.phone_type, rk.email, rk.phones, rk.emails,
        rk.absentee_owner, rk.out_of_state_owner, rk.owner_state,
        aus.src_auction_date AS auction_date, aus.src_default_amount AS default_amount,
@@ -439,7 +443,7 @@ _EMPTY_COUNTS = {
 # The enrichment_data keys each record-type group owns (the keys build_lead_export_row
 # and the Results UI read for that group). apply_group_sources moves exactly these
 # from the group's source row onto the lead, so a group is never half one row's.
-_TAX_ENRICHMENT_KEYS = ("billed_amount", "paid_amount", "account_status")
+_TAX_ENRICHMENT_KEYS = ("billed_amount", "paid_amount", "account_status", "foreclosure_minimum_bid")
 _VIOLATION_ENRICHMENT_KEYS = (
     "violation_category", "record_type", "case_type", "status", "description",
     "last_inspection", "record_number", "case_number",

@@ -184,6 +184,24 @@ _TRUSTED_TAX_SOURCES = frozenset({
 # property taxes from 2023 or earlier", not per parcel).
 _YEAR_UNPUBLISHED_TAX_SOURCES = frozenset({"cowlitz_county_tax_foreclosure"})
 
+# Trusted sources that publish no balance owed, only the foreclosure minimum bid (the
+# redemption total, costs included). Their rows carry delinquent_amount None, so no
+# "Tax Balance Owed" surface or balance filter ever shows a bid as a balance; the bid
+# travels as enrichment_data.foreclosure_minimum_bid and is required instead.
+_BID_ONLY_TAX_SOURCES = frozenset({"cowlitz_county_tax_foreclosure"})
+
+
+def _bounded_amount(raw) -> Decimal | None:
+    """A stored dollar amount, coerced and bounded like the tax columns, or None."""
+    if raw is None:
+        return None
+    try:
+        # Decimal(str(...)) — never Decimal(float) (binary-float drift).
+        d = Decimal(str(raw)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return d if d.is_finite() and Decimal("0") <= d <= Decimal("99999999.99") else None
+
 
 def _extract_tax_fields(
     enrichment_data, record_type: str
@@ -203,16 +221,9 @@ def _extract_tax_fields(
     if enrichment_data.get("source") not in _TRUSTED_TAX_SOURCES:
         return (None, None)
 
-    amount: Decimal | None = None
-    raw_amt = enrichment_data.get("delinquent_amount")
-    if raw_amt is not None:
-        try:
-            # Decimal(str(...)) — never Decimal(float) (binary-float drift).
-            d = Decimal(str(raw_amt)).quantize(Decimal("0.01"))
-            if d.is_finite() and Decimal("0") <= d <= Decimal("99999999.99"):
-                amount = d
-        except (InvalidOperation, ValueError, TypeError):
-            amount = None
+    # A bid-only source has no balance, whatever its enrichment carries (Codex High).
+    amount = (None if enrichment_data.get("source") in _BID_ONLY_TAX_SOURCES
+              else _bounded_amount(enrichment_data.get("delinquent_amount")))
 
     year: int | None = None
     raw_year = enrichment_data.get("bill_year")
@@ -271,6 +282,11 @@ def validate_tax_delinquent_records(records, record_type: str) -> None:
             )
         amount, year = _extract_tax_fields(enrichment, record_type)
         year_optional = source in _YEAR_UNPUBLISHED_TAX_SOURCES
+        if source in _BID_ONLY_TAX_SOURCES:
+            # No balance by design: a positive minimum bid must be there instead (a zero
+            # bid would export blank, Codex).
+            amount = _bounded_amount(enrichment.get("foreclosure_minimum_bid"))
+            amount = amount if amount is not None and amount > 0 else None
         if amount is None or (year is None and not year_optional):
             raise TaxDelinquentInvariantError(
                 f"tax_delinquent record #{idx} from {source!r} is missing required "

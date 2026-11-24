@@ -206,9 +206,58 @@ async def test_no_promised_column_is_silently_blank(
         # "Overlap" is the WORD, written only at lists_count >= 2
         # (build_overlap_export_row). This fixture is on one list.
         "overlap",
+        # Only a tax foreclosure listing has a minimum bid; this lead is not one.
+        "foreclosure_minimum_bid",
     }
     blank = {c for c in OVERLAP_LEAD_COLUMNS if not (row.get(c) or "").strip()}
     unexpected = blank - allowed_blank
     assert not unexpected, (
         f"promised columns rendered blank despite being populated: {sorted(unexpected)}"
     )
+
+
+async def _config(db: AsyncSession, user: User, record_type: str, county: str) -> str:
+    config = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=user.id, name=f"bid {uuid.uuid4().hex[:6]}",
+        county=county, state="WA", record_type=record_type,
+        fields=["party_name", "parcel_id"], enrichment=[],
+        schedule={"frequency": "manual"}, deliver={"format": "csv", "emails": []},
+    )
+    db.add(config)
+    await db.commit()
+    job_id = str(uuid.uuid4())
+    db.add(Job(id=job_id, user_id=user.id, scraper_config_id=config.id, status="done", created_at=NOW))
+    await db.commit()
+    return job_id
+
+
+@pytest.mark.parametrize("property_key", ["pk-bid-live", None], ids=["property-key", "fallback-bucket"])
+async def test_a_bid_only_tax_lead_keeps_its_bid_behind_a_non_tax_representative(
+        db: AsyncSession, starter_user: User, property_key):
+    """A Cowlitz tax listing has no balance, only its minimum bid. A contact-bearing
+    probate row wins the property's representative slot; the bid must still come from
+    the tax row (Codex High), in the union's fallback bucket too."""
+    probate_job = await _config(db, starter_user, "probate", "cowlitz")
+    tax_job = await _config(db, starter_user, "tax_delinquent", "cowlitz")
+    common = {"user_id": starter_user.id, "property_key": property_key, "dedup_hash": "dh-bid-live",
+              "parcel_id": "WL2408005", "property_address": "10 BID ST, KELSO, WA 98626",
+              "party_name": "BIDOWNER JANE", "created_at": NOW}
+    probate_id = str(uuid.uuid4())
+    db.add(Result(id=probate_id, job_id=probate_job, date_recorded="11/01/2026",
+                  phone="3605550199", **common))
+    db.add(Result(id=str(uuid.uuid4()), job_id=tax_job, date_recorded=None,
+                  enrichment_data={"source": "cowlitz_county_tax_foreclosure",
+                                   "foreclosure_minimum_bid": "22912.46", "bill_year": None},
+                  **common))
+    await db.commit()
+    res = await db.execute(text(segments._UNION_SQL.format(county_clause="")), {
+        "uid": starter_user.id, "types": ["probate", "tax_delinquent"], "limit": 1000,
+        "filing_from": None, "filing_to": None, "require_date": False, "tax_cap_min_year": 1900,
+    })
+    rows = [r for r in segments._decrypt_pii_rows(res.fetchall()) if r.parcel_id == "WL2408005"]
+    assert [str(r.id) for r in rows] == [probate_id]                # probate represents it
+    out = io.StringIO()
+    write_lead_csv_with_overlap([(rows[0], {"overlap": "Overlap", "lists_count": 2,
+                                            "lists": "Probate, Tax", "counties": "cowlitz"})], out)
+    (row,) = list(csv.DictReader(io.StringIO(out.getvalue())))
+    assert (row["foreclosure_minimum_bid"], row["delinquent_amount"]) == ("22912.46", "")

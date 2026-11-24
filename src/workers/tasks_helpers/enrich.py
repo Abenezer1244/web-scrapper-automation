@@ -433,6 +433,12 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
             f"ELSE rn.{col} END"
         )
 
+    # A bid-only tax source has no balance owed: an earlier result's amount is never
+    # copied onto it (Codex). Code constants, quoted here, never user input.
+    from src.workers.tasks_helpers.dedup import _BID_ONLY_TAX_SOURCES
+
+    _bid_only = ", ".join("'" + s.replace("'", "''") + "'" for s in sorted(_BID_ONLY_TAX_SOURCES))
+
     # Address and enrichment fields are NOT gated by the subject: they describe the
     # property, not its owner, and fill-missing (COALESCE current-first) never
     # clobbers a fresh scrape or GIS value.
@@ -440,7 +446,9 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
         UPDATE results AS rn SET
             property_address     = COALESCE(rn.property_address, ro.property_address),
             mailing_address      = COALESCE(rn.mailing_address, ro.mailing_address),
-            delinquent_amount    = COALESCE(rn.delinquent_amount, ro.delinquent_amount),
+            delinquent_amount    = CASE WHEN rn.enrichment_data->>'source' IN ({_bid_only})
+                                        THEN rn.delinquent_amount
+                                        ELSE COALESCE(rn.delinquent_amount, ro.delinquent_amount) END,
             delinquent_bill_year = COALESCE(rn.delinquent_bill_year, ro.delinquent_bill_year),
             {_copy("phone")},
             {_copy("phone_type")},

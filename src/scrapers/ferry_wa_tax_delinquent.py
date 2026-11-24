@@ -15,9 +15,10 @@ Differences from Asotin (Codex Review C):
 * TaxSifter stamps its data date ("Data current as of"), which can lag the fetch; the
   crawler settles an answer only when that date is within 14 days
   (pacs_tax_crawler._AS_OF_SLACK_BY_COUNTY), so a frozen source goes stale, never fresh.
-* FAIL_ON_HELD: most Ferry parcels are rural with no situs address (7 of 12 sampled).
-  Until the owner decides how such land is delivered, a run that would hold any
-  qualifying parcel fails with the count instead of returning a shorter list.
+* Rural land: on 2026-11-18, 77 of 211 qualifying Ferry parcels had no situs address
+  on the assessor roll. Owner decision 2026-11-18: deliver the parcels that have one
+  and HOLD the rest (counted in every run's log, as Asotin/Columbia do); never invent
+  an address.
 * party_name is TaxSifter's "Owner Name" (the assessor roll's owner block), not the
   Treasurer grid's Taxpayer column; it is not independently verified as title holder.
 """
@@ -34,4 +35,3 @@ class FerryWATaxDelinquentScraper(AsotinWATaxDelinquentScraper):
 
     COUNTY = "ferry"
     SOURCE = SOURCE
-    FAIL_ON_HELD = True

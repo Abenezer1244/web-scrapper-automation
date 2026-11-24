@@ -93,6 +93,8 @@ def test_the_mapping_covers_the_csv_contract():
         "property_street", "property_city", "property_state", "property_zip",
         "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
         "lead_subtype", "default_amount_type", *_DERIVED_NEVER_SELECTED,
+        # A projected scalar alias from enrichment_data (pinned below), like lead_subtype.
+        "foreclosure_minimum_bid",
     }
     assert unclassified == known_non_row, (
         "OVERLAP_LEAD_COLUMNS changed. Classify the new column as row-backed "
@@ -121,6 +123,18 @@ def test_every_segment_query_projects_the_amount_basis(name):
     sql = _sql_without_comments(ALL_SEGMENT_SQL[name])
     assert "r.enrichment_data->'nts'->>'amount_basis' AS default_amount_basis" in sql
     assert "rk.default_amount_basis" in sql
+
+
+@pytest.mark.parametrize("name", sorted(ALL_SEGMENT_SQL))
+def test_every_segment_query_projects_the_minimum_bid(name):
+    """A tax listing's minimum bid is never a balance: without this alias a Cowlitz
+    tax lead's only amount would be missing from every Lists CSV."""
+    sql = _sql_without_comments(ALL_SEGMENT_SQL[name])
+    assert ("CASE WHEN sc.record_type = 'tax_delinquent'\n"
+            "                THEN r.enrichment_data->>'foreclosure_minimum_bid' END AS foreclosure_minimum_bid") in sql
+    # Sourced from the property's tax row, not the representative row.
+    key = "bucket" if name == "union" else "property_key"   # union groups by its fallback bucket
+    assert f"c2.{key} = rk.{key} AND c2.foreclosure_minimum_bid IS NOT NULL" in sql
 
 
 @pytest.mark.parametrize("column", _DERIVED_NEVER_SELECTED)

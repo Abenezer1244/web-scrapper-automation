@@ -4,6 +4,8 @@ Anchored on the REAL grantor/grantee values captured live during the 21-county
 probate audit (2026-06-19): cowlitz/king filing-agency death certs, the okanogan
 "Estate of" caption, and the clean counties that must stay unchanged.
 """
+import pytest
+
 from src.scrapers.probate import (
     is_filing_agency_party,
     is_person_like_party,
@@ -111,6 +113,30 @@ def test_estate_caption_in_re_form():
 
 def test_no_caption_unchanged():
     assert strip_estate_caption("CONKLIN DENNIS WILLIAM") == "CONKLIN DENNIS WILLIAM"
+
+
+def test_inverted_estate_caption_collapses_to_decedent():
+    # Douglas live shape (2026-11-15): grantor STATE OF WASHINGTON, grantee "<name> ESTATE OF".
+    from src.scrapers.probate import strip_inverted_estate_caption as inv
+
+    assert inv("DOE JOHN A ESTATE OF") == "DOE JOHN A"
+    assert inv("DOE JOHN A ESTATE OF / DOE JANE") == "DOE JOHN A"
+    # The decedent is still chosen over the issuing state; the caption is left to Douglas.
+    party, _ = orient_probate_party("STATE OF WASHINGTON", "DOE JOHN A ESTATE OF", "DEATH CERTIFICATE")
+    assert inv(party) == "DOE JOHN A"
+
+
+@pytest.mark.parametrize("name", ["ACME REAL ESTATE", "ESTATE OF", "SMITH JOHN, / SMITH JANE",
+                                  ", SMITH JOHN", "SMITH JOHN / SMITH JANE", "", None])
+def test_without_an_inverted_caption_the_name_is_untouched(name):
+    from src.scrapers.probate import strip_inverted_estate_caption as inv
+
+    assert inv(name) == name
+
+
+def test_the_shared_caption_helper_is_unchanged_by_the_inverted_form():
+    # Every county's delivered name+date keys depend on strip_estate_caption's output.
+    assert strip_estate_caption("DOE JOHN A ESTATE OF") == "DOE JOHN A ESTATE OF"
 
 
 def test_stacked_multi_grantor_no_caption_preserved():

@@ -203,6 +203,10 @@ _ESTATE_CAPTION_RE = re.compile(
     r"^\s*(?:IN\s+RE(?:\s+THE)?\s+)?(?:THE\s+)?ESTATE\s+OF\s+",
     re.IGNORECASE,
 )
+# The same caption inverted after the name ("DOE JOHN A ESTATE OF", Douglas recorder
+# 2026-11-15). Only the dangling "ESTATE OF": a bare trailing ESTATE is a company name
+# ("ACME REAL ESTATE").
+_ESTATE_CAPTION_TRAILING_RE = re.compile(r"\s+(?:THE\s+)?ESTATE\s+OF\s*$", re.IGNORECASE)
 
 # A residue that is wholly a place — what is left of "SEATTLE-KING COUNTY PUBLIC
 # HEALTH DEPARTMENT" once the agency phrase is excised. A locality is the agency's
@@ -341,6 +345,23 @@ def strip_estate_caption(name: str | None) -> str | None:
         if not _ESTATE_CAPTION_RE.match(seg):
             return seg
     return name
+
+
+def strip_inverted_estate_caption(name: str | None) -> str | None:
+    """Collapse "<DECEDENT> ESTATE OF / ..." to the decedent.
+
+    Douglas's recorder inverts the caption. Deliberately NOT part of
+    strip_estate_caption: that helper serves every county, and changing a name it
+    returns would re-key leads already delivered under the name+date fallback. A
+    value without the trailing caption is returned unchanged, co-parties included.
+    """
+    if not name:
+        return name
+    first = name.split(" / ")[0]
+    if not _ESTATE_CAPTION_TRAILING_RE.search(first):
+        return name
+    decedent = _ESTATE_CAPTION_TRAILING_RE.sub("", first).strip()
+    return decedent or name
 
 
 def clean_counterparty(value: str | None) -> str | None:

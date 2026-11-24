@@ -9,6 +9,7 @@ from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import (
     DELIVERY_EXCLUDED_KEY,
+    NO_ADDRESS,
     NOT_QUALIFIED,
     OVER_QUOTA,
     address_actionable_sql,
@@ -166,3 +167,46 @@ def mark_not_qualified_rows(db, *, job_id: str, user_id: str) -> int:
     if survivor_hashes:
         db.execute(sa_text(_HOLD_SIBLINGS_SQL), {**params, "hashes": survivor_hashes})
     return sum(1 for row in held if not row.is_duplicate and row.has_address)
+
+
+_HOLD_NO_ADDRESS_SQL = (  # splices only module constants; every value is bound
+    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} || jsonb_build_object(CAST(:key AS text), CAST(:reason AS text)))::json "  # noqa: S608
+    "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+    "  AND is_duplicate = false "
+    f"  AND NOT {address_actionable_sql('results')} "
+    "RETURNING dedup_hash"
+)
+_HOLD_NO_ADDRESS_SIBLINGS_SQL = (  # splices only module constants; every value is bound
+    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} || jsonb_build_object(CAST(:key AS text), CAST(:reason AS text)))::json "  # noqa: S608
+    "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+    "  AND duplicate_reason = 'same_run' "
+    "  AND dedup_hash = ANY(CAST(:hashes AS text[])) "
+    "  AND COALESCE(enrichment_data->>:key, '') <> :reason"
+)
+
+
+def mark_no_address_rows(db, *, job_id: str, user_id: str) -> int:
+    """Hold this job's rows that have no usable address as it delivers; return how many.
+
+    For every record type except code violation (mark_not_qualified_rows already holds
+    those, no-address ones included). A held row carries delivery_excluded_reason =
+    'no_address', which lead_actionability treats like over_quota: not listed as a lead,
+    exported, counted, billed, skip traced or pushed. The decision is frozen with the run,
+    because the background mailing sweep can find an address hours later and the row
+    would otherwise become a lead of this finished run that was never billed or sent
+    (owner, 2026-11-15). It keeps its claim, so a later run can still take and deliver it.
+
+    Same-run siblings of a held row are held with it, even one with an address: lists
+    and the batch export keep duplicates and would otherwise deliver the property through
+    a sibling (Codex). Idempotent for a watchdog re-run: this job's previous no_address
+    holds are cleared first, so a row the re-run found an address for is decided again.
+    Does not commit.
+    """
+    params = {"jid": job_id, "uid": str(user_id), "key": DELIVERY_EXCLUDED_KEY,
+              "reason": NO_ADDRESS}
+    db.execute(sa_text(_CLEAR_HOLDS_SQL), params)
+    held = db.execute(sa_text(_HOLD_NO_ADDRESS_SQL), params).fetchall()
+    hashes = [row.dedup_hash for row in held if row.dedup_hash]
+    if hashes:
+        db.execute(sa_text(_HOLD_NO_ADDRESS_SIBLINGS_SQL), {**params, "hashes": hashes})
+    return len(held)

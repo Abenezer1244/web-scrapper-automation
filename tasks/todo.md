@@ -394,3 +394,84 @@ Redis handler, real-sender tests sync + running loop -> Codex GO. 55 passed loca
 (test_canary_check, test_ops_alerts); enrichment canary 11 passed. Pre-existing local-only
 failure: test_db_canary::test_the_next_tick_samples_again_once_the_gate_expires fails on
 unchanged main too (key gone before pttl; slow local Redis connect), unrelated.
+
+## Clallam cross-scraper integrity + no-address promotion leak (2026-11-15)
+
+Investigation (read-only prod) — runs 7dfa7d6c probate / 8f70234c pre / cd7ae48b death, one account:
+- Pre (3 LP + 12 NTS) vs Death (23 recorded "Death"): 0 shared instruments; equal "15 already
+  delivered" is coincidence. Death's 15 = 14 delivered by the probate run 11 min earlier + 1 older probate run.
+- EagleWeb probate includes DEATH + TOD by design; death_certificate (whole-label DEATH) is a subset.
+  Owner: keep, disclose the overlap. Dedup once per property (parcel|address): owner confirmed.
+- 51/77 delivered probate leads mailing "Pending" = deferred lookup; policy is property OR mailing.
+- DEFECT (systemic): mailing recovery fills rows of done jobs that had NO address at delivery; they
+  become live "new" leads never billed/claimed-as-delivered/e-mailed (Clark 62404bd0 643 billed vs 655
+  live; Jefferson 013bbdd6 39 vs 46; King/Cowlitz too). CV rows are already safe (held by
+  mark_not_qualified_rows). Owner chose: promote AND bill.
+
+Plan (Codex consult before code; approval between phases):
+- [x] Phase 1 hold (`7831916c`, Codex GO, ~1,945 tests): at delivery, hold every non-CV record type's no-address rows (+ same-run siblings)
+      with delivery_excluded_reason = 'no_address'; add to EXCLUSION_REASONS; No-address list keeps
+      listing held rows until late-delivered; idempotent on watchdog re-run. Stops the leak.
+      Codex design consult adds: deliverable_before_cap_sql must exclude NO_ADDRESS (not just
+      NOT_QUALIFIED); owner_recovery/property_recovery may still enrich NO_ADDRESS-held rows;
+      hold every same-run sibling of a held survivor; run_breakdown live partition counts a held
+      row as no_address; keep weak-claim release; hold failure is fatal before delivery.
+      Files: lead_actionability.py, plan_cap.py, tasks.py, results_category.py, run_breakdown.py
+      (1a) + owner_recovery.py, property_recovery.py (1b), tests per sub-phase.
+- [x] Phase 2 late delivery (`bb4e9353`, Codex NO-GO tax cap -> GO): widen cv_late_delivery to deliver + bill a held no_address row once it
+      has an address (any record type), same locks/grant_records/late_delivery proof/notice; flag-gated.
+- [x] Phase 3 historical: dry-run report (below); owner decides. Nothing written.
+
+### Phase 3 dry run (read-only prod, 2026-11-16)
+
+Rule: done, billed, non-CV runs; a row counts when it is a live lead now (address, not excluded,
+not duplicate, not privacy-suppressed, no late_delivery) but had NEITHER address when its run was
+billed (property empty or property_recovery_last_at > billing_applied_at, AND mailing empty or
+mailing_recovery found after billing). Gap = live leads - billed_count. Ids are prefixes; no PII.
+
+A. Exact match (candidates = gap), all account b6d2095d, all still hold their claim: 45 rows
+   - Clallam probate 7dfa7d6c (2026-11-15): 3
+   - Clark probate 62404bd0: 12, 371c1a44: 10, e6e09238: 11, 5176d851: 1
+   - Jefferson probate 013bbdd6: 7
+   - King tax e629d68a: 1
+B. Partly explained (candidates < gap): King tax b2f2ecd5 (acct ba64975a) 22 of 24; King tax
+   230a1d0f 6 of 8; King pre 7afdda0c 2 of 32; Cowlitz probate 4bc38e82 1 of 7. These runs predate
+   the breakdown snapshot (Sep 2026); the rest of each gap has other causes (not this bug).
+C. Unattributable: Cowlitz probate 4f1fbb37 (gap 13) and pre dfa811a0 (gap 8): every live row now
+   has both addresses but carries no recovery stamp, so which rows were unbilled cannot be told
+   from the data. Same class of leak, written by a path that leaves no timestamp.
+D. Separate anomaly (not this bug): King tax 68d83263, acct 01dc9396 (Starter, limit 50), manual
+   run 2026-09-04, record_count 10,344, billed 0, 16,549 live leads (5,865 match the rule).
+   Looks like a pre-cap run that was never capped or billed; needs its own look.
+E. Negative gaps (live < billed; Pierce, King tax, Okanogan): rows billed that are no longer leads
+   (lost actionability later). Opposite direction; not this bug.
+
+Phase 2 does NOT touch any of these: they carry no no_address marker, so they stay live and
+unbilled. Options for the owner (nothing done without approval):
+   1. Leave them (recommended): the customer already received them; charging months later, in the
+      current window, is a surprise bill for data already used.
+   2. Stamp them no_address so Phase 2 bills them now (billing change; current window).
+   3. Hide them (stamp held, no bill): takes away leads the customer may already be working.
+   OWNER (2026-11-16): option 2, bill them. scripts/backfill_hold_unbilled_no_address.py stamps
+   exactly the 45 (prod read-only check of its selection: 7/10/1/12/3/1/11 = 45; account is
+   agency/unlimited, the one King tax row is 2026 and cap-exempt). Run ONLY after the Phase 2
+   deploy, with owner approval: dry run, then --apply --expect 45. King 68d83263 anomaly: later.
+- [ ] Copy (frontend repo): No-address tab wording ("may still be pending"); probate/death overlap note.
+
+## Canary: re-probe down connectors promptly; Clallam tax retry backoff (2026-11-18)
+
+Cause (read-only prod): Clallam tax canary 2026-11-16 20:18 UTC, PID 17038 portal page had no tax
+table 3x within ~1 s (300 ms retry gap) -> connector 'down' (hidden from customers). Page reads fine
+now. 'down' gets no canary priority (only never-checked/'unknown' do), 5 random units/hour of ~68,
+so it sat 30+ h. Owner-approved one-off probe 2026-11-18 -> healthy (6 leads), RECOVERED sent.
+- [x] 1. `_canary_units`: down connectors share the priority slots (pending keeps >=1 while any
+      down exist), random sample, the Redis-marked type (one MGET, 2 s bounded, advisory);
+      recovery probes run LAST in the tick; siblings stay in rotation. `_canary_check_impl`: a type
+      that failed this tick keeps its connector down, and a connector down at tick start stays
+      down until its last unit this tick has run.
+- [x] 2. Clallam `_portal_status`: waits 2 s then 5 s between retryable failures, never under POLITE_DELAY_MS.
+- [x] Tests (positive-controlled), ruff; Codex 8 review rounds, no Critical/High; every P2/P3 fixed
+      except the one below.
+Owner (2026-11-18): ship as is. Known limit (Codex P2, pre-existing): one health flag per connector,
+so recovering one marked type can relist a connector whose other marked type is still broken
+(that type still pages on its own). Per-type health would need a migration + listing change.

@@ -118,6 +118,14 @@ def test_the_crawl_task_is_registered_and_scheduled():
     assert "src.workers.nts_crawler.crawl_nts_nwmarket_asotin" in tasks
 
 
+def test_the_crawl_runs_twice_a_day_so_one_failed_run_costs_half_a_day():
+    import src.workers.scheduler  # noqa: F401 — import installs the beat schedule
+    from src.workers import app
+
+    sched = app.conf.beat_schedule["crawl-nts-nwmarket-asotin"]["schedule"]
+    assert sched.hour == {10, 22} and sched.minute == {0}
+
+
 def test_a_readable_non_sale_pdf_is_a_read_not_an_extraction_failure():
     # Real 2026-11-12 WSU bid notice: enough text to be a real read, no trustee sale.
     from src.workers.nts_crawler import _NWM_MIN_TEXT_CHARS

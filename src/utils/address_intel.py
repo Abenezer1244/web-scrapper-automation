@@ -224,13 +224,25 @@ def _unit_id(token: str) -> str:
     return re.sub(r"(?<=[A-Z])-(?=\d)|(?<=\d)-(?=[A-Z])", "", t)
 
 
-_UNIT_LIKE_KINDS = frozenset("USLRT")
-
-
 def _street_units(parsed: dict) -> str | None:
     """_unit_ids for a parsed address: its own ZIP, when known, is never part of a unit
-    ("1420 E PINE ST #409 98122" with ZIP 98122, 2026-11-24 dry run)."""
-    return _unit_ids(parsed["street"], _unparsed(parsed), _zip5(parsed.get("zip")) or None)
+    ("1420 E PINE ST #409 98122" with ZIP 98122, 2026-11-24 dry run), nor is a trailing
+    "WA" when the parser found no state ("UNIT A WA, SEATTLE, WA" keeps its "WA", Codex)."""
+    return _unit_ids(parsed["street"], _unparsed(parsed), _zip5(parsed.get("zip")) or None,
+                     trim_state=not parsed.get("state"))
+
+
+def _units_differ(a: str | None, b: str | None) -> bool:
+    """Two explicit units name two places. A bare "#" (kind H) is generic and matches any
+    single named kind ("SPC 9" == "#9"); named kinds stay apart ("APT 5" != "SPC 5",
+    Codex); UNIT/APT/STE are one kind. With several groups, "#" reads as a unit."""
+    if not a or not b or a == b:
+        return False
+    ga, gb = a.split("|"), b.split("|")
+    if len(ga) == 1 and len(gb) == 1:
+        (ka, va), (kb, vb) = ga[0].split(":", 1), gb[0].split(":", 1)
+        return va != vb or ("H" not in (ka, kb) and ka != kb)
+    return a.replace("H:", "U:") != b.replace("H:", "U:")
 
 
 def _unparsed(parsed: dict) -> bool:
@@ -241,7 +253,7 @@ def _unparsed(parsed: dict) -> bool:
 
 
 def _unit_ids(street: str | None, zip_in_street: bool = False,
-              known_zip: str | None = None) -> str | None:
+              known_zip: str | None = None, trim_state: bool = True) -> str | None:
     """The unit tail as comparable ids: "BLDG 1 UNIT 23" -> "B:1|U:23", "#G304" and
     "UNIT G 304" -> "U:G304". None when the street names no unit. A unit word inside a
     street name ("OLD LOT 5 ACCESS ALY") is glued first and never starts a tail.
@@ -279,7 +291,7 @@ def _unit_ids(street: str | None, zip_in_street: bool = False,
     # Never the id right after a marker ("# 98032" stays a unit).
     def _locality(tok: str) -> bool:
         t = tok.rstrip("._")
-        if t == "WA" or (known_zip and t[:5] == known_zip and re.fullmatch(r"\d{5}(?:[-_]\d{4})?", t)):
+        if (t == "WA" and trim_state) or (known_zip and t[:5] == known_zip and re.fullmatch(r"\d{5}(?:[-_]\d{4})?", t)):
             return True  # this address's own state / ZIP left in a comma-less line
         return zip_in_street and bool(re.fullmatch(r"\d{5}(?:[-_]\d{4})?", t))
     while len(chunks) > 1 and not _UNIT_START_RE.fullmatch(chunks[-2]) and _locality(chunks[-1]):
@@ -289,7 +301,7 @@ def _unit_ids(street: str | None, zip_in_street: bool = False,
     for tok in (c for c in chunks if c):
         is_marker = tok == "#" or tok in _UNIT_DESIGNATOR_WORDS
         if is_marker and not expecting_id:
-            groups.append([_UNIT_KIND.get(tok, "U"), ""])
+            groups.append(["H" if tok == "#" else _UNIT_KIND.get(tok, "U"), ""])
             expecting_id = True
         elif tok == "#":
             continue  # "UNIT #5": the "#" belongs to the marker
@@ -303,11 +315,6 @@ def _unit_ids(street: str | None, zip_in_street: bool = False,
             groups[-1][1] = prev + sep + _unit_id(tok)
             expecting_id = False
     groups = [g for g in groups if g[1]]
-    if len(groups) == 1 and groups[0][0] in _UNIT_LIKE_KINDS:
-        # One unit named: unit / space / lot / room / trailer is just spelling ("SPC 9" ==
-        # "#9" == "UNIT 9"). A building, floor, dept or box stays itself ("BLDG 2" !=
-        # "UNIT 2", Codex); kinds also tell several units apart ("LOT 1 UNIT 2").
-        groups[0][0] = "U"
     ids = "|".join(sorted(f"{k}:{v}" for k, v in groups))
     return ids or None
 
@@ -568,7 +575,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     # ...unless the explicit units differ in a way that normalizing erased ("UNIT A.1"
     # vs "UNIT A 1", Codex). Read from the parsed street, never the whole line.
     if (_normalize_full(property_address) == _normalize_full(mailing_address)
-            and _street_units(p) == _street_units(m)):
+            and not _units_differ(_street_units(p), _street_units(m))):
         return False
     p_street = _compare_street(p["street"])
     m_street = _compare_street(m["street"])
@@ -590,7 +597,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
     # type ("UNIT 5" vs "UNIT 6", "COUNTY ROAD #5" vs "#6", Codex). Only a unit OMITTED on
     # one side is the product rule's same place (county situs drops the unit).
     p_unit, m_unit = _street_units(p), _street_units(m)
-    if p_unit and m_unit and p_unit != m_unit:
+    if _units_differ(p_unit, m_unit):
         return True
 
     # Base street matches — need a positive discriminator to call it same vs diff.

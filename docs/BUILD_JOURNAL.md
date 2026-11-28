@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-27 — Pierce seven-type audit + two scraper reliability fixes (Phase 1, unpushed)
+
+**Built (branch `feat/pierce-wa-seven-record-types-reliability`, not committed/pushed):**
+- ARMS parcel pass: `_return_to_first_page` replaces a swallowed First-page click. A reset not
+  confirmed by the page dropdown now raises TransientScrapeError (job retried) instead of starting
+  the parcel pass on the last page and delivering earlier pages' rows without parcels.
+- Tacoma code violations: exhausted transient page failures raise TransientScrapeError (job retried)
+  instead of a permanent RuntimeError; ArcGIS 200 bodies with a 4xx `error.code` (not 429) are
+  permanent; backoff uses asyncio.sleep and the request runs in `asyncio.to_thread`.
+- Tests: `tests/test_pierce_arms_parcel_pass.py` (real Chromium), `tests/test_pierce_cv_retry.py`.
+  296 Pierce/qualification/scraper tests pass on a dedicated test DB; ruff clean.
+
+**Tried / Decided:** read-only prod baseline (counts only) in `tasks/pierce-wa-seven.md`. The brief's
+"historical problems" were mostly already fixed: done+NULL `records_found` runs all predate migration
+099 (2026-09-20), guarded by #598; Probate "stuck connecting" = #217 + #273. Tacoma `parcelnumber` is
+`esriFieldTypeString` (live metadata), so leading zeros are safe; no change.
+
+**Caught & fixed:** Codex NO-GO round 1: High (invalid-query error bodies promoted to job retries),
+Medium (sync request on the event loop), Low (reset landing in the final poll). Round 2: GO.
+
+**Failed / Blocked:** owner/counsel decisions needed before any new Pierce type: ARMS terms ban
+commercial/automated use (P0-4); LINX terms ban redistribution; tax_delinquent has no lawful balance
+source; death_certificate has no lawful recent source; strict qualification for non-CV types changes
+billing; ATIP reCAPTCHA solving conflicts with the no-CAPTCHA-bypass rule.
+
+**Pending / Handoff:** commit + PR on owner OK. Codex noted the parcel pass can still stop early on
+detail-entry / Back to Results / Next failures inside `_fetch_parcels_from_detail` (records still
+delivered, without parcels); not changed here. Two Low test gaps (recovery test uses an empty page).
+
+**Facts learned:** local test DBs must not use port 5432: `src/db/session.py` rewrites the sync URL
+`:5432/` -> `:6543/`. Use a container on another port.
+
+---
+
 ## 2026-11-24 — Absentee owner, part 2: punctuation, explicit units, and 47 Codex rounds (#679)
 
 **Built / Shipped:** #679 merged as `65319b8e`, deployed. Comparison-only (`address_match_key` untouched):

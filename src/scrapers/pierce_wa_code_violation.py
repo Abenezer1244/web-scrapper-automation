@@ -13,9 +13,9 @@ Fields returned:
 - latitude, longitude, parcelinfo (ATIP link)
 """
 
+import asyncio
 import hashlib
 import random
-import time
 from datetime import UTC, datetime, timedelta
 
 import requests
@@ -23,6 +23,7 @@ import requests
 from src.api.middleware.security import add_scrape_domain
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.reliability import TransientScrapeError
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -53,7 +54,13 @@ class _ArcGISErrorBodyError(RuntimeError):
     """ArcGIS returned HTTP 200 with a JSON ``{"error": ...}`` body (or a body
     missing ``features``). These are usually transient (the service throttles /
     overloads and answers 200 with an error payload), so they are retried like a
-    5xx before failing loud — distinct from a plain RuntimeError, which is not."""
+    5xx before failing loud — distinct from a plain RuntimeError, which is not.
+    The exception is a body whose ``error.code`` is a 4xx other than 429 (an invalid
+    query): a retry cannot fix it, so it is permanent."""
+
+    def __init__(self, message: str, code: object = None):
+        super().__init__(message)
+        self.retryable = not (isinstance(code, int) and 400 <= code < 500 and code != 429)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -62,7 +69,7 @@ def _is_retryable(exc: Exception) -> bool:
     (ValueError) and non-transient 4xx (bad query / forbidden), which a retry
     can't fix."""
     if isinstance(exc, _ArcGISErrorBodyError):
-        return True
+        return exc.retryable
     if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
         return True
     if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
@@ -92,7 +99,7 @@ class PierceWACodeViolationScraper(BridgeScraper):
     def __init__(self, record_type: str = "code_violation"):
         super().__init__()
 
-    def _fetch_page(self, params: dict, offset: int, page_num: int) -> dict:
+    async def _fetch_page(self, params: dict, offset: int, page_num: int) -> dict:
         """Fetch one ArcGIS page with bounded retries on transient failures.
 
         Retries read-timeout / 429 / 5xx with jittered backoff
@@ -111,25 +118,29 @@ class PierceWACodeViolationScraper(BridgeScraper):
                 # S4: safe_http (SSRF defense-in-depth) — re-validates the fixed
                 # HTTPS ArcGIS endpoint each attempt, disables ambient proxy,
                 # refuses redirect-to-internal.
-                resp = safe_get(_FEATURE_URL, params=params, headers=_HEADERS,
-                                timeout=settings.DEFAULT_TIMEOUT)
+                # In a thread so the blocking request does not stall the event loop.
+                resp = await asyncio.to_thread(safe_get, _FEATURE_URL, params=params,
+                                               headers=_HEADERS,
+                                               timeout=settings.DEFAULT_TIMEOUT)
                 resp.raise_for_status()
                 data = resp.json()
                 # ArcGIS returns 200 + an error body on a bad/overloaded query.
                 # Treat a non-dict, an "error" key, or a missing "features" key as
                 # a hard failure — never as an empty page.
                 if not isinstance(data, dict) or "error" in data or "features" not in data:
-                    err = ""
+                    err, code = "", None
                     if isinstance(data, dict) and isinstance(data.get("error"), dict):
                         message = data["error"].get("message")  # server text only, never the object
                         err = message[:160] if isinstance(message, str) else ""
+                        code = data["error"].get("code")
                     # _ArcGISErrorBodyError is retryable (usually a transient throttle);
                     # a persistent bad query still fails loud after MAX_RETRIES.
                     # P0-04: the body's shape, never the body (it can hold records).
                     shape = f"keys {sorted(data)[:10]}" if isinstance(data, dict) else type(data).__name__
                     raise _ArcGISErrorBodyError(
                         f"ArcGIS returned an error/malformed body at offset {offset} "
-                        f"(page {page_num + 1}): {err or shape}"
+                        f"(page {page_num + 1}): {err or shape}",
+                        code,
                     )
                 return data
             except Exception as exc:
@@ -144,11 +155,16 @@ class PierceWACodeViolationScraper(BridgeScraper):
                     offset, page_num + 1, attempt, settings.MAX_RETRIES,
                     str(exc)[:120], wait,
                 )
-                time.sleep(wait)
+                await asyncio.sleep(wait)
+        reason = (f"API page fetch failed at offset {offset} (page {page_num + 1}) after "
+                  f"{settings.MAX_RETRIES} attempt(s), aborting to avoid a truncated result")
+        if last_exc is not None and _is_retryable(last_exc):
+            # Still transient after the per-page retries: the worker re-runs the job later.
+            raise TransientScrapeError("pierce", "tacoma_arcgis", reason,
+                                       record_type="code_violation",
+                                       context=last_exc) from last_exc
         raise RuntimeError(
-            f"Pierce code violations: API page fetch failed at offset {offset} "
-            f"(page {page_num + 1}) after {settings.MAX_RETRIES} attempt(s) — "
-            f"aborting to avoid a truncated result: {str(last_exc)[:120]}"
+            f"Pierce code violations: {reason}: {str(last_exc)[:120]}"
         ) from last_exc
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
@@ -196,7 +212,7 @@ class PierceWACodeViolationScraper(BridgeScraper):
                 "f": "json",
             }
 
-            data = self._fetch_page(params, offset, page_num)
+            data = await self._fetch_page(params, offset, page_num)
 
             features = data.get("features", [])
             if not features:

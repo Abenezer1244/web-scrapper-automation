@@ -43,6 +43,10 @@ _PAGE_RETRY_BACKOFF_MS: tuple[int, ...] = (5_000, 15_000)  # waits between attem
 # page — a double click would skip a full results page (silent partial scrape).
 _PAGE_ADVANCE_POLLS = 5
 _PAGE_ADVANCE_POLL_MS = 1_500
+_PAGE_INDEX_JS = """() => {
+    const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
+    return sel ? sel.selectedIndex : -1;
+}"""
 
 # Minimum <td> count for a row to be an ARMS results row. The live grid renders 39
 # cells per row; 9 is the number _map_row actually needs and is what the row filter
@@ -238,16 +242,7 @@ class PierceWAARMSScraper(BridgeScraper):
             # Report phase change so frontend shows "Looking up parcel IDs..."
             if self.on_progress:
                 self.on_progress(0, len(needs_parcel), len(all_records), "parcel_lookup", unit="parcel")
-            try:
-                # Go to first page
-                first_btn = self.page.locator("#OptionsBar1_imgFirst")
-                if await first_btn.count() > 0:
-                    await first_btn.click(timeout=5_000)
-                    await self.page.wait_for_load_state("load")
-                    await self.page.wait_for_timeout(1_000)
-            except Exception:
-                pass
-
+            await self._return_to_first_page(page_num)
             await self._fetch_parcels_from_detail(needs_parcel)
 
         parcels_found = sum(1 for r in all_records if r.parcel_id)
@@ -373,6 +368,43 @@ class PierceWAARMSScraper(BridgeScraper):
         self._page_total = page_total
         _logger.info("Total pages: %d", page_total)
 
+    async def _page_index(self) -> int:
+        """The results dropdown's selectedIndex (0 = page 1), or -1 if it is absent."""
+        try:
+            return int(await self.page.evaluate(_PAGE_INDEX_JS))
+        except Exception:
+            return -1
+
+    async def _return_to_first_page(self, pages_walked: int) -> None:
+        """Put the results grid back on page 1 before the parcel pass.
+
+        The parcel pass walks forward from wherever the grid is. Starting on the last
+        page would skip every earlier page's parcels (and the address enrichment that
+        needs them) while the run still finished as a success, so a reset we cannot
+        confirm raises TransientScrapeError and the worker retries the run.
+        """
+        if pages_walked <= 1:
+            return  # never left page 1
+        last_exc: Exception | None = None
+        try:
+            await self.page.locator("#OptionsBar1_imgFirst").click(timeout=5_000)
+        except Exception as exc:
+            last_exc = exc  # ARMS can apply the postback after the click wait gave up
+        for _ in range(_PAGE_ADVANCE_POLLS):
+            if await self._page_index() == 0:
+                await self.page.wait_for_timeout(1_000)
+                return
+            await self.page.wait_for_timeout(_PAGE_ADVANCE_POLL_MS)
+        if await self._page_index() == 0:  # landed during the last wait
+            return
+        raise TransientScrapeError(
+            "pierce", "arms",
+            "could not return to results page 1 for the parcel pass "
+            "(prevented a silent partial parcel lookup)",
+            record_type=self._record_type,
+            context=last_exc,
+        ) from last_exc
+
     async def _go_to_next_page(self) -> bool:
         """Advance to the next results page.
 
@@ -397,16 +429,7 @@ class PierceWAARMSScraper(BridgeScraper):
             _logger.info("No next button — last page")
             return False
 
-        _idx_js = """() => {
-            const sel = document.getElementById('cphNoMargin_cphNoMargin_OptionsBar1_ItemList');
-            return sel ? sel.selectedIndex : -1;
-        }"""
-
-        async def _page_index() -> int:
-            try:
-                return int(await page.evaluate(_idx_js))
-            except Exception:
-                return -1
+        _page_index = self._page_index
 
         start_idx = await _page_index()
         opts_len = await page.evaluate("""() => {
